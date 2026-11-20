@@ -15,4 +15,8 @@ serde_json.workspace = true
 rquickjs.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+futures-channel.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
