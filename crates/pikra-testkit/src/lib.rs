@@ -133,6 +133,7 @@ impl ScriptedHttpResponse {
     }
 }
 
+#[derive(Default)]
 struct FauxTransportState {
     responses: VecDeque<ScriptedHttpResponse>,
     requests: Vec<RecordedRequest>,
@@ -142,15 +143,6 @@ struct FauxTransportState {
 #[derive(Clone, Default)]
 pub struct FauxTransport {
     state: Arc<Mutex<FauxTransportState>>,
-}
-
-impl Default for FauxTransportState {
-    fn default() -> Self {
-        Self {
-            responses: VecDeque::new(),
-            requests: Vec::new(),
-        }
-    }
 }
 
 impl FauxTransport {
@@ -279,18 +271,10 @@ impl Stream for GatedEventStream {
     }
 }
 
+#[derive(Default)]
 struct FauxProviderState {
     streams: VecDeque<AssistantEventStream>,
     calls: Vec<RecordedProviderCall>,
-}
-
-impl Default for FauxProviderState {
-    fn default() -> Self {
-        Self {
-            streams: VecDeque::new(),
-            calls: Vec::new(),
-        }
-    }
 }
 
 /// Deterministic in-memory `StreamProvider` for higher-level agent/session E2E tests.

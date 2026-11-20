@@ -156,10 +156,12 @@ fn all_four_protocols_stream_thinking_parallel_tools_malformed_json_and_cost() {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200,\"total_tokens\":1200,\"input_tokens_details\":{\"cached_tokens\":400},\"output_tokens_details\":{\"reasoning_tokens\":50}}}}\n\n",
         ]);
 
-        let mut opts = SimpleStreamOptions::default();
-        opts.reasoning = Some(ThinkingLevel::High);
-        opts.fast = Some(true);
-        opts.session_id = Some(long_session);
+        let opts = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            fast: Some(true),
+            session_id: Some(long_session),
+            ..Default::default()
+        };
         let resp_msg = models.complete(&openai_responses_model(), &ctx, opts).await;
         assert_eq!(resp_msg.stop_reason, StopReason::ToolUse);
         assert_eq!(resp_msg.response_id.as_deref(), Some("resp_1"));
@@ -215,8 +217,10 @@ fn all_four_protocols_stream_thinking_parallel_tools_malformed_json_and_cost() {
             "data: {\"id\":\"chatcmpl_1\",\"choices\":[],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":100,\"total_tokens\":600}}\n\n",
             "data: [DONE]\n\n",
         ]);
-        let mut comp_opts = SimpleStreamOptions::default();
-        comp_opts.reasoning = Some(ThinkingLevel::Medium);
+        let mut comp_opts = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
         comp_opts.sampling_params.insert("top_p".into(), json!(0.85));
         let comp_msg = models
             .complete(&openai_completions_model(), &ctx, comp_opts)
@@ -282,8 +286,10 @@ fn all_four_protocols_stream_thinking_parallel_tools_malformed_json_and_cost() {
             "data: {\"responseId\":\"gem_1\",\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Thinking in Gemini\"},{\"functionCall\":{\"id\":\"gem_fc_1\",\"name\":\"read_file\",\"args\":{\"path\":\"main.rs\"}},\"thoughtSignature\":\"Z2VtaW5pX3NpZw==\"}]}}]}\n\n",
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Done!\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":300,\"cachedContentTokenCount\":100,\"candidatesTokenCount\":40,\"thoughtsTokenCount\":20,\"totalTokenCount\":360}}\n\n",
         ]);
-        let mut gem_opts = SimpleStreamOptions::default();
-        gem_opts.reasoning = Some(ThinkingLevel::Low);
+        let gem_opts = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Low),
+            ..Default::default()
+        };
         let gem_msg = models.complete(&google_model(), &ctx, gem_opts).await;
         assert_eq!(gem_msg.stop_reason, StopReason::ToolUse);
         assert_eq!(gem_msg.response_id.as_deref(), Some("gem_1"));
@@ -422,8 +428,10 @@ fn anthropic_tool_result_merging_error_image_splitting_cache_control_and_cross_p
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ]);
-        let mut ant_opts = SimpleStreamOptions::default();
-        ant_opts.cache_retention = CacheRetention::Long;
+        let ant_opts = SimpleStreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
         let ant_reply = models.complete(&anthropic_model(), &ctx, ant_opts).await;
         assert_eq!(ant_reply.stop_reason, StopReason::Stop);
 
@@ -567,8 +575,10 @@ fn multi_turn_prompt_cache_prefix_byte_stability_and_mid_stream_cancel() {
         // Mid-stream cooperative CancelToken abort over channel-gated SSE (zero sleep!).
         let sender = transport.enqueue_gated_sse();
         let cancel = CancelToken::new();
-        let mut opts = SimpleStreamOptions::default();
-        opts.cancel = cancel.clone();
+        let opts = SimpleStreamOptions {
+            cancel: cancel.clone(),
+            ..Default::default()
+        };
 
         let mut stream = models.stream(&model, &ctx, opts);
 

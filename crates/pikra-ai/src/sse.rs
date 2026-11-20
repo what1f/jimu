@@ -169,10 +169,8 @@ impl SseParser {
                 self.data_lines.push(raw_value.to_string());
                 self.has_data = true;
             }
-            "id" => {
-                if !raw_value.contains('\0') {
-                    self.event_id = Some(raw_value.to_string());
-                }
+            "id" if !raw_value.contains('\0') => {
+                self.event_id = Some(raw_value.to_string());
             }
             _ => {}
         }
