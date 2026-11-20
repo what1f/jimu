@@ -1,5 +1,23 @@
 //! Unified multi-provider streaming LLM API, transcript model, and transport traits.
 
+pub mod models;
+pub mod providers;
+pub mod sse;
+pub mod transcript;
+pub mod transform;
+pub mod usage;
+
+pub use models::{Client, Models, ProviderConfig, complete};
+pub use sse::{SseEvent, SseParser, SseStream};
+pub use transcript::{ResolvedTranscript, render_system_message_text};
+pub use transform::{
+    ERROR_TOOL_IMAGE_PLACEHOLDER, NON_VISION_TOOL_IMAGE_PLACEHOLDER,
+    NON_VISION_USER_IMAGE_PLACEHOLDER, SplitErrorToolResult, normalize_tool_call_id_anthropic,
+    normalize_tool_call_id_openai_completions, normalize_tool_call_id_openai_responses,
+    split_error_tool_result_images, transform_messages,
+};
+pub use usage::{calculate_cost, clamp_prompt_cache_key, parse_tool_call_arguments};
+
 use bytes::Bytes;
 use futures_core::Stream;
 use pikra_schema::Schema;
