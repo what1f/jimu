@@ -1,7 +1,21 @@
 //! Standalone JSON Schema builders, 3-pass loose argument coercion, and validation.
 
+mod builders;
+mod coerce;
+mod formats;
+mod resolve;
+mod validate;
+
+pub use builders::{
+    all_of, any_of, arr_schema, bool_schema, const_schema, int_schema, map_schema, null_schema,
+    num_schema, obj_schema, one_of, opt_nullable, ref_schema, str_schema, string_enum,
+    tuple_schema, with_additional_properties, with_bounds, with_default, with_defs,
+    with_description, with_exclusive_bounds, with_format, with_items_bounds, with_length,
+    with_title, with_unique_items,
+};
+
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use std::fmt;
 use thiserror::Error;
 
@@ -40,7 +54,7 @@ impl fmt::Display for ValidationErrors {
     }
 }
 
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid JSON schema: {0}")]
 pub struct SchemaCompileError(pub String);
 
@@ -52,8 +66,11 @@ pub struct CompiledSchema {
 impl CompiledSchema {
     pub fn compile(schema: Schema) -> Result<Self, SchemaCompileError> {
         if !schema.is_object() && !schema.is_boolean() {
-            return Err(SchemaCompileError("schema root must be an object or boolean".into()));
+            return Err(SchemaCompileError(
+                "schema root must be an object or boolean".into(),
+            ));
         }
+        resolve::validate_schema_tree(&schema, &schema, "#")?;
         Ok(Self { raw: schema })
     }
 
@@ -61,12 +78,16 @@ impl CompiledSchema {
         &self.raw
     }
 
-    pub fn validate(&self, _value: &Value) -> Result<(), ValidationErrors> {
-        Ok(())
+    pub fn is_valid(&self, value: &Value) -> bool {
+        validate::passes_node(&self.raw, &self.raw, value)
+    }
+
+    pub fn validate(&self, value: &Value) -> Result<(), ValidationErrors> {
+        validate::validate_root(&self.raw, value)
     }
 
     pub fn coerce(&self, value: &Value) -> Value {
-        value.clone()
+        coerce::coerce_root(&self.raw, value)
     }
 
     pub fn coerce_and_validate(&self, value: &Value) -> Result<Value, ValidationErrors> {
@@ -74,40 +95,4 @@ impl CompiledSchema {
         self.validate(&coerced)?;
         Ok(coerced)
     }
-}
-
-pub fn str_schema() -> Schema {
-    json!({ "type": "string" })
-}
-
-pub fn int_schema() -> Schema {
-    json!({ "type": "integer" })
-}
-
-pub fn num_schema() -> Schema {
-    json!({ "type": "number" })
-}
-
-pub fn bool_schema() -> Schema {
-    json!({ "type": "boolean" })
-}
-
-pub fn obj_schema(properties: impl IntoIterator<Item = (impl Into<String>, Schema, bool)>) -> Schema {
-    let mut props = Map::new();
-    let mut required = Vec::new();
-    for (name, schema, is_req) in properties {
-        let key = name.into();
-        if is_req {
-            required.push(Value::String(key.clone()));
-        }
-        props.insert(key, schema);
-    }
-    let mut obj = Map::new();
-    obj.insert("type".into(), Value::String("object".into()));
-    obj.insert("properties".into(), Value::Object(props));
-    if !required.is_empty() {
-        obj.insert("required".into(), Value::Array(required));
-    }
-    obj.insert("additionalProperties".into(), Value::Bool(false));
-    Value::Object(obj)
 }
