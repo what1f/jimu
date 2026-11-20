@@ -1,0 +1,11 @@
+/target
+/.pikra-wt
+**/*.rs.bk
+.DS_Store
+.env
+.env.*
+!.env.example
+swift/.build
+swift/.swiftpm
+swift/Artifacts/*.xcframework
+swift/Artifacts/*.zip

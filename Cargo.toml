@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pikra-schema",
+    "crates/pikra-ai",
+    "crates/pikra-http",
+    "crates/pikra-agent",
+    "crates/pikra-codemode",
+    "crates/pikra-session",
+    "crates/pikra-js",
+    "crates/pikra-tools",
+    "crates/pikra-kit",
+    "crates/pikra-ffi",
+    "crates/pikra-testkit",
+    "apps/pikra-rpc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+repository = "https://github.com/what1f/pikra"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[workspace.dependencies]
+pikra-schema = { path = "crates/pikra-schema" }
+pikra-ai = { path = "crates/pikra-ai" }
+pikra-http = { path = "crates/pikra-http" }
+pikra-agent = { path = "crates/pikra-agent" }
+pikra-codemode = { path = "crates/pikra-codemode" }
+pikra-session = { path = "crates/pikra-session" }
+pikra-js = { path = "crates/pikra-js" }
+pikra-tools = { path = "crates/pikra-tools" }
+pikra-kit = { path = "crates/pikra-kit" }
+pikra-ffi = { path = "crates/pikra-ffi" }
+pikra-testkit = { path = "crates/pikra-testkit" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+bytes = "1.11"
+futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink", "std"] }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc", "sink", "std"] }
+futures-executor = { version = "0.3", default-features = false, features = ["std", "thread-pool"] }
+thiserror = "2.0"
+base64 = "0.22"
+sha2 = "0.10"
+uuid = { version = "1.18", features = ["v4", "v7"] }
+rquickjs = { version = "0.14.0", features = ["futures", "loader", "parallel"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "sync", "time", "net", "signal", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+tempfile = "3.27"

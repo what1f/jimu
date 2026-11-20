@@ -1,0 +1,15 @@
+[package]
+name = "pikra-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Standalone JSON Schema builders, 3-pass loose tool-argument coercion, and validator"
+
+[lib]
+test = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
