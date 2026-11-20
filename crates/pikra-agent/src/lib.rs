@@ -1,5 +1,20 @@
 //! Stateful in-memory Agent Turn Loop, concurrent tool execution, steering, and middleware hooks.
 
+mod agent;
+mod context;
+mod error;
+mod loop_runner;
+mod tool;
+
+pub use agent::{Agent, AgentConfig, AgentEventStream, SubscriptionId};
+pub use context::{default_convert_to_llm, ConvertToLlmFn};
+pub use error::AgentError;
+pub use loop_runner::{
+    agent_loop, agent_loop_continue, AgentLoopConfig, AgentLoopOutcome, ApiKeyResolver,
+    QueueSource, QueuedInput,
+};
+pub use tool::{run_tool_call, ClosureTool};
+
 use pikra_ai::{
     AssistantMessage, AssistantMessageEvent, BoxFuture, CancelToken, ContentPart, Message, Model,
     ThinkingLevel, ToolCall, ToolDefinition, ToolResultMessage, Usage,
@@ -203,6 +218,7 @@ pub trait AgentMiddleware: Send + Sync {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {

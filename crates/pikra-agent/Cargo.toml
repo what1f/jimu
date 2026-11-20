@@ -19,3 +19,6 @@ futures-util.workspace = true
 futures-channel.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
