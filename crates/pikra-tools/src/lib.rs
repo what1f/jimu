@@ -7,6 +7,11 @@ mod read;
 mod util;
 mod write;
 
+#[cfg(feature = "web-fetch")]
+pub mod web;
+#[cfg(feature = "web-fetch")]
+pub use web::{WebFetchConfig, WebFetchTool};
+
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use find::FindTool;
