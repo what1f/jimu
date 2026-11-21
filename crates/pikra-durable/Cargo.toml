@@ -1,0 +1,27 @@
+[package]
+name = "pikra-durable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embedded single-node transactional durable execution engine with SQLite WAL storage, crash recovery, signals, timers, and CAS documents"
+
+[lib]
+test = false
+
+[dependencies]
+pikra-schema.workspace = true
+pikra-ai.workspace = true
+pikra-agent.workspace = true
+pikra-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+pikra-testkit.workspace = true
+futures-executor.workspace = true
+tempfile.workspace = true
