@@ -31,6 +31,9 @@ mod util;
 #[cfg(feature = "fs")]
 mod write;
 
+#[cfg(feature = "web-fetch")]
+pub mod web;
+
 #[cfg(feature = "patch")]
 pub use apply_patch::ApplyPatchTool;
 #[cfg(all(feature = "shell", not(target_os = "ios")))]
@@ -58,6 +61,8 @@ pub use read::ReadTool;
 #[cfg(feature = "sleep")]
 pub use sleep::SleepTool;
 pub use util::{TruncatedOutput, truncate_output};
+#[cfg(feature = "web-fetch")]
+pub use web::{HostResolver, WebFetchConfig, WebFetchTool};
 #[cfg(feature = "fs")]
 pub use write::WriteTool;
 

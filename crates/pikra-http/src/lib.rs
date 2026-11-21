@@ -9,11 +9,13 @@ use pikra_ai::{
 use reqwest::header::{HeaderName, HeaderValue};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
+const MANUAL_REDIRECT_HEADER: &str = "x-pikra-no-redirect";
 
 fn decode_capped_utf8(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
@@ -29,39 +31,64 @@ fn decode_capped_utf8(bytes: &[u8]) -> String {
 #[derive(Clone, Debug)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    manual: Option<Arc<OnceLock<Result<reqwest::Client, String>>>>,
 }
 
 impl ReqwestTransport {
-    /// Build a new `ReqwestTransport` with default rustls settings (no disk cache)
-    /// and a strict same-origin redirect policy so API credentials never leak cross-origin.
+    /// Use native and public WebPKI roots, system proxies, and same-origin redirects.
+    /// Requests carrying `x-pikra-no-redirect` receive the redirect response directly.
     pub fn new() -> Result<Self, reqwest::Error> {
-        let policy = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 10 {
-                return attempt.error("too many redirects");
-            }
-            if let Some(first) = attempt.previous().first() {
-                let next = attempt.url();
-                let same_origin = first.scheme() == next.scheme()
-                    && first.host_str() == next.host_str()
-                    && first.port_or_known_default() == next.port_or_known_default();
-                if !same_origin {
-                    return attempt.error("cross-origin redirect refused for credential safety");
+        let policy = || {
+            reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("too many redirects");
                 }
-            }
-            attempt.follow()
-        });
-        let client = reqwest::Client::builder().redirect(policy).build()?;
-        Ok(Self { client })
+                if let Some(first) = attempt.previous().first() {
+                    let next = attempt.url();
+                    let same_origin = first.scheme() == next.scheme()
+                        && first.host_str() == next.host_str()
+                        && first.port_or_known_default() == next.port_or_known_default();
+                    if !same_origin {
+                        return attempt
+                            .error("cross-origin redirect refused for credential safety");
+                    }
+                }
+                attempt.follow()
+            })
+        };
+        let client = build_client(policy)?;
+        Ok(Self {
+            client,
+            manual: Some(Arc::new(OnceLock::new())),
+        })
     }
 
-    /// Wrap a pre-configured `reqwest::Client`.
+    /// Wrap a pre-configured `reqwest::Client`. For manual redirect requests,
+    /// configure the supplied client with `reqwest::redirect::Policy::none()`.
     pub fn from_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            manual: None,
+        }
     }
 
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }
+}
+
+fn build_client(
+    policy: impl Fn() -> reqwest::redirect::Policy,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(policy())
+        .build()
+        .or_else(|_| {
+            reqwest::Client::builder()
+                .tls_built_in_native_certs(false)
+                .redirect(policy())
+                .build()
+        })
 }
 
 struct CancellableByteStream {
@@ -118,11 +145,27 @@ impl HttpTransport for ReqwestTransport {
             let method = reqwest::Method::from_bytes(request.method.as_bytes())
                 .map_err(|e| TransportError::Network(format!("invalid HTTP method: {e}")))?;
 
-            let mut builder = self.client.request(method, &request.url);
+            let manual = request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(MANUAL_REDIRECT_HEADER));
+            let client = match (&self.manual, manual) {
+                (Some(client), true) => client
+                    .get_or_init(|| {
+                        build_client(reqwest::redirect::Policy::none).map_err(|e| e.to_string())
+                    })
+                    .as_ref()
+                    .map_err(|e| TransportError::Network(e.clone()))?,
+                _ => &self.client,
+            };
+            let mut builder = client.request(method, &request.url);
             if let Some(timeout_ms) = request.timeout_ms {
                 builder = builder.timeout(Duration::from_millis(timeout_ms));
             }
             for (name, value) in &request.headers {
+                if name.eq_ignore_ascii_case(MANUAL_REDIRECT_HEADER) {
+                    continue;
+                }
                 let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                     TransportError::Network(format!("invalid header name `{name}`: {e}"))
                 })?;
@@ -154,7 +197,8 @@ impl HttpTransport for ReqwestTransport {
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
 
-            if !response.status().is_success() {
+            let redirect = manual && matches!(status, 301 | 302 | 303 | 307 | 308);
+            if !(response.status().is_success() || redirect) {
                 let mut response = response;
                 let mut buf = Vec::new();
                 let mut truncated = false;
