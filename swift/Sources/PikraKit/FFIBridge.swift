@@ -359,6 +359,7 @@ func encodeJSONString<T: Encodable>(_ value: T) throws -> String {
 
 final class PikraSessionBridge: @unchecked Sendable {
     private let httpClient: any PikraHTTPClient
+    private let authorizeRequest: PikraRequestAuthorizer?
     private let beforeRequest: (@Sendable (Data) async throws -> Void)?
 
     private let lock = NSLock()
@@ -368,10 +369,12 @@ final class PikraSessionBridge: @unchecked Sendable {
 
     init(
         httpClient: any PikraHTTPClient,
+        authorizeRequest: PikraRequestAuthorizer?,
         beforeRequest: (@Sendable (Data) async throws -> Void)?,
         initialTools: [PikraTool]
     ) {
         self.httpClient = httpClient
+        self.authorizeRequest = authorizeRequest
         self.beforeRequest = beforeRequest
         var map: [String: PikraTool] = [:]
         for tool in initialTools {
@@ -482,13 +485,25 @@ final class PikraSessionBridge: @unchecked Sendable {
                 return (pair[0], pair[1])
             }
             let timeout = head.timeoutMs.map { TimeInterval($0) / 1000.0 }
-            let request = PikraHTTPRequest(
+            var request = PikraHTTPRequest(
                 method: head.method,
                 url: url,
                 headers: headers,
                 body: body,
                 timeoutInterval: timeout
             )
+
+            if let authorizeRequest {
+                var urlRequest = request.toURLRequest()
+                let originalTimeout = urlRequest.timeoutInterval
+                try await authorizeRequest(&urlRequest)
+                try Task.checkCancellation()
+                request = PikraHTTPRequest(
+                    applying: urlRequest,
+                    fallback: request,
+                    originalTimeout: originalTimeout
+                )
+            }
 
             if let beforeRequest {
                 try await beforeRequest(request.body)

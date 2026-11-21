@@ -846,3 +846,138 @@ pub unsafe extern "C" fn pikra_session_reload_skills(
     }))
     .unwrap_or(PikraStatus::ErrInternal)
 }
+
+/* ---- Skill Discovery ---- */
+
+#[derive(serde::Serialize)]
+struct FfiDiscoveredSkill {
+    name: String,
+    description: String,
+    location: String,
+    disable_model_invocation: bool,
+    revision: String,
+}
+
+#[derive(serde::Serialize)]
+struct FfiSkillDiscoveryResponse {
+    skills: Vec<FfiDiscoveredSkill>,
+    prompt: String,
+}
+
+fn escape_skill_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn format_discovered_skills_prompt(skills: &[FfiDiscoveredSkill]) -> String {
+    let visible: Vec<&FfiDiscoveredSkill> = skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .collect();
+    if visible.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::with_capacity(visible.len() * 6 + 3);
+    lines.push(
+        "Available skills. Use read to load a skill's SKILL.md when the task matches its description, before doing the work."
+            .to_string(),
+    );
+    lines.push("<available_skills>".to_string());
+    for skill in visible {
+        lines.push("  <skill>".to_string());
+        lines.push(format!("    <name>{}</name>", escape_skill_xml(&skill.name)));
+        lines.push(format!(
+            "    <description>{}</description>",
+            escape_skill_xml(&skill.description)
+        ));
+        lines.push(format!(
+            "    <location>{}</location>",
+            escape_skill_xml(&skill.location)
+        ));
+        lines.push(format!(
+            "    <revision>{}</revision>",
+            escape_skill_xml(&skill.revision)
+        ));
+        lines.push("  </skill>".to_string());
+    }
+    lines.push("</available_skills>".to_string());
+    lines.join("\n")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_discover_skills(
+    roots_json: *const c_char,
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json_str = match unsafe { read_cstr(roots_json, "roots_json") } {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { write_out_string(out_error, e) };
+                return std::ptr::null_mut();
+            }
+        };
+        let raw_roots: Vec<String> = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { write_out_string(out_error, format!("invalid roots JSON: {e}")) };
+                return std::ptr::null_mut();
+            }
+        };
+
+        let root_paths: Vec<std::path::PathBuf> =
+            raw_roots.into_iter().map(std::path::PathBuf::from).collect();
+        let catalog = pikra_kit::SkillCatalog::discover(&root_paths);
+        let skills: Vec<FfiDiscoveredSkill> = catalog
+            .skills()
+            .iter()
+            .map(|skill| {
+                let raw_contents = std::fs::read_to_string(&skill.file_path).unwrap_or_default();
+                let revision = pikra_ai::transform::short_hash(&raw_contents);
+                FfiDiscoveredSkill {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    location: skill.file_path.to_string_lossy().into_owned(),
+                    disable_model_invocation: skill.disable_model_invocation,
+                    revision,
+                }
+            })
+            .collect();
+        let prompt = format_discovered_skills_prompt(&skills);
+        let response = FfiSkillDiscoveryResponse { skills, prompt };
+
+        match serde_json::to_string(&response) {
+            Ok(json) => {
+                let sanitized = json.replace('\0', "");
+                match CString::new(sanitized) {
+                    Ok(cstr) => cstr.into_raw(),
+                    Err(e) => {
+                        unsafe {
+                            write_out_string(out_error, format!("encode skills JSON: {e}"));
+                        }
+                        std::ptr::null_mut()
+                    }
+                }
+            }
+            Err(e) => {
+                unsafe { write_out_string(out_error, format!("serialize skills JSON: {e}")) };
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        unsafe { write_out_string(out_error, "panic inside pikra_discover_skills") };
+        std::ptr::null_mut()
+    })
+}

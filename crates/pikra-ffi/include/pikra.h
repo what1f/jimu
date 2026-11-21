@@ -269,6 +269,13 @@ PikraStatus pikra_session_reload_skills(
     char **out_error
 );
 
+/* ---- Skill Discovery ---- */
+
+char *pikra_discover_skills(
+    const char *roots_json,
+    char **out_error
+);
+
 #ifdef __cplusplus
 }
 #endif

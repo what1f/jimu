@@ -44,6 +44,7 @@ public actor PikraAgent {
         let httpClient = configuration.httpClient ?? PikraURLSessionHTTPClient()
         let bridge = PikraSessionBridge(
             httpClient: httpClient,
+            authorizeRequest: configuration.authorizeRequest,
             beforeRequest: configuration.beforeRequest,
             initialTools: configuration.tools
         )
