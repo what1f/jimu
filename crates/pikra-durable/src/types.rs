@@ -47,8 +47,29 @@ pub struct ConversationRecord {
     pub status: ConversationStatus,
     pub active_model: Model,
     pub system_prompt: String,
+    #[serde(default)]
+    pub checkpoint_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// Outcome of an atomic lease claim/renewal attempt on a conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseClaimResult {
+    /// Execution lease acquired or renewed by the caller.
+    Acquired {
+        checkpoint_version: u64,
+        lease_expires_at_ms: u64,
+    },
+    /// Another active engine currently holds a live (unexpired) lease.
+    HeldByOther {
+        lease_owner: String,
+        lease_expires_at_ms: u64,
+    },
 }
 
 /// Idempotent execution state for a `(conversation_id, submission_id)` pair.
@@ -237,6 +258,10 @@ pub struct CommitBatch {
     pub conversation_id: String,
     pub now_ms: u64,
     pub expected_head_entry_id: Option<Option<String>>,
+    pub expected_lease_owner: Option<String>,
+    pub expected_checkpoint_version: Option<u64>,
+    pub renew_lease_expires_at_ms: Option<u64>,
+    pub release_lease: bool,
     pub require_no_checkpoint: bool,
     pub upsert_conversation: Option<ConversationRecord>,
     pub update_status: Option<ConversationStatus>,
@@ -255,6 +280,10 @@ impl CommitBatch {
             conversation_id: conversation_id.into(),
             now_ms,
             expected_head_entry_id: None,
+            expected_lease_owner: None,
+            expected_checkpoint_version: None,
+            renew_lease_expires_at_ms: None,
+            release_lease: false,
             require_no_checkpoint: false,
             upsert_conversation: None,
             update_status: None,
@@ -267,6 +296,15 @@ impl CommitBatch {
             document_writes: Vec::new(),
         }
     }
+
+    pub(crate) fn advances_checkpoint_version(&self) -> bool {
+        !matches!(self.checkpoint, CheckpointMutation::Unchanged)
+            || !self.append_entries.is_empty()
+            || self.upsert_submission.is_some()
+            || self.update_status.is_some()
+            || !self.record_completed_tools.is_empty()
+            || self.expected_checkpoint_version.is_some()
+    }
 }
 
 /// Receipt returned after an atomic [`CommitBatch`] succeeds.
@@ -275,6 +313,7 @@ pub struct CommitReceipt {
     pub conversation_id: String,
     pub head_entry_id: Option<String>,
     pub last_seq: u64,
+    pub checkpoint_version: u64,
     pub document_revisions: Vec<(String, u64)>,
 }
 

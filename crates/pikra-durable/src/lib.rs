@@ -13,7 +13,7 @@ mod tool;
 mod types;
 
 pub use clock::{Clock, ManualClock, RetryPolicy, SystemClock};
-pub use engine::{DurableEngine, DurableEngineConfig, DurableSubscriptionId};
+pub use engine::{DEFAULT_LEASE_TTL_MS, DurableEngine, DurableEngineConfig, DurableSubscriptionId};
 pub use error::DurableError;
 pub use store::{DurableStore, MemoryDurableStore, SqliteDurableStore};
 pub use tool::{
@@ -21,7 +21,7 @@ pub use tool::{
 };
 pub use types::{
     CheckpointMutation, CommitBatch, CommitReceipt, CompletedToolRecord, ConversationRecord,
-    ConversationStatus, DocumentRecord, DocumentWrite, DurableEvent, ParkState, ParkedToolCall,
-    RunOutcome, SignalDeliveryResult, SignalRecord, SubmissionRecord, SubmissionState,
-    TaskCheckpoint,
+    ConversationStatus, DocumentRecord, DocumentWrite, DurableEvent, LeaseClaimResult, ParkState,
+    ParkedToolCall, RunOutcome, SignalDeliveryResult, SignalRecord, SubmissionRecord,
+    SubmissionState, TaskCheckpoint,
 };

@@ -4,13 +4,15 @@
 use futures_executor::block_on;
 use pikra_agent::{AgentToolResult, ClosureTool};
 use pikra_ai::{
-    ApiKind, BoxFuture, Message, Model, ModelCost, Models, ProviderConfig, ToolDefinition,
+    ApiKind, AssistantBlock, AssistantEventStream, AssistantMessage, AssistantMessageEvent,
+    BoxFuture, Message, Model, ModelCost, Models, ProviderConfig, SimpleStreamOptions, StopReason,
+    StreamProvider, TextContent, ToolDefinition, TranscriptContext, Usage,
 };
 use pikra_durable::{
     Clock, CommitBatch, ConversationStatus, DurableEngine, DurableError, DurableEvent,
-    DurableStore, DurableTool, DurableToolContext, DurableToolOutcome, ManualClock, ParkState,
-    RetryPolicy, RunOutcome, SignalDeliveryResult, SignalResolution, SqliteDurableStore,
-    TaskCheckpoint,
+    DurableStore, DurableTool, DurableToolContext, DurableToolOutcome, LeaseClaimResult,
+    ManualClock, MemoryDurableStore, ParkState, RetryPolicy, RunOutcome, SignalDeliveryResult,
+    SignalResolution, SqliteDurableStore, TaskCheckpoint,
 };
 use pikra_schema::{int_schema, obj_schema, str_schema};
 use pikra_session::{CompactionConfig, SessionEntryPayload};
@@ -763,4 +765,411 @@ fn durable_compaction_and_cas_documents() {
             pikra_agent::AgentMessage::Llm(Message::Assistant(a)) if a.text_output() == "Step 2 completed cleanly."
         )));
     });
+}
+
+struct BlockingStreamProvider {
+    calls: Arc<AtomicUsize>,
+    entered_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release_rx: Mutex<Option<std::sync::mpsc::Receiver<String>>>,
+}
+
+impl BlockingStreamProvider {
+    fn new() -> (
+        Arc<Self>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<String>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                entered_tx: Mutex::new(Some(entered_tx)),
+                release_rx: Mutex::new(Some(release_rx)),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl StreamProvider for BlockingStreamProvider {
+    fn stream(
+        &self,
+        model: &Model,
+        _context: &TranscriptContext,
+        _options: SimpleStreamOptions,
+    ) -> AssistantEventStream {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let model = model.clone();
+        let entered_tx = self.entered_tx.lock().unwrap().take();
+        let release_rx = self.release_rx.lock().unwrap().take();
+        Box::pin(futures_util::stream::once(async move {
+            if let Some(sig) = entered_tx {
+                let _ = sig.send(());
+            }
+            let text = release_rx
+                .and_then(|rx| rx.recv().ok())
+                .unwrap_or_else(|| "released".to_string());
+            let final_msg = AssistantMessage {
+                content: vec![AssistantBlock::Text(TextContent::plain(text))],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                response_id: Some("resp_blocking".into()),
+                thinking_level: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                diagnostics: Vec::new(),
+                timestamp: 1,
+                duration_ms: Some(1),
+            };
+            AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message: final_msg,
+            }
+        }))
+    }
+}
+
+#[test]
+fn concurrent_engine_lease_prevents_double_execution_and_fences_expired_owner() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("lease.sqlite");
+    let clock = Arc::new(ManualClock::new(10_000));
+    let store1 = Arc::new(SqliteDurableStore::open(&db_path).expect("open sqlite 1"));
+    let store2 = Arc::new(SqliteDurableStore::open(&db_path).expect("open sqlite 2"));
+
+    // Part 1: Live lease blocks concurrent recover() and submit() from a second engine.
+    let (blocking_provider, entered_rx, release_tx) = BlockingStreamProvider::new();
+    let engine1 = Arc::new(
+        DurableEngine::new(store1.clone(), blocking_provider.clone())
+            .with_clock(clock.clone())
+            .with_lease_ttl_ms(60_000),
+    );
+    let transport2 = Arc::new(FauxTransport::new());
+    let engine2 = DurableEngine::new(store2.clone(), provider_for(transport2.clone()))
+        .with_clock(clock.clone())
+        .with_lease_ttl_ms(60_000);
+
+    engine1
+        .create_conversation("conv-lease", test_model(128_000, 4_096), "Lease test.")
+        .unwrap();
+
+    let e1_handle = {
+        let e1 = Arc::clone(&engine1);
+        std::thread::spawn(move || block_on(e1.submit("conv-lease", "sub-1", "Hello")))
+    };
+
+    // Wait deterministically until engine1 is inside provider.stream().
+    entered_rx.recv().expect("engine1 entered provider");
+    let conv_during = store2.get_conversation("conv-lease").unwrap().unwrap();
+    assert_eq!(
+        conv_during.lease_owner.as_deref(),
+        Some(engine1.engine_id())
+    );
+    assert_eq!(conv_during.lease_expires_at_ms, Some(70_000));
+
+    // Engine 2 recover() skips live-leased conversation instead of double-executing it.
+    assert_eq!(
+        block_on(engine2.recover("conv-lease")).unwrap(),
+        RunOutcome::Idle
+    );
+    assert_eq!(transport2.request_count(), 0);
+
+    // Engine 2 submit() on same or new submission returns Busy while engine1 holds a live lease.
+    assert!(matches!(
+        block_on(engine2.submit("conv-lease", "sub-1", "Hello")),
+        Err(DurableError::Busy { .. })
+    ));
+    assert!(matches!(
+        block_on(engine2.submit("conv-lease", "sub-2", "Another")),
+        Err(DurableError::Busy { .. })
+    ));
+
+    // Release engine1 -> completes cleanly and releases the lease.
+    release_tx.send("reply from engine1".into()).unwrap();
+    let outcome1 = e1_handle.join().unwrap().unwrap();
+    assert!(matches!(
+        outcome1,
+        RunOutcome::Completed { ref final_text, .. } if final_text == "reply from engine1"
+    ));
+    assert_eq!(blocking_provider.call_count(), 1);
+    let conv_after = store2.get_conversation("conv-lease").unwrap().unwrap();
+    assert_eq!(conv_after.lease_owner, None);
+    assert_eq!(conv_after.lease_expires_at_ms, None);
+
+    // Part 2: Expired lease takeover by engine2 fences stalled engine1 from committing a duplicate reply.
+    let (stalled_provider, stalled_entered_rx, stalled_release_tx) = BlockingStreamProvider::new();
+    let stalled_engine = Arc::new(
+        DurableEngine::new(store1.clone(), stalled_provider)
+            .with_clock(clock.clone())
+            .with_lease_ttl_ms(60_000),
+    );
+    let stalled_handle = {
+        let e = Arc::clone(&stalled_engine);
+        std::thread::spawn(move || block_on(e.submit("conv-lease", "sub-2", "Stalled prompt")))
+    };
+    stalled_entered_rx
+        .recv()
+        .expect("stalled engine entered provider");
+
+    // Advance virtual clock past lease_ttl_ms so engine2 can take over via recover().
+    clock.advance(60_000);
+    transport2.enqueue_sse(sse_text_response(
+        "resp_takeover",
+        "reply from engine2 takeover",
+        40,
+        10,
+    ));
+    let takeover_outcome = block_on(engine2.recover("conv-lease")).unwrap();
+    assert!(matches!(
+        takeover_outcome,
+        RunOutcome::Completed { ref final_text, .. } if final_text == "reply from engine2 takeover"
+    ));
+
+    // Unblock stalled_engine: its stale CommitBatch must fail with Conflict, never duplicating the reply.
+    stalled_release_tx
+        .send("stale reply from engine1".into())
+        .unwrap();
+    let stalled_res = stalled_handle.join().unwrap();
+    assert!(
+        matches!(stalled_res, Err(DurableError::Conflict { .. })),
+        "expected Conflict fencing stale owner, got {stalled_res:?}"
+    );
+
+    let assistant_replies: Vec<String> = store2
+        .load_entries("conv-lease")
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            SessionEntryPayload::Message {
+                message: pikra_agent::AgentMessage::Llm(Message::Assistant(a)),
+            } => Some(a.text_output()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_replies,
+        vec![
+            "reply from engine1".to_string(),
+            "reply from engine2 takeover".to_string()
+        ]
+    );
+
+    // Part 3: Verify MemoryDurableStore enforces identical lease exclusivity and fencing.
+    let mem_store = Arc::new(MemoryDurableStore::new());
+    let mem_clock = Arc::new(ManualClock::new(1_000));
+    let mem_e1 = DurableEngine::new(
+        mem_store.clone(),
+        provider_for(Arc::new(FauxTransport::new())),
+    )
+    .with_clock(mem_clock.clone())
+    .with_lease_ttl_ms(10_000);
+    mem_e1
+        .create_conversation("conv-mem", test_model(128_000, 4_096), "Memory lease test.")
+        .unwrap();
+    let claim1 = mem_store
+        .try_claim_conversation("conv-mem", "owner-a", 1_000, 10_000)
+        .unwrap();
+    let ver1 = match claim1 {
+        LeaseClaimResult::Acquired {
+            checkpoint_version, ..
+        } => checkpoint_version,
+        other => panic!("expected Acquired, got {other:?}"),
+    };
+    assert!(matches!(
+        mem_store
+            .try_claim_conversation("conv-mem", "owner-b", 5_000, 10_000)
+            .unwrap(),
+        LeaseClaimResult::HeldByOther { ref lease_owner, .. } if lease_owner == "owner-a"
+    ));
+    let claim2 = mem_store
+        .try_claim_conversation("conv-mem", "owner-b", 11_000, 10_000)
+        .unwrap();
+    assert!(matches!(
+        claim2,
+        LeaseClaimResult::Acquired {
+            checkpoint_version, ..
+        } if checkpoint_version > ver1
+    ));
+    let mut stale_batch = CommitBatch::new("conv-mem", 11_001);
+    stale_batch.expected_lease_owner = Some("owner-a".into());
+    stale_batch.expected_checkpoint_version = Some(ver1);
+    assert!(matches!(
+        mem_store.commit(stale_batch),
+        Err(DurableError::Conflict { .. })
+    ));
+    assert!(
+        !mem_store
+            .release_conversation("conv-mem", "owner-a", 11_002)
+            .unwrap()
+    );
+    assert!(
+        mem_store
+            .release_conversation("conv-mem", "owner-b", 11_002)
+            .unwrap()
+    );
+}
+
+struct StagedDocTool {
+    crash_once: Arc<AtomicBool>,
+}
+
+impl DurableTool for StagedDocTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "staged_doc".into(),
+            description: "Read-modify-write state document with crash/error/park modes".into(),
+            parameters: obj_schema([("mode", str_schema(), true)]),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        ctx: &'a DurableToolContext,
+        args: Value,
+    ) -> BoxFuture<'a, Result<DurableToolOutcome, String>> {
+        let crash_once = Arc::clone(&self.crash_once);
+        Box::pin(async move {
+            let mode = args["mode"].as_str().unwrap_or("ok");
+            let current = ctx.get_document("counter").map_err(|e| e.to_string())?;
+            let (cur_rev, cur_val) = match current {
+                Some((r, v)) => (Some(r), v["n"].as_u64().unwrap_or(0)),
+                None => (None, 0),
+            };
+
+            let rev1 = ctx
+                .put_document("counter", cur_rev, json!({ "n": cur_val + 1 }))
+                .map_err(|e| e.to_string())?;
+            // Read-your-own-writes inside the same tool execution.
+            let seen = ctx.get_document("counter").map_err(|e| e.to_string())?;
+            assert_eq!(seen, Some((rev1, json!({ "n": cur_val + 1 }))));
+
+            match mode {
+                "crash_then_ok" => {
+                    let rev2 = ctx
+                        .put_document("counter", Some(rev1), json!({ "n": cur_val + 2 }))
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(rev2, rev1 + 1);
+                    if crash_once.swap(false, Ordering::SeqCst) {
+                        panic!("simulated crash after staging put_document");
+                    }
+                    Ok(DurableToolOutcome::Completed(AgentToolResult::text(
+                        format!("counter={}", cur_val + 2),
+                    )))
+                }
+                "error" => Err("tool aborted after staging document".into()),
+                "park" => Ok(DurableToolOutcome::AwaitSignal {
+                    signal_key: "resume:doc".into(),
+                    timeout_at_ms: None,
+                    checkpoint: json!({ "staged": cur_val + 1 }),
+                }),
+                _ => Ok(DurableToolOutcome::Completed(AgentToolResult::text("ok"))),
+            }
+        })
+    }
+}
+
+#[test]
+fn staged_tool_document_writes_commit_atomically_and_never_orphan_on_crash_or_error() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("staged_docs.sqlite");
+    let clock = Arc::new(ManualClock::new(50_000));
+    let crash_once = Arc::new(AtomicBool::new(true));
+
+    // 1. Crash after two staged put_document calls -> zero writes hit SQLite.
+    {
+        let store = Arc::new(SqliteDurableStore::open(&db_path).expect("open sqlite"));
+        let transport = Arc::new(FauxTransport::new());
+        transport.enqueue_sse(sse_tool_calls_response(
+            "resp_doc_1",
+            &[(
+                "call_doc_1",
+                "staged_doc",
+                json!({ "mode": "crash_then_ok" }),
+            )],
+        ));
+        let engine = DurableEngine::new(store.clone(), provider_for(transport))
+            .with_clock(clock.clone())
+            .with_tool(StagedDocTool {
+                crash_once: Arc::clone(&crash_once),
+            });
+        engine
+            .create_conversation("conv-doc-tx", test_model(128_000, 4_096), "Doc tx.")
+            .unwrap();
+
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            block_on(engine.submit("conv-doc-tx", "sub-1", "Increment twice"))
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(
+            store.get_document("conv-doc-tx", "counter").unwrap(),
+            None,
+            "crashed tool must leave zero orphaned document writes in store"
+        );
+    }
+
+    // 2. Recover: tool re-runs cleanly and commits counter=2 (rev 2) atomically with completion.
+    let store2 = Arc::new(SqliteDurableStore::open(&db_path).expect("reopen sqlite"));
+    let transport2 = Arc::new(FauxTransport::new());
+    transport2.enqueue_sse(sse_text_response("resp_doc_done", "done", 30, 10));
+    let engine2 = DurableEngine::new(store2.clone(), provider_for(transport2.clone()))
+        .with_clock(clock.clone())
+        .with_tool(StagedDocTool {
+            crash_once: Arc::clone(&crash_once),
+        });
+    assert!(matches!(
+        block_on(engine2.recover("conv-doc-tx")).unwrap(),
+        RunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        store2.get_document("conv-doc-tx", "counter").unwrap(),
+        Some((2, json!({ "n": 2 }))),
+        "recovery must apply read-modify-write exactly once"
+    );
+
+    // 3. Tool returning Err after staging put_document must not persist the staged write.
+    transport2.enqueue_sse(sse_tool_calls_response(
+        "resp_doc_err",
+        &[("call_doc_err", "staged_doc", json!({ "mode": "error" }))],
+    ));
+    transport2.enqueue_sse(sse_text_response(
+        "resp_doc_err_done",
+        "handled error",
+        30,
+        10,
+    ));
+    assert!(matches!(
+        block_on(engine2.submit("conv-doc-tx", "sub-2", "Trigger error")).unwrap(),
+        RunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        store2.get_document("conv-doc-tx", "counter").unwrap(),
+        Some((2, json!({ "n": 2 }))),
+        "tool returning Err must discard staged document writes"
+    );
+
+    // 4. Tool returning AwaitSignal commits staged document atomically with Parked checkpoint.
+    transport2.enqueue_sse(sse_tool_calls_response(
+        "resp_doc_park",
+        &[("call_doc_park", "staged_doc", json!({ "mode": "park" }))],
+    ));
+    assert!(matches!(
+        block_on(engine2.submit("conv-doc-tx", "sub-3", "Park with doc")).unwrap(),
+        RunOutcome::Parked {
+            park: ParkState::AwaitSignal { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        store2.get_document("conv-doc-tx", "counter").unwrap(),
+        Some((3, json!({ "n": 3 }))),
+        "parking tool must commit staged document writes atomically with ParkState"
+    );
 }

@@ -1,5 +1,7 @@
 use crate::WorkspaceToolsConfig;
-use crate::util::{atomic_write_file, display_path, resolve_path};
+use crate::util::{
+    atomic_write_file_resolved, display_path, lock_path, resolve_path, resolve_write_target,
+};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{arr_schema, obj_schema, str_schema, with_description, with_items_bounds};
@@ -166,8 +168,17 @@ impl AgentTool for EditTool {
 
             let resolved = resolve_path(&config.cwd, raw_path)?;
             let shown = display_path(&config.cwd, &resolved);
+            let target = resolve_write_target(&resolved).await?;
+            let _path_guard = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err("Operation aborted".into()),
+                guard = lock_path(&target) => guard,
+            };
+            if cancel.is_cancelled() {
+                return Err("Operation aborted".into());
+            }
 
-            let meta = tokio::fs::metadata(&resolved)
+            let meta = tokio::fs::metadata(&target)
                 .await
                 .map_err(|e| format!("failed to stat '{shown}': {e}"))?;
             if meta.is_dir() {
@@ -183,7 +194,7 @@ impl AgentTool for EditTool {
                 ));
             }
 
-            let bytes = tokio::fs::read(&resolved)
+            let bytes = tokio::fs::read(&target)
                 .await
                 .map_err(|e| format!("failed to read '{shown}': {e}"))?;
             if bytes.iter().take(8192).any(|&b| b == 0) {
@@ -231,7 +242,7 @@ impl AgentTool for EditTool {
                 working
             };
 
-            atomic_write_file(&resolved, final_content.as_bytes()).await?;
+            atomic_write_file_resolved(&target, final_content.as_bytes()).await?;
 
             let count = hunks.len();
             let mut res = AgentToolResult::text(format!(

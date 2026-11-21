@@ -554,3 +554,151 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     let recovery = agent.prompt("ping after abort").await.unwrap();
     assert!(!recovery.is_empty());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Seed a real target file in a subdirectory and a symlink pointing to it from root.
+    let real_dir = root.join("targets");
+    fs::create_dir_all(&real_dir).unwrap();
+    let real_file = real_dir.join("real.txt");
+    fs::write(&real_file, "hello world\n").unwrap();
+    let link_path = root.join("linked.txt");
+    symlink(&real_file, &link_path).unwrap();
+
+    // 1. Edit and write through the symlink: target updates while symlink stays intact.
+    let fs_tools = WorkspaceTools::new(
+        WorkspaceToolsConfig::new(root)
+            .with_enabled_tools([BuiltinToolKind::Edit, BuiltinToolKind::Write]),
+    );
+    let model = test_model();
+    let provider = Arc::new(FauxProvider::new());
+    provider.enqueue_events(turn_events(
+        &model,
+        vec![AssistantBlock::ToolCall(make_tool_call(
+            "c_edit_symlink",
+            "edit",
+            json!({
+                "path": "linked.txt",
+                "oldText": "world",
+                "newText": "pikra"
+            }),
+        ))],
+        StopReason::ToolUse,
+    ));
+    provider.enqueue_events(turn_events(
+        &model,
+        vec![AssistantBlock::Text(TextContent::plain("edited symlink"))],
+        StopReason::Stop,
+    ));
+
+    let agent = Agent::new(
+        provider.clone(),
+        AgentConfig::new(model.clone())
+            .with_system_prompt("symlink-e2e")
+            .with_tools(fs_tools.tools()),
+    );
+    let msgs = agent.prompt("edit via symlink").await.unwrap();
+    let edit_res = tool_results_from(&msgs)[0];
+    assert!(!edit_res.is_error);
+    assert!(
+        fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "edit must preserve symlink instead of replacing it with a regular file"
+    );
+    assert_eq!(fs::read_to_string(&real_file).unwrap(), "hello pikra\n");
+
+    provider.enqueue_events(turn_events(
+        &model,
+        vec![AssistantBlock::ToolCall(make_tool_call(
+            "c_write_symlink",
+            "write",
+            json!({
+                "path": "linked.txt",
+                "content": "rewritten through symlink\n"
+            }),
+        ))],
+        StopReason::ToolUse,
+    ));
+    provider.enqueue_events(turn_events(
+        &model,
+        vec![AssistantBlock::Text(TextContent::plain("wrote symlink"))],
+        StopReason::Stop,
+    ));
+    let msgs = agent.prompt("write via symlink").await.unwrap();
+    let write_res = tool_results_from(&msgs)[0];
+    assert!(!write_res.is_error);
+    assert!(
+        fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "write must preserve existing symlink instead of replacing it with a regular file"
+    );
+    assert_eq!(
+        fs::read_to_string(&real_file).unwrap(),
+        "rewritten through symlink\n"
+    );
+
+    // 2. Tiny bash output budget (< compact marker length) with a single overflowing 70-byte chunk
+    //    must preserve the head prefix instead of returning empty output.
+    let bash_cfg = WorkspaceToolsConfig::new(root)
+        .with_enabled_tools([BuiltinToolKind::Bash])
+        .with_max_output_bytes(16);
+    let bash_provider = Arc::new(FauxProvider::new());
+    let payload_70 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345";
+    assert_eq!(payload_70.len(), 70);
+    bash_provider.enqueue_events(turn_events(
+        &model,
+        vec![
+            AssistantBlock::ToolCall(make_tool_call(
+                "c_tiny_ascii",
+                "bash",
+                json!({ "command": format!("printf '%s' '{payload_70}'") }),
+            )),
+            AssistantBlock::ToolCall(make_tool_call(
+                "c_tiny_utf8",
+                "bash",
+                json!({ "command": "printf 'a你好世界🚀0123456789abcdef0123456789abcdef'" }),
+            )),
+        ],
+        StopReason::ToolUse,
+    ));
+    bash_provider.enqueue_events(turn_events(
+        &model,
+        vec![AssistantBlock::Text(TextContent::plain("tiny budget ok"))],
+        StopReason::Stop,
+    ));
+    let bash_agent = Agent::new(
+        bash_provider,
+        AgentConfig::new(model)
+            .with_system_prompt("tiny-bash-e2e")
+            .with_tools(WorkspaceTools::build(bash_cfg)),
+    );
+    let bash_msgs = bash_agent.prompt("test tiny bash budget").await.unwrap();
+    let bash_results = tool_results_from(&bash_msgs);
+
+    let ascii_res = bash_results
+        .iter()
+        .find(|r| r.tool_call_id == "c_tiny_ascii")
+        .unwrap();
+    assert!(!ascii_res.is_error);
+    assert_eq!(result_text(ascii_res), "0123456789abcdef");
+
+    let utf8_res = bash_results
+        .iter()
+        .find(|r| r.tool_call_id == "c_tiny_utf8")
+        .unwrap();
+    assert!(!utf8_res.is_error);
+    let utf8_text = result_text(utf8_res);
+    assert_eq!(utf8_text, "a你好世界");
+    assert!(utf8_text.len() <= 16);
+    assert!(!utf8_text.contains('\u{FFFD}'));
+}

@@ -7,7 +7,8 @@ pub use sqlite::SqliteDurableStore;
 use crate::error::DurableError;
 use crate::types::{
     CommitBatch, CommitReceipt, CompletedToolRecord, ConversationRecord, DocumentRecord,
-    DocumentWrite, SignalDeliveryResult, SignalRecord, SubmissionRecord, TaskCheckpoint,
+    DocumentWrite, LeaseClaimResult, SignalDeliveryResult, SignalRecord, SubmissionRecord,
+    TaskCheckpoint,
 };
 use pikra_session::SessionEntry;
 use serde_json::Value;
@@ -142,6 +143,28 @@ pub trait DurableStore: Send + Sync {
             .map(|(_, rev)| rev)
             .ok_or_else(|| DurableError::Storage("document write returned no revision".into()))
     }
+
+    /// Atomically claim or renew an exclusive execution lease on a conversation.
+    ///
+    /// Succeeds when the conversation has no lease, has an expired lease
+    /// (`lease_expires_at_ms <= now_ms`), or is already leased by `lease_owner`.
+    /// Acquiring a lease from an unheld or different owner increments `checkpoint_version`
+    /// so any stale owner's in-flight commits are fenced out.
+    fn try_claim_conversation(
+        &self,
+        conversation_id: &str,
+        lease_owner: &str,
+        now_ms: u64,
+        lease_ttl_ms: u64,
+    ) -> Result<LeaseClaimResult, DurableError>;
+
+    /// Atomically release an execution lease if currently held by `lease_owner`.
+    fn release_conversation(
+        &self,
+        conversation_id: &str,
+        lease_owner: &str,
+        now_ms: u64,
+    ) -> Result<bool, DurableError>;
 
     /// Execute an atomic single-transaction batch commit.
     fn commit(&self, tx: CommitBatch) -> Result<CommitReceipt, DurableError>;

@@ -1,13 +1,24 @@
 use crate::clock::Clock;
 use crate::error::DurableError;
 use crate::store::DurableStore;
+use crate::types::DocumentWrite;
 use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone)]
+struct StagedDocumentWrite {
+    write: DocumentWrite,
+    next_revision: u64,
+}
 
 /// Runtime context supplied to [`DurableTool`] execution and resume callbacks.
+///
+/// Document writes performed via [`Self::put_document`] are staged in memory and committed
+/// atomically in the same [`crate::CommitBatch`] as the tool's completion or park checkpoint,
+/// preventing double-applied read-modify-write state on crash recovery or tool errors.
 #[derive(Clone)]
 pub struct DurableToolContext {
     pub conversation_id: String,
@@ -16,14 +27,43 @@ pub struct DurableToolContext {
     pub clock: Arc<dyn Clock>,
     pub store: Arc<dyn DurableStore>,
     pub cancel: CancelToken,
+    staged_documents: Arc<Mutex<Vec<StagedDocumentWrite>>>,
 }
 
 impl DurableToolContext {
+    pub(crate) fn new(
+        conversation_id: String,
+        submission_id: String,
+        tool_call_id: String,
+        clock: Arc<dyn Clock>,
+        store: Arc<dyn DurableStore>,
+        cancel: CancelToken,
+    ) -> Self {
+        Self {
+            conversation_id,
+            submission_id,
+            tool_call_id,
+            clock,
+            store,
+            cancel,
+            staged_documents: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
     }
 
     pub fn get_document(&self, key: &str) -> Result<Option<(u64, Value)>, DurableError> {
+        {
+            let staged = self
+                .staged_documents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = staged.iter().rev().find(|e| e.write.key == key) {
+                return Ok(Some((entry.next_revision, entry.write.value.clone())));
+            }
+        }
         self.store.get_document(&self.conversation_id, key)
     }
 
@@ -33,13 +73,68 @@ impl DurableToolContext {
         expected_revision: Option<u64>,
         value: Value,
     ) -> Result<u64, DurableError> {
-        self.store.put_document(
-            &self.conversation_id,
-            key,
-            expected_revision,
-            value,
-            self.now_ms(),
-        )
+        let mut staged = self
+            .staged_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current_rev = if let Some(entry) = staged.iter().rev().find(|e| e.write.key == key) {
+            Some(entry.next_revision)
+        } else {
+            self.store
+                .get_document(&self.conversation_id, key)?
+                .map(|(rev, _)| rev)
+        };
+
+        if current_rev != expected_revision {
+            return Err(DurableError::Conflict {
+                conversation_id: self.conversation_id.clone(),
+                key: key.to_string(),
+                expected: expected_revision,
+                actual: current_rev,
+            });
+        }
+
+        let next_revision = current_rev.unwrap_or(0) + 1;
+        staged.push(StagedDocumentWrite {
+            write: DocumentWrite {
+                key: key.to_string(),
+                expected_revision,
+                value,
+            },
+            next_revision,
+        });
+        Ok(next_revision)
+    }
+
+    pub(crate) fn staged_len(&self) -> usize {
+        self.staged_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    pub(crate) fn truncate_staged(&self, len: usize) {
+        let mut staged = self
+            .staged_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        staged.truncate(len);
+    }
+
+    pub(crate) fn peek_staged_document_writes(&self) -> Vec<DocumentWrite> {
+        self.staged_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|e| e.write.clone())
+            .collect()
+    }
+
+    pub(crate) fn clear_staged_document_writes(&self) {
+        self.staged_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 

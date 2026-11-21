@@ -6,9 +6,9 @@ use crate::tool::{
     AgentToolAdapter, DurableTool, DurableToolContext, DurableToolOutcome, SignalResolution,
 };
 use crate::types::{
-    CheckpointMutation, CommitBatch, CompletedToolRecord, ConversationRecord, ConversationStatus,
-    DurableEvent, ParkState, ParkedToolCall, RunOutcome, SignalDeliveryResult, SignalRecord,
-    SubmissionRecord, SubmissionState, TaskCheckpoint,
+    CheckpointMutation, CommitBatch, CommitReceipt, CompletedToolRecord, ConversationRecord,
+    ConversationStatus, DurableEvent, LeaseClaimResult, ParkState, ParkedToolCall, RunOutcome,
+    SignalDeliveryResult, SignalRecord, SubmissionRecord, SubmissionState, TaskCheckpoint,
 };
 use futures_util::StreamExt;
 use futures_util::lock::Mutex as AsyncMutex;
@@ -35,6 +35,9 @@ type DurableEventListener = Arc<dyn Fn(&DurableEvent) + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DurableSubscriptionId(u64);
 
+/// Default execution lease duration (60 seconds).
+pub const DEFAULT_LEASE_TTL_MS: u64 = 60_000;
+
 /// Configuration knobs for [`DurableEngine`].
 #[derive(Clone)]
 pub struct DurableEngineConfig {
@@ -42,6 +45,7 @@ pub struct DurableEngineConfig {
     pub compaction: CompactionConfig,
     pub compaction_strategy: Option<Arc<dyn CompactionStrategy>>,
     pub max_turns_per_submission: u32,
+    pub lease_ttl_ms: u64,
     pub api_key: Option<String>,
     pub thinking_level: ThinkingLevel,
     pub fast: bool,
@@ -59,6 +63,7 @@ impl Default for DurableEngineConfig {
             compaction: CompactionConfig::default(),
             compaction_strategy: None,
             max_turns_per_submission: 64,
+            lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
             api_key: None,
             thinking_level: ThinkingLevel::Off,
             fast: false,
@@ -73,6 +78,7 @@ impl Default for DurableEngineConfig {
 
 /// Embedded single-node durable execution engine backed by [`DurableStore`].
 pub struct DurableEngine {
+    engine_id: String,
     store: Arc<dyn DurableStore>,
     provider: Arc<dyn StreamProvider>,
     clock: Arc<dyn Clock>,
@@ -88,9 +94,162 @@ enum ToolStepResolution {
     Parked(ParkState),
 }
 
+struct ConversationLeaseGuard {
+    store: Arc<dyn DurableStore>,
+    clock: Arc<dyn Clock>,
+    conversation_id: String,
+    lease_owner: String,
+    lease_ttl_ms: u64,
+    checkpoint_version: u64,
+    lease_expires_at_ms: u64,
+    released: bool,
+}
+
+impl ConversationLeaseGuard {
+    fn try_acquire(
+        store: Arc<dyn DurableStore>,
+        clock: Arc<dyn Clock>,
+        conversation_id: &str,
+        lease_owner: &str,
+        lease_ttl_ms: u64,
+    ) -> Result<Result<Self, (String, u64)>, DurableError> {
+        let ttl = lease_ttl_ms.max(1);
+        let now = clock.now_ms();
+        match store.try_claim_conversation(conversation_id, lease_owner, now, ttl)? {
+            LeaseClaimResult::Acquired {
+                checkpoint_version,
+                lease_expires_at_ms,
+            } => Ok(Ok(Self {
+                store,
+                clock,
+                conversation_id: conversation_id.to_string(),
+                lease_owner: lease_owner.to_string(),
+                lease_ttl_ms: ttl,
+                checkpoint_version,
+                lease_expires_at_ms,
+                released: false,
+            })),
+            LeaseClaimResult::HeldByOther {
+                lease_owner,
+                lease_expires_at_ms,
+            } => Ok(Err((lease_owner, lease_expires_at_ms))),
+        }
+    }
+
+    fn renew(&mut self) -> Result<(), DurableError> {
+        let now = self.clock.now_ms();
+        match self.store.try_claim_conversation(
+            &self.conversation_id,
+            &self.lease_owner,
+            now,
+            self.lease_ttl_ms,
+        )? {
+            LeaseClaimResult::Acquired {
+                checkpoint_version,
+                lease_expires_at_ms,
+            } => {
+                self.checkpoint_version = checkpoint_version;
+                self.lease_expires_at_ms = lease_expires_at_ms;
+                Ok(())
+            }
+            LeaseClaimResult::HeldByOther {
+                lease_owner,
+                lease_expires_at_ms,
+            } => {
+                self.released = true;
+                Err(DurableError::Busy {
+                    conversation_id: self.conversation_id.clone(),
+                    lease_owner,
+                    lease_expires_at_ms,
+                })
+            }
+        }
+    }
+
+    fn maybe_renew(&mut self) -> Result<(), DurableError> {
+        let now = self.clock.now_ms();
+        let half_ttl = (self.lease_ttl_ms / 2).max(1);
+        if now.saturating_add(half_ttl) >= self.lease_expires_at_ms {
+            self.renew()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_batch(&self, batch: &mut CommitBatch, release_lease: bool) {
+        batch.expected_lease_owner = Some(self.lease_owner.clone());
+        batch.expected_checkpoint_version = Some(self.checkpoint_version);
+        if release_lease {
+            batch.release_lease = true;
+            batch.renew_lease_expires_at_ms = None;
+        } else {
+            batch.release_lease = false;
+            batch.renew_lease_expires_at_ms = Some(batch.now_ms.saturating_add(self.lease_ttl_ms));
+        }
+    }
+
+    fn commit(
+        &mut self,
+        mut batch: CommitBatch,
+        release_lease: bool,
+    ) -> Result<CommitReceipt, DurableError> {
+        self.prepare_batch(&mut batch, release_lease);
+        let next_expires = batch.renew_lease_expires_at_ms;
+        let receipt = self.store.commit(batch)?;
+        self.checkpoint_version = receipt.checkpoint_version;
+        if release_lease {
+            self.released = true;
+        } else if let Some(expires_at) = next_expires {
+            self.lease_expires_at_ms = expires_at;
+        }
+        Ok(receipt)
+    }
+
+    fn commit_or_peek_signal(
+        &mut self,
+        mut batch: CommitBatch,
+        signal_key: &str,
+        exclude_signal_ids: &[String],
+        max_received_at_ms: Option<u64>,
+        release_lease: bool,
+    ) -> Result<Result<CommitReceipt, SignalRecord>, DurableError> {
+        self.prepare_batch(&mut batch, release_lease);
+        let next_expires = batch.renew_lease_expires_at_ms;
+        match self.store.commit_or_peek_signal(
+            batch,
+            signal_key,
+            exclude_signal_ids,
+            max_received_at_ms,
+        )? {
+            Ok(receipt) => {
+                self.checkpoint_version = receipt.checkpoint_version;
+                if release_lease {
+                    self.released = true;
+                } else if let Some(expires_at) = next_expires {
+                    self.lease_expires_at_ms = expires_at;
+                }
+                Ok(Ok(receipt))
+            }
+            Err(sig) => Ok(Err(sig)),
+        }
+    }
+}
+
+impl Drop for ConversationLeaseGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.store.release_conversation(
+                &self.conversation_id,
+                &self.lease_owner,
+                self.clock.now_ms(),
+            );
+        }
+    }
+}
+
 impl DurableEngine {
     pub fn new(store: Arc<dyn DurableStore>, provider: Arc<dyn StreamProvider>) -> Self {
         Self {
+            engine_id: Uuid::now_v7().to_string(),
             store,
             provider,
             clock: Arc::new(SystemClock),
@@ -100,6 +259,28 @@ impl DurableEngine {
             next_sub_id: AtomicU64::new(1),
             conv_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn engine_id(&self) -> &str {
+        &self.engine_id
+    }
+
+    pub fn with_lease_ttl_ms(mut self, lease_ttl_ms: u64) -> Self {
+        self.config.lease_ttl_ms = lease_ttl_ms.max(1);
+        self
+    }
+
+    fn try_acquire_lease(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Result<ConversationLeaseGuard, (String, u64)>, DurableError> {
+        ConversationLeaseGuard::try_acquire(
+            Arc::clone(&self.store),
+            Arc::clone(&self.clock),
+            conversation_id,
+            &self.engine_id,
+            self.config.lease_ttl_ms,
+        )
     }
 
     fn conversation_mutex(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
@@ -222,6 +403,9 @@ impl DurableEngine {
             status: ConversationStatus::Idle,
             active_model: model,
             system_prompt,
+            checkpoint_version: 0,
+            lease_owner: None,
+            lease_expires_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -300,6 +484,11 @@ impl DurableEngine {
         let conv_mutex = self.conversation_mutex(conversation_id);
         let _conv_guard = conv_mutex.lock().await;
 
+        let _ = self.require_conversation(conversation_id)?;
+        let mut lease = match self.try_acquire_lease(conversation_id)? {
+            Ok(lease) => lease,
+            Err(_) => return Ok(None),
+        };
         let conv = self.require_conversation(conversation_id)?;
         if self.store.get_checkpoint(conversation_id)?.is_some() {
             return Ok(None);
@@ -336,7 +525,7 @@ impl DurableEngine {
         batch.expected_head_entry_id = Some(expected_leaf_id);
         batch.require_no_checkpoint = true;
         batch.append_entries.push(entry.clone());
-        match self.store.commit(batch) {
+        match lease.commit(batch, true) {
             Ok(_) => {}
             Err(DurableError::Conflict { .. } | DurableError::ConversationBusy { .. }) => {
                 return Ok(None);
@@ -382,35 +571,34 @@ impl DurableEngine {
         let conv_mutex = self.conversation_mutex(conversation_id);
         let _conv_guard = conv_mutex.lock().await;
 
-        let conv = self.require_conversation(conversation_id)?;
+        let _ = self.require_conversation(conversation_id)?;
 
-        // Idempotency check: same submission_id never duplicates prompts or LLM execution.
+        // Fast idempotency check for already-settled submissions (no lease required).
+        if let Some(existing) = self.store.get_submission(conversation_id, submission_id)?
+            && let Some(settled) = settled_submission_outcome(existing)
+        {
+            return Ok(settled);
+        }
+
+        let mut lease = match self.try_acquire_lease(conversation_id)? {
+            Ok(lease) => lease,
+            Err((lease_owner, lease_expires_at_ms)) => {
+                return Err(DurableError::Busy {
+                    conversation_id: conversation_id.to_string(),
+                    lease_owner,
+                    lease_expires_at_ms,
+                });
+            }
+        };
+
+        // Re-check submission under the exclusive store lease to prevent TOCTOU races.
         if let Some(existing) = self.store.get_submission(conversation_id, submission_id)? {
-            return match existing.state {
-                SubmissionState::Completed {
-                    assistant_entry_id,
-                    final_text,
-                    stop_reason,
-                    usage,
-                } => Ok(RunOutcome::Completed {
-                    submission_id: existing.submission_id,
-                    assistant_entry_id,
-                    final_text,
-                    stop_reason,
-                    usage,
-                    deduplicated: true,
-                }),
-                SubmissionState::Failed { error } => Ok(RunOutcome::Failed {
-                    submission_id: existing.submission_id,
-                    error,
-                }),
-                SubmissionState::Cancelled => Ok(RunOutcome::Cancelled {
-                    submission_id: existing.submission_id,
-                }),
-                SubmissionState::Running | SubmissionState::Parked => {
-                    self.recover_locked(conversation_id, cancel).await
-                }
-            };
+            if let Some(settled) = settled_submission_outcome(existing) {
+                return Ok(settled);
+            }
+            return self
+                .drive_from_checkpoint(conversation_id, cancel, &mut lease)
+                .await;
         }
 
         if let Some(active_cp) = self.store.get_checkpoint(conversation_id)? {
@@ -420,6 +608,7 @@ impl DurableEngine {
             });
         }
 
+        let conv = self.require_conversation(conversation_id)?;
         let now = self.clock.now_ms();
         let user_entry = SessionEntry {
             id: Uuid::now_v7().to_string(),
@@ -449,14 +638,15 @@ impl DurableEngine {
             turn_index: 0,
             attempt: 0,
         });
-        self.store.commit(batch)?;
+        lease.commit(batch, false)?;
 
         self.emit(DurableEvent::SubmissionStarted {
             conversation_id: conversation_id.to_string(),
             submission_id: submission_id.to_string(),
         });
 
-        self.drive_from_checkpoint(conversation_id, cancel).await
+        self.drive_from_checkpoint(conversation_id, cancel, &mut lease)
+            .await
     }
 
     /// Reopen and recover an interrupted or parked conversation from its persisted checkpoint.
@@ -485,7 +675,16 @@ impl DurableEngine {
         if self.store.get_checkpoint(conversation_id)?.is_none() {
             return Ok(RunOutcome::Idle);
         }
-        self.drive_from_checkpoint(conversation_id, cancel).await
+        let mut lease = match self.try_acquire_lease(conversation_id)? {
+            Ok(lease) => lease,
+            // Another active engine holds a live lease on this conversation; skip instead of double-executing.
+            Err(_) => return Ok(RunOutcome::Idle),
+        };
+        if self.store.get_checkpoint(conversation_id)?.is_none() {
+            return Ok(RunOutcome::Idle);
+        }
+        self.drive_from_checkpoint(conversation_id, cancel, &mut lease)
+            .await
     }
 
     // ---- Core Durable State Machine ----
@@ -494,8 +693,10 @@ impl DurableEngine {
         &self,
         conversation_id: &str,
         cancel: CancelToken,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<RunOutcome, DurableError> {
         loop {
+            lease.renew()?;
             let Some(checkpoint) = self.store.get_checkpoint(conversation_id)? else {
                 return Ok(RunOutcome::Idle);
             };
@@ -513,6 +714,7 @@ impl DurableEngine {
                             turn_index,
                             expected_leaf_id,
                             &cancel,
+                            lease,
                         )
                         .await?
                     {
@@ -531,6 +733,7 @@ impl DurableEngine {
                             turn_index,
                             attempt,
                             &cancel,
+                            lease,
                         )
                         .await?
                     {
@@ -551,6 +754,7 @@ impl DurableEngine {
                             &assistant_entry_id,
                             &tool_calls,
                             &cancel,
+                            lease,
                         )
                         .await?
                     {
@@ -563,7 +767,14 @@ impl DurableEngine {
                     park,
                 } => {
                     if let Some(outcome) = self
-                        .step_parked(conversation_id, &submission_id, turn_index, park, &cancel)
+                        .step_parked(
+                            conversation_id,
+                            &submission_id,
+                            turn_index,
+                            park,
+                            &cancel,
+                            lease,
+                        )
                         .await?
                     {
                         return Ok(outcome);
@@ -580,9 +791,14 @@ impl DurableEngine {
         turn_index: u32,
         expected_leaf_id: Option<String>,
         cancel: &CancelToken,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<Option<RunOutcome>, DurableError> {
         if cancel.is_cancelled() {
-            return Ok(Some(self.commit_cancelled(conversation_id, submission_id)?));
+            return Ok(Some(self.commit_cancelled(
+                conversation_id,
+                submission_id,
+                lease,
+            )?));
         }
 
         let conv = self.require_conversation(conversation_id)?;
@@ -605,14 +821,20 @@ impl DurableEngine {
                     {
                         Ok(out) => out,
                         Err(_) if cancel.is_cancelled() => {
-                            return Ok(Some(
-                                self.commit_cancelled(conversation_id, submission_id)?,
-                            ));
+                            return Ok(Some(self.commit_cancelled(
+                                conversation_id,
+                                submission_id,
+                                lease,
+                            )?));
                         }
                         Err(err) => return Err(err.into()),
                     };
                 if cancel.is_cancelled() {
-                    return Ok(Some(self.commit_cancelled(conversation_id, submission_id)?));
+                    return Ok(Some(self.commit_cancelled(
+                        conversation_id,
+                        submission_id,
+                        lease,
+                    )?));
                 }
 
                 let now = self.clock.now_ms();
@@ -635,7 +857,7 @@ impl DurableEngine {
                     turn_index,
                     attempt: 0,
                 });
-                self.store.commit(batch)?;
+                lease.commit(batch, false)?;
 
                 self.emit(DurableEvent::Compacted {
                     conversation_id: conversation_id.to_string(),
@@ -655,7 +877,7 @@ impl DurableEngine {
             turn_index,
             attempt: 0,
         });
-        self.store.commit(batch)?;
+        lease.commit(batch, false)?;
         Ok(None)
     }
 
@@ -666,9 +888,14 @@ impl DurableEngine {
         turn_index: u32,
         attempt: u32,
         cancel: &CancelToken,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<Option<RunOutcome>, DurableError> {
         if cancel.is_cancelled() {
-            return Ok(Some(self.commit_cancelled(conversation_id, submission_id)?));
+            return Ok(Some(self.commit_cancelled(
+                conversation_id,
+                submission_id,
+                lease,
+            )?));
         }
 
         if turn_index >= self.config.max_turns_per_submission {
@@ -680,6 +907,7 @@ impl DurableEngine {
                 conversation_id,
                 submission_id,
                 err,
+                lease,
             )?));
         }
 
@@ -707,7 +935,7 @@ impl DurableEngine {
                     turn_index,
                     expected_leaf_id: conv.head_entry_id,
                 });
-                self.store.commit(batch)?;
+                lease.commit(batch, false)?;
                 return Ok(None);
             }
         }
@@ -724,11 +952,16 @@ impl DurableEngine {
                 turn_index,
                 &conv.active_model,
                 stream,
+                lease,
             )
-            .await;
+            .await?;
 
         if assistant_msg.stop_reason == StopReason::Aborted || cancel.is_cancelled() {
-            return Ok(Some(self.commit_cancelled(conversation_id, submission_id)?));
+            return Ok(Some(self.commit_cancelled(
+                conversation_id,
+                submission_id,
+                lease,
+            )?));
         }
 
         if assistant_msg.stop_reason == StopReason::Error {
@@ -742,7 +975,7 @@ impl DurableEngine {
                     turn_index,
                     attempt: attempt + 1,
                 });
-                self.store.commit(batch)?;
+                lease.commit(batch, false)?;
                 return Ok(None);
             }
             let err = assistant_msg
@@ -752,6 +985,7 @@ impl DurableEngine {
                 conversation_id,
                 submission_id,
                 err,
+                lease,
             )?));
         }
 
@@ -788,7 +1022,7 @@ impl DurableEngine {
             batch.append_entries.push(assistant_entry.clone());
             batch.upsert_submission = Some(sub);
             batch.checkpoint = CheckpointMutation::Clear;
-            self.store.commit(batch)?;
+            lease.commit(batch, true)?;
 
             self.emit(DurableEvent::SubmissionCompleted {
                 conversation_id: conversation_id.to_string(),
@@ -842,7 +1076,7 @@ impl DurableEngine {
                 turn_index: turn_index + 1,
                 attempt: 0,
             });
-            self.store.commit(batch)?;
+            lease.commit(batch, false)?;
             return Ok(None);
         }
 
@@ -855,10 +1089,11 @@ impl DurableEngine {
             assistant_entry_id: assistant_entry.id,
             tool_calls,
         });
-        self.store.commit(batch)?;
+        lease.commit(batch, false)?;
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn step_executing_tools(
         &self,
         conversation_id: &str,
@@ -867,6 +1102,7 @@ impl DurableEngine {
         assistant_entry_id: &str,
         tool_calls: &[ToolCall],
         cancel: &CancelToken,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<Option<RunOutcome>, DurableError> {
         let existing = self
             .store
@@ -890,8 +1126,14 @@ impl DurableEngine {
             }
 
             if cancel.is_cancelled() {
-                return Ok(Some(self.commit_cancelled(conversation_id, submission_id)?));
+                return Ok(Some(self.commit_cancelled(
+                    conversation_id,
+                    submission_id,
+                    lease,
+                )?));
             }
+
+            lease.renew()?;
 
             let raw_args = Value::Object(tc.arguments.clone());
             self.emit(DurableEvent::ToolStarted {
@@ -907,8 +1149,12 @@ impl DurableEngine {
 
             let initial_outcome = match (tool_opt, prepared_or_err) {
                 (Some(tool), Ok(validated_args)) => {
+                    let staged_mark = tool_ctx.staged_len();
                     let res = tool.execute(&tool_ctx, validated_args.clone()).await;
-                    (Some((tool, validated_args)), outcome_from_tool_result(res))
+                    (
+                        Some((tool, validated_args)),
+                        outcome_from_tool_result(res, &tool_ctx, staged_mark),
+                    )
                 }
                 (_, Err(immediate_err)) => (None, DurableToolOutcome::Completed(immediate_err)),
                 (None, Ok(_)) => (
@@ -933,6 +1179,7 @@ impl DurableEngine {
                     initial_outcome.1,
                     Vec::new(),
                     false,
+                    lease,
                 )
                 .await?
             {
@@ -1011,7 +1258,7 @@ impl DurableEngine {
             batch.append_entries = tr_entries;
             batch.upsert_submission = Some(sub);
             batch.checkpoint = CheckpointMutation::Clear;
-            self.store.commit(batch)?;
+            lease.commit(batch, true)?;
 
             self.emit(DurableEvent::SubmissionCompleted {
                 conversation_id: conversation_id.to_string(),
@@ -1039,7 +1286,7 @@ impl DurableEngine {
             turn_index: turn_index + 1,
             attempt: 0,
         });
-        self.store.commit(batch)?;
+        lease.commit(batch, false)?;
         Ok(None)
     }
 
@@ -1050,9 +1297,14 @@ impl DurableEngine {
         turn_index: u32,
         park: ParkState,
         cancel: &CancelToken,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<Option<RunOutcome>, DurableError> {
         if cancel.is_cancelled() {
-            return Ok(Some(self.commit_cancelled(conversation_id, submission_id)?));
+            return Ok(Some(self.commit_cancelled(
+                conversation_id,
+                submission_id,
+                lease,
+            )?));
         }
 
         let now = self.clock.now_ms();
@@ -1083,7 +1335,7 @@ impl DurableEngine {
                         turn_index,
                         attempt: 0,
                     });
-                    self.store.commit(batch)?;
+                    lease.commit(batch, false)?;
                     return Ok(None);
                 };
 
@@ -1095,6 +1347,7 @@ impl DurableEngine {
                     None,
                     Vec::new(),
                     cancel,
+                    lease,
                 )
                 .await
             }
@@ -1137,7 +1390,7 @@ impl DurableEngine {
                         turn_index,
                         attempt: 0,
                     });
-                    self.store.commit(batch)?;
+                    lease.commit(batch, false)?;
                     return Ok(None);
                 };
 
@@ -1149,6 +1402,7 @@ impl DurableEngine {
                     Some(resolution),
                     consume_ids,
                     cancel,
+                    lease,
                 )
                 .await
             }
@@ -1165,6 +1419,7 @@ impl DurableEngine {
         signal_resolution: Option<SignalResolution>,
         consume_signal_ids: Vec<String>,
         cancel: &CancelToken,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<Option<RunOutcome>, DurableError> {
         let tc = &parked_tc.tool_call;
         let (tool_opt, prepared_or_err) = self.prepare_tool_call(tc);
@@ -1172,6 +1427,7 @@ impl DurableEngine {
 
         let (tool_and_args, initial_outcome) = match (tool_opt, prepared_or_err) {
             (Some(tool), Ok(validated_args)) => {
+                let staged_mark = tool_ctx.staged_len();
                 let res = match signal_resolution {
                     Some(resolution) => {
                         tool.resume_with_signal(
@@ -1191,7 +1447,10 @@ impl DurableEngine {
                         .await
                     }
                 };
-                (Some((tool, validated_args)), outcome_from_tool_result(res))
+                (
+                    Some((tool, validated_args)),
+                    outcome_from_tool_result(res, &tool_ctx, staged_mark),
+                )
             }
             (_, Err(err_res)) => (None, DurableToolOutcome::Completed(err_res)),
             (None, Ok(_)) => (
@@ -1216,6 +1475,7 @@ impl DurableEngine {
                 initial_outcome,
                 consume_signal_ids,
                 true,
+                lease,
             )
             .await?
         {
@@ -1240,7 +1500,8 @@ impl DurableEngine {
     /// Drive a tool outcome until it either commits a [`CompletedToolRecord`] or durably parks.
     ///
     /// Handles pre-buffered signals and already-elapsed timers immediately while keeping all
-    /// signal consumptions atomic with the final committed record or park checkpoint.
+    /// signal consumptions and staged document mutations atomic with the final committed record
+    /// or park checkpoint.
     #[allow(clippy::too_many_arguments)]
     async fn settle_tool_outcome(
         &self,
@@ -1255,6 +1516,7 @@ impl DurableEngine {
         mut outcome: DurableToolOutcome,
         mut consume_signal_ids: Vec<String>,
         resuming_from_park: bool,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<ToolStepResolution, DurableError> {
         loop {
             match outcome {
@@ -1281,6 +1543,7 @@ impl DurableEngine {
                     let mut batch = CommitBatch::new(conversation_id, now);
                     batch.record_completed_tools.push(record.clone());
                     batch.consume_signal_ids = consume_signal_ids;
+                    batch.document_writes = tool_ctx.peek_staged_document_writes();
                     if resuming_from_park {
                         let sub = self.updated_submission(
                             conversation_id,
@@ -1298,7 +1561,8 @@ impl DurableEngine {
                                 tool_calls: batch_tool_calls.to_vec(),
                             });
                     }
-                    self.store.commit(batch)?;
+                    lease.commit(batch, false)?;
+                    tool_ctx.clear_staged_document_writes();
                     return Ok(ToolStepResolution::Completed(record));
                 }
                 DurableToolOutcome::SleepUntil {
@@ -1308,10 +1572,11 @@ impl DurableEngine {
                     if self.clock.now_ms() >= wake_at_ms
                         && let Some((tool, args)) = tool_and_args
                     {
+                        let staged_mark = tool_ctx.staged_len();
                         let res = tool
                             .resume_after_sleep(tool_ctx, args.clone(), checkpoint)
                             .await;
-                        outcome = outcome_from_tool_result(res);
+                        outcome = outcome_from_tool_result(res, tool_ctx, staged_mark);
                         continue;
                     }
 
@@ -1331,6 +1596,8 @@ impl DurableEngine {
                         tc,
                         &park,
                         consume_signal_ids,
+                        tool_ctx,
+                        lease,
                     )?;
                     return Ok(ToolStepResolution::Parked(park));
                 }
@@ -1347,6 +1614,7 @@ impl DurableEngine {
                             timeout_at_ms,
                         )? {
                             consume_signal_ids.push(sig.signal_id);
+                            let staged_mark = tool_ctx.staged_len();
                             let res = tool
                                 .resume_with_signal(
                                     tool_ctx,
@@ -1355,10 +1623,11 @@ impl DurableEngine {
                                     SignalResolution::Received(sig.payload),
                                 )
                                 .await;
-                            outcome = outcome_from_tool_result(res);
+                            outcome = outcome_from_tool_result(res, tool_ctx, staged_mark);
                             continue;
                         }
                         if timeout_at_ms.is_some_and(|t| self.clock.now_ms() >= t) {
+                            let staged_mark = tool_ctx.staged_len();
                             let res = tool
                                 .resume_with_signal(
                                     tool_ctx,
@@ -1367,7 +1636,7 @@ impl DurableEngine {
                                     SignalResolution::TimedOut,
                                 )
                                 .await;
-                            outcome = outcome_from_tool_result(res);
+                            outcome = outcome_from_tool_result(res, tool_ctx, staged_mark);
                             continue;
                         }
                     }
@@ -1393,9 +1662,12 @@ impl DurableEngine {
                         &signal_key,
                         timeout_at_ms,
                         &consume_signal_ids,
+                        tool_ctx,
+                        lease,
                     )? && let Some((tool, args)) = tool_and_args
                     {
                         consume_signal_ids.push(arrived_sig.signal_id);
+                        let staged_mark = tool_ctx.staged_len();
                         let res = tool
                             .resume_with_signal(
                                 tool_ctx,
@@ -1404,7 +1676,7 @@ impl DurableEngine {
                                 SignalResolution::Received(arrived_sig.payload),
                             )
                             .await;
-                        outcome = outcome_from_tool_result(res);
+                        outcome = outcome_from_tool_result(res, tool_ctx, staged_mark);
                         continue;
                     }
                     return Ok(ToolStepResolution::Parked(park));
@@ -1439,6 +1711,8 @@ impl DurableEngine {
         signal_key: &str,
         timeout_at_ms: Option<u64>,
         consume_signal_ids: &[String],
+        tool_ctx: &DurableToolContext,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<Option<SignalRecord>, DurableError> {
         let now = self.clock.now_ms();
         let sub =
@@ -1447,18 +1721,21 @@ impl DurableEngine {
         batch.update_status = Some(ConversationStatus::Parked);
         batch.upsert_submission = Some(sub);
         batch.consume_signal_ids = consume_signal_ids.to_vec();
+        batch.document_writes = tool_ctx.peek_staged_document_writes();
         batch.checkpoint = CheckpointMutation::Set(TaskCheckpoint::Parked {
             submission_id: submission_id.to_string(),
             turn_index,
             park: park.clone(),
         });
-        match self.store.commit_or_peek_signal(
+        match lease.commit_or_peek_signal(
             batch,
             signal_key,
             consume_signal_ids,
             timeout_at_ms,
+            true,
         )? {
             Ok(_) => {
+                tool_ctx.clear_staged_document_writes();
                 self.emit(DurableEvent::ToolParked {
                     conversation_id: conversation_id.to_string(),
                     submission_id: submission_id.to_string(),
@@ -1477,6 +1754,7 @@ impl DurableEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_park(
         &self,
         conversation_id: &str,
@@ -1485,6 +1763,8 @@ impl DurableEngine {
         tc: &ToolCall,
         park: &ParkState,
         consume_signal_ids: Vec<String>,
+        tool_ctx: &DurableToolContext,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<(), DurableError> {
         let now = self.clock.now_ms();
         let sub =
@@ -1493,12 +1773,14 @@ impl DurableEngine {
         batch.update_status = Some(ConversationStatus::Parked);
         batch.upsert_submission = Some(sub);
         batch.consume_signal_ids = consume_signal_ids;
+        batch.document_writes = tool_ctx.peek_staged_document_writes();
         batch.checkpoint = CheckpointMutation::Set(TaskCheckpoint::Parked {
             submission_id: submission_id.to_string(),
             turn_index,
             park: park.clone(),
         });
-        self.store.commit(batch)?;
+        lease.commit(batch, true)?;
+        tool_ctx.clear_staged_document_writes();
 
         self.emit(DurableEvent::ToolParked {
             conversation_id: conversation_id.to_string(),
@@ -1520,6 +1802,7 @@ impl DurableEngine {
         conversation_id: &str,
         submission_id: &str,
         error: String,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<RunOutcome, DurableError> {
         let now = self.clock.now_ms();
         let sub = self.updated_submission(
@@ -1534,7 +1817,7 @@ impl DurableEngine {
         batch.update_status = Some(ConversationStatus::Failed);
         batch.upsert_submission = Some(sub);
         batch.checkpoint = CheckpointMutation::Clear;
-        self.store.commit(batch)?;
+        lease.commit(batch, true)?;
 
         self.emit(DurableEvent::SubmissionFailed {
             conversation_id: conversation_id.to_string(),
@@ -1551,6 +1834,7 @@ impl DurableEngine {
         &self,
         conversation_id: &str,
         submission_id: &str,
+        lease: &mut ConversationLeaseGuard,
     ) -> Result<RunOutcome, DurableError> {
         let now = self.clock.now_ms();
         let conv = self.require_conversation(conversation_id)?;
@@ -1627,7 +1911,7 @@ impl DurableEngine {
         batch.append_entries = flush_entries;
         batch.upsert_submission = Some(sub);
         batch.checkpoint = CheckpointMutation::Clear;
-        self.store.commit(batch)?;
+        lease.commit(batch, true)?;
 
         Ok(RunOutcome::Cancelled {
             submission_id: submission_id.to_string(),
@@ -1668,14 +1952,14 @@ impl DurableEngine {
         tool_call_id: &str,
         cancel: &CancelToken,
     ) -> DurableToolContext {
-        DurableToolContext {
-            conversation_id: conversation_id.to_string(),
-            submission_id: submission_id.to_string(),
-            tool_call_id: tool_call_id.to_string(),
-            clock: Arc::clone(&self.clock),
-            store: Arc::clone(&self.store),
-            cancel: cancel.clone(),
-        }
+        DurableToolContext::new(
+            conversation_id.to_string(),
+            submission_id.to_string(),
+            tool_call_id.to_string(),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.store),
+            cancel.clone(),
+        )
     }
 
     fn prepare_tool_call(
@@ -1752,9 +2036,16 @@ impl DurableEngine {
         turn_index: u32,
         model: &Model,
         mut stream: AssistantEventStream,
-    ) -> AssistantMessage {
+        lease: &mut ConversationLeaseGuard,
+    ) -> Result<AssistantMessage, DurableError> {
         let mut final_msg: Option<AssistantMessage> = None;
         while let Some(event) = stream.next().await {
+            if !matches!(
+                event,
+                AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
+            ) {
+                lease.maybe_renew()?;
+            }
             self.emit(DurableEvent::AssistantEvent {
                 conversation_id: conversation_id.to_string(),
                 submission_id: submission_id.to_string(),
@@ -1771,7 +2062,7 @@ impl DurableEngine {
                 _ => {}
             }
         }
-        final_msg.unwrap_or_else(|| AssistantMessage {
+        Ok(final_msg.unwrap_or_else(|| AssistantMessage {
             content: Vec::new(),
             api: model.api.clone(),
             provider: model.provider.clone(),
@@ -1784,13 +2075,46 @@ impl DurableEngine {
             diagnostics: Vec::new(),
             timestamp: self.clock.now_ms(),
             duration_ms: None,
-        })
+        }))
     }
 }
 
-fn outcome_from_tool_result(res: Result<DurableToolOutcome, String>) -> DurableToolOutcome {
+fn settled_submission_outcome(existing: SubmissionRecord) -> Option<RunOutcome> {
+    match existing.state {
+        SubmissionState::Completed {
+            assistant_entry_id,
+            final_text,
+            stop_reason,
+            usage,
+        } => Some(RunOutcome::Completed {
+            submission_id: existing.submission_id,
+            assistant_entry_id,
+            final_text,
+            stop_reason,
+            usage,
+            deduplicated: true,
+        }),
+        SubmissionState::Failed { error } => Some(RunOutcome::Failed {
+            submission_id: existing.submission_id,
+            error,
+        }),
+        SubmissionState::Cancelled => Some(RunOutcome::Cancelled {
+            submission_id: existing.submission_id,
+        }),
+        SubmissionState::Running | SubmissionState::Parked => None,
+    }
+}
+
+fn outcome_from_tool_result(
+    res: Result<DurableToolOutcome, String>,
+    tool_ctx: &DurableToolContext,
+    staged_mark: usize,
+) -> DurableToolOutcome {
     match res {
         Ok(outcome) => outcome,
-        Err(err) => DurableToolOutcome::Completed(AgentToolResult::error(err)),
+        Err(err) => {
+            tool_ctx.truncate_staged(staged_mark);
+            DurableToolOutcome::Completed(AgentToolResult::error(err))
+        }
     }
 }

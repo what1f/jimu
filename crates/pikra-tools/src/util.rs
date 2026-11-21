@@ -1,8 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PATH_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+const MAX_SYMLINK_HOPS: usize = 40;
 
 /// Resolve a tool path relative to `base_cwd` (preserving absolute paths as-is).
 pub(crate) fn resolve_path(base_cwd: &Path, raw: &str) -> Result<PathBuf, String> {
@@ -23,8 +28,113 @@ pub(crate) fn display_path(base_cwd: &Path, path: &Path) -> String {
     shown.to_string_lossy().replace('\\', "/")
 }
 
-/// Atomically write `bytes` to `target`, creating parent directories automatically.
-pub(crate) async fn atomic_write_file(target: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Canonicalize the nearest existing ancestor of `path` and re-attach remaining components
+/// so per-path write locks serialize equivalent paths consistently.
+async fn normalize_nonexistent_path(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = tokio::fs::canonicalize(cur).await {
+            let mut out = canon;
+            for part in missing.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                missing.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Resolve the real target file path before acquiring a write lock or renaming a temp file.
+///
+/// If `target` is an existing symlink, resolves it to the real target path so atomic
+/// temp-file + `rename` writes into the resolved target's parent directory and preserves
+/// the symlink intact.
+pub(crate) async fn resolve_write_target(target: &Path) -> Result<PathBuf, String> {
+    match tokio::fs::symlink_metadata(target).await {
+        Ok(meta) if meta.file_type().is_symlink() => match tokio::fs::canonicalize(target).await {
+            Ok(real) => Ok(real),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // Dangling symlink: walk symlink hops so `write` creates the linked target
+                // while preserving the symlink (and `edit` still reports missing target).
+                let mut cur = target.to_path_buf();
+                for _ in 0..MAX_SYMLINK_HOPS {
+                    match tokio::fs::symlink_metadata(&cur).await {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            let link = tokio::fs::read_link(&cur).await.map_err(|e| {
+                                format!("failed to read symlink '{}': {e}", cur.display())
+                            })?;
+                            cur = if link.is_absolute() {
+                                link
+                            } else {
+                                cur.parent()
+                                    .filter(|p| !p.as_os_str().is_empty())
+                                    .unwrap_or_else(|| Path::new("."))
+                                    .join(link)
+                            };
+                        }
+                        Ok(_) => {
+                            return tokio::fs::canonicalize(&cur).await.map_err(|e| {
+                                format!("failed to resolve symlink '{}': {e}", target.display())
+                            });
+                        }
+                        Err(e) if e.kind() == ErrorKind::NotFound => {
+                            return Ok(normalize_nonexistent_path(&cur).await);
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "failed to resolve symlink '{}': {e}",
+                                target.display()
+                            ));
+                        }
+                    }
+                }
+                Err(format!(
+                    "failed to resolve symlink '{}': too many levels of symbolic links",
+                    target.display()
+                ))
+            }
+            Err(err) => Err(format!(
+                "failed to resolve symlink '{}': {err}",
+                target.display()
+            )),
+        },
+        Ok(_) => Ok(tokio::fs::canonicalize(target)
+            .await
+            .unwrap_or_else(|_| target.to_path_buf())),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            Ok(normalize_nonexistent_path(target).await)
+        }
+        Err(_) => Ok(target.to_path_buf()),
+    }
+}
+
+/// Acquire an exclusive async lock scoped to the resolved file path.
+pub(crate) async fn lock_path(path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let map = PATH_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(existing) = guard.get(path).and_then(Weak::upgrade) {
+            existing
+        } else {
+            let created = Arc::new(tokio::sync::Mutex::new(()));
+            guard.insert(path.to_path_buf(), Arc::downgrade(&created));
+            created
+        }
+    };
+    lock.lock_owned().await
+}
+
+/// Atomically write `bytes` to an already-resolved and locked `target`, creating parent
+/// directories automatically.
+pub(crate) async fn atomic_write_file_resolved(target: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Ok(meta) = tokio::fs::metadata(target).await
         && meta.is_dir()
     {
@@ -253,36 +363,38 @@ impl BoundedOutputBuffer {
                 self.head.extend_from_slice(chunk);
                 return;
             }
-            // Transition to bounded head + rolling tail mode.
+            // Transition to bounded head + rolling tail mode while filling `head` up to
+            // `max_bytes` so small-budget renders (< compact marker length) still have a
+            // full prefix available.
             self.overflowed = true;
-            let excess = if self.head.len() > self.head_cap {
-                self.head.split_off(self.head_cap)
-            } else {
-                Vec::new()
-            };
-            self.push_tail(&excess);
-            self.push_tail(chunk);
+            let need = self.max_bytes.saturating_sub(self.head.len());
+            let take = need.min(chunk.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            if self.head.len() > self.head_cap {
+                Self::push_tail(&mut self.tail, self.tail_cap, &self.head[self.head_cap..]);
+            }
+            Self::push_tail(&mut self.tail, self.tail_cap, &chunk[take..]);
         } else {
-            self.push_tail(chunk);
+            Self::push_tail(&mut self.tail, self.tail_cap, chunk);
         }
     }
 
-    fn push_tail(&mut self, bytes: &[u8]) {
-        if self.tail_cap == 0 || bytes.is_empty() {
+    fn push_tail(tail: &mut VecDeque<u8>, tail_cap: usize, bytes: &[u8]) {
+        if tail_cap == 0 || bytes.is_empty() {
             return;
         }
-        if bytes.len() >= self.tail_cap {
-            self.tail.clear();
-            let start = bytes.len() - self.tail_cap;
-            self.tail.extend(&bytes[start..]);
+        if bytes.len() >= tail_cap {
+            tail.clear();
+            let start = bytes.len() - tail_cap;
+            tail.extend(&bytes[start..]);
             return;
         }
-        let needed = self.tail.len() + bytes.len();
-        if needed > self.tail_cap {
-            let drop_count = needed - self.tail_cap;
-            self.tail.drain(..drop_count);
+        let needed = tail.len() + bytes.len();
+        if needed > tail_cap {
+            let drop_count = needed - tail_cap;
+            tail.drain(..drop_count);
         }
-        self.tail.extend(bytes);
+        tail.extend(bytes);
     }
 
     /// Render captured bytes into UTF-8 text bounded by `budget` (at most `self.max_bytes`).
@@ -363,18 +475,15 @@ fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
     if bytes.is_empty() {
         return bytes;
     }
-    let check_len = bytes.len().min(4);
-    let tail = &bytes[bytes.len() - check_len..];
-    match std::str::from_utf8(tail) {
+    let mut start = bytes.len() - 1;
+    let floor = bytes.len().saturating_sub(4);
+    while start > floor && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
+        start -= 1;
+    }
+    match std::str::from_utf8(&bytes[start..]) {
         Ok(_) => bytes,
-        Err(err) => {
-            if err.error_len().is_none() {
-                // Incomplete sequence at the very end; trim it cleanly.
-                &bytes[..bytes.len() - check_len + err.valid_up_to()]
-            } else {
-                bytes
-            }
-        }
+        Err(err) if err.error_len().is_none() => &bytes[..start],
+        Err(_) => bytes,
     }
 }
 

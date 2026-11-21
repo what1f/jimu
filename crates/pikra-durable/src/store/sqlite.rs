@@ -2,8 +2,8 @@ use crate::error::DurableError;
 use crate::store::DurableStore;
 use crate::types::{
     CheckpointMutation, CommitBatch, CommitReceipt, CompletedToolRecord, ConversationRecord,
-    ConversationStatus, DocumentRecord, SignalDeliveryResult, SignalRecord, SubmissionRecord,
-    TaskCheckpoint,
+    ConversationStatus, DocumentRecord, LeaseClaimResult, SignalDeliveryResult, SignalRecord,
+    SubmissionRecord, TaskCheckpoint,
 };
 use pikra_session::SessionEntry;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     status TEXT NOT NULL,
     active_model_json TEXT NOT NULL,
     system_prompt TEXT NOT NULL,
+    checkpoint_version INTEGER NOT NULL DEFAULT 0,
+    lease_owner TEXT,
+    lease_expires_at_ms INTEGER,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
@@ -95,9 +98,13 @@ type RawConversationRow = (
     String,
     String,
     i64,
+    Option<String>,
+    Option<i64>,
+    i64,
     i64,
 );
 type RawSignalRow = (String, String, String, String, i64, Option<i64>);
+type ConversationLeaseStateRow = (Option<String>, i64, Option<String>, Option<i64>);
 
 /// Single-node SQLite WAL [`DurableStore`] with atomic `IMMEDIATE` transactions.
 pub struct SqliteDurableStore {
@@ -169,6 +176,9 @@ impl SqliteDurableStore {
             row.get(5)?,
             row.get(6)?,
             row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
         ))
     }
 
@@ -180,6 +190,9 @@ impl SqliteDurableStore {
             status_str,
             active_model_json,
             system_prompt,
+            checkpoint_version,
+            lease_owner,
+            lease_expires_at_ms,
             created_at_ms,
             updated_at_ms,
         ) = tuple;
@@ -194,6 +207,9 @@ impl SqliteDurableStore {
             status,
             active_model,
             system_prompt,
+            checkpoint_version: checkpoint_version.max(0) as u64,
+            lease_owner,
+            lease_expires_at_ms: lease_expires_at_ms.map(|v| v.max(0) as u64),
             created_at_ms: created_at_ms.max(0) as u64,
             updated_at_ms: updated_at_ms.max(0) as u64,
         })
@@ -243,8 +259,9 @@ impl DurableStore for SqliteDurableStore {
         db_tx.execute(
             "INSERT INTO conversations (
                 conversation_id, session_id, head_entry_id, status,
-                active_model_json, system_prompt, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                active_model_json, system_prompt, checkpoint_version,
+                lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &record.conversation_id,
                 &record.session_id,
@@ -252,6 +269,9 @@ impl DurableStore for SqliteDurableStore {
                 record.status.as_str(),
                 &model_json,
                 &record.system_prompt,
+                record.checkpoint_version as i64,
+                &record.lease_owner,
+                record.lease_expires_at_ms.map(|v| v as i64),
                 record.created_at_ms as i64,
                 record.updated_at_ms as i64,
             ],
@@ -280,6 +300,7 @@ impl DurableStore for SqliteDurableStore {
             conversation_id: record.conversation_id,
             head_entry_id: record.head_entry_id,
             last_seq: seq,
+            checkpoint_version: record.checkpoint_version,
             document_revisions: Vec::new(),
         })
     }
@@ -292,7 +313,8 @@ impl DurableStore for SqliteDurableStore {
         let row = conn
             .query_row(
                 "SELECT conversation_id, session_id, head_entry_id, status,
-                        active_model_json, system_prompt, created_at_ms, updated_at_ms
+                        active_model_json, system_prompt, checkpoint_version,
+                        lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms
                  FROM conversations WHERE conversation_id = ?1",
                 params![conversation_id],
                 Self::parse_conversation_row,
@@ -305,7 +327,8 @@ impl DurableStore for SqliteDurableStore {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT conversation_id, session_id, head_entry_id, status,
-                    active_model_json, system_prompt, created_at_ms, updated_at_ms
+                    active_model_json, system_prompt, checkpoint_version,
+                    lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms
              FROM conversations ORDER BY created_at_ms ASC, conversation_id ASC",
         )?;
         let rows = stmt.query_map([], Self::parse_conversation_row)?;
@@ -536,6 +559,7 @@ impl DurableStore for SqliteDurableStore {
     ) -> Result<Result<CommitReceipt, SignalRecord>, DurableError> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_sqlite_lease_and_version(&db_tx, &tx)?;
         if let Some(sig) = query_next_unconsumed_signal(
             &db_tx,
             &tx.conversation_id,
@@ -621,6 +645,91 @@ impl DurableStore for SqliteDurableStore {
         Ok(out)
     }
 
+    fn try_claim_conversation(
+        &self,
+        conversation_id: &str,
+        lease_owner: &str,
+        now_ms: u64,
+        lease_ttl_ms: u64,
+    ) -> Result<LeaseClaimResult, DurableError> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let row: Option<(i64, Option<String>, Option<i64>)> = db_tx
+            .query_row(
+                "SELECT checkpoint_version, lease_owner, lease_expires_at_ms
+                 FROM conversations WHERE conversation_id = ?1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((cur_ver_raw, cur_owner, cur_expires_raw)) = row else {
+            return Err(DurableError::ConversationNotFound(
+                conversation_id.to_string(),
+            ));
+        };
+        let mut checkpoint_version = cur_ver_raw.max(0) as u64;
+        let cur_expires = cur_expires_raw.map(|v| v.max(0) as u64);
+
+        if let (Some(owner), Some(expires_at)) = (&cur_owner, cur_expires)
+            && owner != lease_owner
+            && expires_at > now_ms
+        {
+            return Ok(LeaseClaimResult::HeldByOther {
+                lease_owner: owner.clone(),
+                lease_expires_at_ms: expires_at,
+            });
+        }
+
+        if cur_owner.as_deref() != Some(lease_owner) {
+            checkpoint_version = checkpoint_version.saturating_add(1);
+        }
+        let lease_expires_at_ms = now_ms.saturating_add(lease_ttl_ms);
+
+        db_tx.execute(
+            "UPDATE conversations
+             SET checkpoint_version = ?1,
+                 lease_owner = ?2,
+                 lease_expires_at_ms = ?3,
+                 updated_at_ms = ?4
+             WHERE conversation_id = ?5",
+            params![
+                checkpoint_version as i64,
+                lease_owner,
+                lease_expires_at_ms as i64,
+                now_ms as i64,
+                conversation_id,
+            ],
+        )?;
+        db_tx.commit()?;
+
+        Ok(LeaseClaimResult::Acquired {
+            checkpoint_version,
+            lease_expires_at_ms,
+        })
+    }
+
+    fn release_conversation(
+        &self,
+        conversation_id: &str,
+        lease_owner: &str,
+        now_ms: u64,
+    ) -> Result<bool, DurableError> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = db_tx.execute(
+            "UPDATE conversations
+             SET lease_owner = NULL,
+                 lease_expires_at_ms = NULL,
+                 updated_at_ms = ?1
+             WHERE conversation_id = ?2 AND lease_owner = ?3",
+            params![now_ms as i64, conversation_id, lease_owner],
+        )?;
+        db_tx.commit()?;
+        Ok(updated > 0)
+    }
+
     fn commit(&self, tx: CommitBatch) -> Result<CommitReceipt, DurableError> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -628,6 +737,51 @@ impl DurableStore for SqliteDurableStore {
         db_tx.commit()?;
         Ok(receipt)
     }
+}
+
+fn validate_sqlite_lease_and_version(
+    db_tx: &rusqlite::Transaction<'_>,
+    tx: &CommitBatch,
+) -> Result<(), DurableError> {
+    if tx.expected_lease_owner.is_none() && tx.expected_checkpoint_version.is_none() {
+        return Ok(());
+    }
+    let row: Option<(i64, Option<String>)> = db_tx
+        .query_row(
+            "SELECT checkpoint_version, lease_owner FROM conversations WHERE conversation_id = ?1",
+            params![&tx.conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (actual_ver, actual_owner) = match row {
+        Some((v, o)) => (v.max(0) as u64, o),
+        None => {
+            return Err(DurableError::ConversationNotFound(
+                tx.conversation_id.clone(),
+            ));
+        }
+    };
+    if let Some(expected_owner) = &tx.expected_lease_owner
+        && actual_owner.as_deref() != Some(expected_owner.as_str())
+    {
+        return Err(DurableError::Conflict {
+            conversation_id: tx.conversation_id.clone(),
+            key: "__lease_owner__".into(),
+            expected: None,
+            actual: None,
+        });
+    }
+    if let Some(expected_ver) = tx.expected_checkpoint_version
+        && actual_ver != expected_ver
+    {
+        return Err(DurableError::Conflict {
+            conversation_id: tx.conversation_id.clone(),
+            key: "__checkpoint_version__".into(),
+            expected: Some(expected_ver),
+            actual: Some(actual_ver),
+        });
+    }
+    Ok(())
 }
 
 fn query_next_unconsumed_signal(
@@ -724,8 +878,9 @@ fn execute_commit_in_tx(
         db_tx.execute(
             "INSERT INTO conversations (
                 conversation_id, session_id, head_entry_id, status,
-                active_model_json, system_prompt, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                active_model_json, system_prompt, checkpoint_version,
+                lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(conversation_id) DO UPDATE SET
                 session_id = excluded.session_id,
                 head_entry_id = excluded.head_entry_id,
@@ -740,23 +895,30 @@ fn execute_commit_in_tx(
                 conv.status.as_str(),
                 &model_json,
                 &conv.system_prompt,
+                conv.checkpoint_version as i64,
+                &conv.lease_owner,
+                conv.lease_expires_at_ms.map(|v| v as i64),
                 conv.created_at_ms as i64,
                 tx.now_ms as i64,
             ],
         )?;
     }
 
-    let current_head: Option<Option<String>> = db_tx
+    let current_row: Option<ConversationLeaseStateRow> = db_tx
         .query_row(
-            "SELECT head_entry_id FROM conversations WHERE conversation_id = ?1",
+            "SELECT head_entry_id, checkpoint_version, lease_owner, lease_expires_at_ms
+             FROM conversations WHERE conversation_id = ?1",
             params![&tx.conversation_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let mut head_entry_id = match current_head {
-        Some(h) => h,
-        None => return Err(DurableError::ConversationNotFound(tx.conversation_id)),
-    };
+    let (mut head_entry_id, current_ver_raw, current_lease_owner, current_lease_expires_raw) =
+        match current_row {
+            Some(row) => row,
+            None => return Err(DurableError::ConversationNotFound(tx.conversation_id)),
+        };
+    let current_checkpoint_version = current_ver_raw.max(0) as u64;
+    let current_lease_expires_at_ms = current_lease_expires_raw.map(|v| v.max(0) as u64);
 
     if let Some(expected_head) = &tx.expected_head_entry_id
         && &head_entry_id != expected_head
@@ -768,6 +930,41 @@ fn execute_commit_in_tx(
             actual: None,
         });
     }
+
+    if let Some(expected_owner) = &tx.expected_lease_owner
+        && current_lease_owner.as_deref() != Some(expected_owner.as_str())
+    {
+        return Err(DurableError::Conflict {
+            conversation_id: tx.conversation_id,
+            key: "__lease_owner__".into(),
+            expected: None,
+            actual: None,
+        });
+    }
+
+    if let Some(expected_ver) = tx.expected_checkpoint_version
+        && current_checkpoint_version != expected_ver
+    {
+        return Err(DurableError::Conflict {
+            conversation_id: tx.conversation_id,
+            key: "__checkpoint_version__".into(),
+            expected: Some(expected_ver),
+            actual: Some(current_checkpoint_version),
+        });
+    }
+
+    let next_checkpoint_version = if tx.advances_checkpoint_version() {
+        current_checkpoint_version.saturating_add(1)
+    } else {
+        current_checkpoint_version
+    };
+    let (next_lease_owner, next_lease_expires_at_ms) = if tx.release_lease {
+        (None, None)
+    } else if let Some(expires_at) = tx.renew_lease_expires_at_ms {
+        (current_lease_owner, Some(expires_at))
+    } else {
+        (current_lease_owner, current_lease_expires_at_ms)
+    };
 
     if let Some(status) = tx.update_status {
         db_tx.execute(
@@ -808,16 +1005,25 @@ fn execute_commit_in_tx(
             )?;
             head_entry_id = Some(entry.id.clone());
         }
-        db_tx.execute(
-            "UPDATE conversations SET head_entry_id = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
-            params![&head_entry_id, tx.now_ms as i64, &tx.conversation_id],
-        )?;
-    } else {
-        db_tx.execute(
-            "UPDATE conversations SET updated_at_ms = ?1 WHERE conversation_id = ?2",
-            params![tx.now_ms as i64, &tx.conversation_id],
-        )?;
     }
+
+    db_tx.execute(
+        "UPDATE conversations
+         SET head_entry_id = ?1,
+             checkpoint_version = ?2,
+             lease_owner = ?3,
+             lease_expires_at_ms = ?4,
+             updated_at_ms = ?5
+         WHERE conversation_id = ?6",
+        params![
+            &head_entry_id,
+            next_checkpoint_version as i64,
+            &next_lease_owner,
+            next_lease_expires_at_ms.map(|v| v as i64),
+            tx.now_ms as i64,
+            &tx.conversation_id,
+        ],
+    )?;
 
     if let Some(sub) = &tx.upsert_submission {
         let state_json = serde_json::to_string(&sub.state)?;
@@ -931,6 +1137,7 @@ fn execute_commit_in_tx(
         conversation_id: tx.conversation_id,
         head_entry_id,
         last_seq: last_seq.max(0) as u64,
+        checkpoint_version: next_checkpoint_version,
         document_revisions,
     })
 }

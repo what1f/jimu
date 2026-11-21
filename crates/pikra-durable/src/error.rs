@@ -19,6 +19,15 @@ pub enum DurableError {
     },
 
     #[error(
+        "conversation `{conversation_id}` is currently leased by `{lease_owner}` until {lease_expires_at_ms}ms"
+    )]
+    Busy {
+        conversation_id: String,
+        lease_owner: String,
+        lease_expires_at_ms: u64,
+    },
+
+    #[error(
         "document CAS conflict on `{conversation_id}/{key}`: expected revision {expected:?}, actual {actual:?}"
     )]
     Conflict {

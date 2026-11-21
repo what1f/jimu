@@ -2,7 +2,8 @@ use crate::error::DurableError;
 use crate::store::DurableStore;
 use crate::types::{
     CheckpointMutation, CommitBatch, CommitReceipt, CompletedToolRecord, ConversationRecord,
-    DocumentRecord, SignalDeliveryResult, SignalRecord, SubmissionRecord, TaskCheckpoint,
+    DocumentRecord, LeaseClaimResult, SignalDeliveryResult, SignalRecord, SubmissionRecord,
+    TaskCheckpoint,
 };
 use pikra_session::SessionEntry;
 use serde_json::Value;
@@ -53,6 +54,7 @@ impl DurableStore for MemoryDurableStore {
             entries.push((seq, entry));
         }
         let head_entry_id = record.head_entry_id.clone();
+        let checkpoint_version = record.checkpoint_version;
         let bucket = ConversationBucket {
             record: Some(record),
             entries,
@@ -63,6 +65,7 @@ impl DurableStore for MemoryDurableStore {
             conversation_id: conv_id,
             head_entry_id,
             last_seq: seq,
+            checkpoint_version,
             document_revisions: Vec::new(),
         })
     }
@@ -205,11 +208,13 @@ impl DurableStore for MemoryDurableStore {
         max_received_at_ms: Option<u64>,
     ) -> Result<Result<CommitReceipt, SignalRecord>, DurableError> {
         let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(bucket) = guard.get(&tx.conversation_id)
-            && let Some(sig) =
+        if let Some(bucket) = guard.get(&tx.conversation_id) {
+            validate_lease_and_version(&tx, bucket.record.as_ref())?;
+            if let Some(sig) =
                 find_matching_signal(bucket, signal_key, exclude_signal_ids, max_received_at_ms)
-        {
-            return Ok(Err(sig));
+            {
+                return Ok(Err(sig));
+            }
         }
         commit_locked(&mut guard, tx).map(Ok)
     }
@@ -242,10 +247,103 @@ impl DurableStore for MemoryDurableStore {
             .unwrap_or_default())
     }
 
+    fn try_claim_conversation(
+        &self,
+        conversation_id: &str,
+        lease_owner: &str,
+        now_ms: u64,
+        lease_ttl_ms: u64,
+    ) -> Result<LeaseClaimResult, DurableError> {
+        let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(record) = guard
+            .get_mut(conversation_id)
+            .and_then(|b| b.record.as_mut())
+        else {
+            return Err(DurableError::ConversationNotFound(
+                conversation_id.to_string(),
+            ));
+        };
+
+        if let (Some(cur_owner), Some(cur_expires)) =
+            (&record.lease_owner, record.lease_expires_at_ms)
+            && cur_owner != lease_owner
+            && cur_expires > now_ms
+        {
+            return Ok(LeaseClaimResult::HeldByOther {
+                lease_owner: cur_owner.clone(),
+                lease_expires_at_ms: cur_expires,
+            });
+        }
+
+        if record.lease_owner.as_deref() != Some(lease_owner) {
+            record.checkpoint_version = record.checkpoint_version.saturating_add(1);
+        }
+        let lease_expires_at_ms = now_ms.saturating_add(lease_ttl_ms);
+        record.lease_owner = Some(lease_owner.to_string());
+        record.lease_expires_at_ms = Some(lease_expires_at_ms);
+        record.updated_at_ms = now_ms;
+
+        Ok(LeaseClaimResult::Acquired {
+            checkpoint_version: record.checkpoint_version,
+            lease_expires_at_ms,
+        })
+    }
+
+    fn release_conversation(
+        &self,
+        conversation_id: &str,
+        lease_owner: &str,
+        now_ms: u64,
+    ) -> Result<bool, DurableError> {
+        let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(record) = guard
+            .get_mut(conversation_id)
+            .and_then(|b| b.record.as_mut())
+        else {
+            return Ok(false);
+        };
+        if record.lease_owner.as_deref() == Some(lease_owner) {
+            record.lease_owner = None;
+            record.lease_expires_at_ms = None;
+            record.updated_at_ms = now_ms;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn commit(&self, tx: CommitBatch) -> Result<CommitReceipt, DurableError> {
         let mut guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         commit_locked(&mut guard, tx)
     }
+}
+
+fn validate_lease_and_version(
+    tx: &CommitBatch,
+    record: Option<&ConversationRecord>,
+) -> Result<(), DurableError> {
+    if let Some(expected_owner) = &tx.expected_lease_owner {
+        let actual_owner = record.and_then(|r| r.lease_owner.as_deref());
+        if actual_owner != Some(expected_owner.as_str()) {
+            return Err(DurableError::Conflict {
+                conversation_id: tx.conversation_id.clone(),
+                key: "__lease_owner__".into(),
+                expected: None,
+                actual: None,
+            });
+        }
+    }
+    if let Some(expected_ver) = tx.expected_checkpoint_version {
+        let actual_ver = record.map(|r| r.checkpoint_version).unwrap_or(0);
+        if actual_ver != expected_ver {
+            return Err(DurableError::Conflict {
+                conversation_id: tx.conversation_id.clone(),
+                key: "__checkpoint_version__".into(),
+                expected: Some(expected_ver),
+                actual: Some(actual_ver),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn find_matching_signal(
@@ -326,6 +424,9 @@ fn commit_locked(
                 });
             }
         }
+        validate_lease_and_version(&tx, bucket.record.as_ref())?;
+    } else {
+        validate_lease_and_version(&tx, None)?;
     }
 
     let mut staged_revisions: HashMap<String, Option<u64>> = HashMap::new();
@@ -353,6 +454,7 @@ fn commit_locked(
     }
 
     // Phase 2: Apply all mutations atomically while holding the lock.
+    let advances_version = tx.advances_checkpoint_version();
     let bucket = guard.entry(tx.conversation_id.clone()).or_default();
     if let Some(conv) = tx.upsert_conversation {
         bucket.record = Some(conv);
@@ -375,8 +477,18 @@ fn commit_locked(
         record.head_entry_id = Some(entry.id.clone());
         bucket.entries.push((last_seq, entry));
     }
+    if advances_version {
+        record.checkpoint_version = record.checkpoint_version.saturating_add(1);
+    }
+    if tx.release_lease {
+        record.lease_owner = None;
+        record.lease_expires_at_ms = None;
+    } else if let Some(expires_at) = tx.renew_lease_expires_at_ms {
+        record.lease_expires_at_ms = Some(expires_at);
+    }
     record.updated_at_ms = tx.now_ms;
     let head_entry_id = record.head_entry_id.clone();
+    let checkpoint_version = record.checkpoint_version;
 
     if let Some(sub) = tx.upsert_submission {
         bucket.submissions.insert(sub.submission_id.clone(), sub);
@@ -425,6 +537,7 @@ fn commit_locked(
         conversation_id: tx.conversation_id,
         head_entry_id,
         last_seq,
+        checkpoint_version,
         document_revisions,
     })
 }
