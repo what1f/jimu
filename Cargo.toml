@@ -49,7 +49,7 @@ pikra-session = { path = "crates/pikra-session" }
 pikra-durable = { path = "crates/pikra-durable" }
 pikra-js = { path = "crates/pikra-js" }
 pikra-tools = { path = "crates/pikra-tools" }
-pikra-kit = { path = "crates/pikra-kit" }
+pikra-kit = { path = "crates/pikra-kit", default-features = false }
 pikra-ffi = { path = "crates/pikra-ffi" }
 pikra-testkit = { path = "crates/pikra-testkit" }
 

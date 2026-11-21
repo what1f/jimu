@@ -19,7 +19,7 @@ pikra-session.workspace = true
 pikra-codemode.workspace = true
 pikra-js.workspace = true
 pikra-tools.workspace = true
-pikra-kit.workspace = true
+pikra-kit = { workspace = true, features = ["stdio"] }
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
