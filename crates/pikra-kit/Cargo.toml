@@ -22,3 +22,8 @@ futures-util.workspace = true
 futures-channel.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+pikra-testkit.workspace = true
+futures-executor.workspace = true
+tempfile.workspace = true
