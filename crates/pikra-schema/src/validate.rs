@@ -145,13 +145,13 @@ impl<'a> ValidateCtx<'a> {
     }
 
     fn check_object(&mut self, schema: &'a Map<String, Value>, obj: &Map<String, Value>) -> bool {
-        if let Some(min) = schema.get("minProperties").and_then(as_usize)
-            && obj.len() < min
+        if let Some(min) = schema.get("minProperties")
+            && cmp_len_bound(obj.len(), min) == Some(Ordering::Less)
         {
             return false;
         }
-        if let Some(max) = schema.get("maxProperties").and_then(as_usize)
-            && obj.len() > max
+        if let Some(max) = schema.get("maxProperties")
+            && cmp_len_bound(obj.len(), max) == Some(Ordering::Greater)
         {
             return false;
         }
@@ -183,13 +183,13 @@ impl<'a> ValidateCtx<'a> {
     }
 
     fn check_array(&mut self, schema: &'a Map<String, Value>, arr: &[Value]) -> bool {
-        if let Some(min) = schema.get("minItems").and_then(as_usize)
-            && arr.len() < min
+        if let Some(min) = schema.get("minItems")
+            && cmp_len_bound(arr.len(), min) == Some(Ordering::Less)
         {
             return false;
         }
-        if let Some(max) = schema.get("maxItems").and_then(as_usize)
-            && arr.len() > max
+        if let Some(max) = schema.get("maxItems")
+            && cmp_len_bound(arr.len(), max) == Some(Ordering::Greater)
         {
             return false;
         }
@@ -360,16 +360,16 @@ impl<'a> ValidateCtx<'a> {
             }
         }
 
-        if let Some(min) = schema.get("minProperties").and_then(as_usize)
-            && obj.len() < min
+        if let Some(min) = schema.get("minProperties")
+            && cmp_len_bound(obj.len(), min) == Some(Ordering::Less)
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
                 message: format!("must have at least {min} properties"),
             });
         }
-        if let Some(max) = schema.get("maxProperties").and_then(as_usize)
-            && obj.len() > max
+        if let Some(max) = schema.get("maxProperties")
+            && cmp_len_bound(obj.len(), max) == Some(Ordering::Greater)
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
@@ -391,16 +391,16 @@ impl<'a> ValidateCtx<'a> {
                 self.walk(item_schema, item, &item_path, out);
             }
         }
-        if let Some(min) = schema.get("minItems").and_then(as_usize)
-            && arr.len() < min
+        if let Some(min) = schema.get("minItems")
+            && cmp_len_bound(arr.len(), min) == Some(Ordering::Less)
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
                 message: format!("must have at least {min} items"),
             });
         }
-        if let Some(max) = schema.get("maxItems").and_then(as_usize)
-            && arr.len() > max
+        if let Some(max) = schema.get("maxItems")
+            && cmp_len_bound(arr.len(), max) == Some(Ordering::Greater)
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
@@ -554,17 +554,17 @@ impl<'a> ValidateCtx<'a> {
 }
 
 fn check_string(schema: &Map<String, Value>, s: &str) -> bool {
-    let min_len = schema.get("minLength").and_then(as_usize);
-    let max_len = schema.get("maxLength").and_then(as_usize);
+    let min_len = schema.get("minLength");
+    let max_len = schema.get("maxLength");
     if min_len.is_some() || max_len.is_some() {
         let char_count = s.chars().count();
         if let Some(min) = min_len
-            && char_count < min
+            && cmp_len_bound(char_count, min) == Some(Ordering::Less)
         {
             return false;
         }
         if let Some(max) = max_len
-            && char_count > max
+            && cmp_len_bound(char_count, max) == Some(Ordering::Greater)
         {
             return false;
         }
@@ -583,12 +583,12 @@ fn walk_string(
     path: &str,
     out: &mut Vec<ValidationIssue>,
 ) {
-    let min_len = schema.get("minLength").and_then(as_usize);
-    let max_len = schema.get("maxLength").and_then(as_usize);
+    let min_len = schema.get("minLength");
+    let max_len = schema.get("maxLength");
     if min_len.is_some() || max_len.is_some() {
         let char_count = s.chars().count();
         if let Some(min) = min_len
-            && char_count < min
+            && cmp_len_bound(char_count, min) == Some(Ordering::Less)
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
@@ -596,7 +596,7 @@ fn walk_string(
             });
         }
         if let Some(max) = max_len
-            && char_count > max
+            && cmp_len_bound(char_count, max) == Some(Ordering::Greater)
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
@@ -815,16 +815,14 @@ fn is_multiple_of(value: &Number, divisor: &Number) -> bool {
         if vc == 0 {
             return true;
         }
-        if ve >= de {
-            if let Some(scale) = pow10_u128((ve - de) as u32)
-                && let Some(scaled) = vc.checked_mul(scale)
-            {
-                return scaled % dc == 0;
-            }
-        } else if let Some(scale) = pow10_u128((de - ve) as u32)
-            && let Some(scaled) = dc.checked_mul(scale)
-        {
-            return vc % scaled == 0;
+        // `vc` and `dc` have trailing base-10 zeros stripped (`vc % 10 != 0`, `dc % 10 != 0`).
+        // If `ve < de`, `vc = k * dc * 10^(de - ve)` has no integer solution because `10 ∤ vc`.
+        if ve < de {
+            return false;
+        }
+        if let Some(diff) = ve.checked_sub(de) {
+            let pow = pow10_mod_u128(diff as u64, dc);
+            return mul_mod_u128(vc, pow, dc) == 0;
         }
     }
     let vf = value.as_f64().unwrap_or(f64::NAN);
@@ -832,15 +830,14 @@ fn is_multiple_of(value: &Number, divisor: &Number) -> bool {
     if !vf.is_finite() || !df.is_finite() || df == 0.0 {
         return false;
     }
-    let q = vf / df;
-    q.is_finite() && (q - q.round()).abs() <= 1e-12
+    vf % df == 0.0
 }
 
-fn parse_decimal(n: &Number) -> Option<(u128, i32)> {
+fn parse_decimal(n: &Number) -> Option<(u128, i64)> {
     let s = n.to_string();
     let s = s.strip_prefix('-').unwrap_or(&s);
     let (mantissa, exp) = match s.find(['e', 'E']) {
-        Some(idx) => (&s[..idx], s[idx + 1..].parse::<i32>().ok()?),
+        Some(idx) => (&s[..idx], s[idx + 1..].parse::<i64>().ok()?),
         None => (s, 0),
     };
     let (digits, frac_len) = match mantissa.find('.') {
@@ -848,32 +845,79 @@ fn parse_decimal(n: &Number) -> Option<(u128, i32)> {
             let mut buf = String::with_capacity(mantissa.len() - 1);
             buf.push_str(&mantissa[..dot]);
             buf.push_str(&mantissa[dot + 1..]);
-            (buf, (mantissa.len() - dot - 1) as i32)
+            (buf, (mantissa.len() - dot - 1) as i64)
         }
         None => (mantissa.to_string(), 0),
     };
-    let coeff = digits.parse::<u128>().ok()?;
-    Some((coeff, exp - frac_len))
+    let mut coeff = digits.parse::<u128>().ok()?;
+    let mut scale = exp.checked_sub(frac_len)?;
+    if coeff == 0 {
+        return Some((0, 0));
+    }
+    while coeff.is_multiple_of(10) {
+        coeff /= 10;
+        scale = scale.checked_add(1)?;
+    }
+    Some((coeff, scale))
 }
 
-fn pow10_u128(exp: u32) -> Option<u128> {
-    10_u128.checked_pow(exp)
+fn add_mod_u128(a: u128, b: u128, m: u128) -> u128 {
+    let a = a % m;
+    let b = b % m;
+    if a >= m - b { a - (m - b) } else { a + b }
 }
 
-fn as_usize(v: &Value) -> Option<usize> {
-    let n = v.as_number()?;
+fn mul_mod_u128(mut a: u128, mut b: u128, m: u128) -> u128 {
+    a %= m;
+    b %= m;
+    if let Some(prod) = a.checked_mul(b) {
+        return prod % m;
+    }
+    let mut res = 0u128;
+    while b > 0 {
+        if b & 1 == 1 {
+            res = add_mod_u128(res, a, m);
+        }
+        a = add_mod_u128(a, a, m);
+        b >>= 1;
+    }
+    res
+}
+
+fn pow10_mod_u128(mut exp: u64, m: u128) -> u128 {
+    if m == 1 {
+        return 0;
+    }
+    let mut base = 10u128 % m;
+    let mut res = 1u128;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            res = mul_mod_u128(res, base, m);
+        }
+        base = mul_mod_u128(base, base, m);
+        exp >>= 1;
+    }
+    res
+}
+
+fn cmp_len_bound(len: usize, bound: &Value) -> Option<Ordering> {
+    let n = bound.as_number()?;
+    let len_u64 = len as u64;
     if let Some(u) = n.as_u64() {
-        return usize::try_from(u).ok();
+        return Some(len_u64.cmp(&u));
     }
     if let Some(i) = n.as_i64() {
-        return usize::try_from(i).ok();
+        return (i >= 0).then(|| len_u64.cmp(&(i as u64)));
     }
     let f = n.as_f64()?;
-    if f.is_finite() && f >= 0.0 && f.fract() == 0.0 {
-        Some(f as usize)
-    } else {
-        None
+    if !f.is_finite() || f < 0.0 || f.fract() != 0.0 {
+        return None;
     }
+    // 2^64 is exact in f64; every u64 length is strictly less than 2^64.
+    if f >= 18446744073709551616.0_f64 {
+        return Some(Ordering::Less);
+    }
+    Some(len_u64.cmp(&(f as u64)))
 }
 
 fn json_type_name(v: &Value) -> &'static str {

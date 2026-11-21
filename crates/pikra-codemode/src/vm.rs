@@ -1,15 +1,18 @@
 //! Dedicated-thread QuickJS VM driver with resource limits, interrupts, and dangling-promise detection.
 
 use crate::prelude::build_prelude_source;
-use crate::types::{CodemodeError, CodemodeErrorKind, CodemodeOutputItem};
+use crate::types::{
+    CodemodeError, CodemodeErrorKind, CodemodeOutputItem, MAX_IN_FLIGHT_CALLS, MAX_MAX_STACK_SIZE,
+    MAX_QUEUED_CALL_ARG_BYTES, MIN_MAX_STACK_SIZE,
+};
 use futures_channel::mpsc as async_mpsc;
 use rquickjs::context::EvalOptions;
 use rquickjs::prelude::Opt;
 use rquickjs::{Context, Ctx, Error as JsError, Exception, Function, Object, Persistent, Runtime, Value};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,10 +79,16 @@ pub(crate) struct VmHandle {
     pub event_rx: async_mpsc::UnboundedReceiver<VmEvent>,
 }
 
+struct CallBudget {
+    pending_arg_bytes: HashMap<u64, usize>,
+    queued_arg_bytes: usize,
+}
+
 struct VmShared {
     event_tx: async_mpsc::UnboundedSender<VmEvent>,
     done_sent: AtomicBool,
     pending_calls: AtomicUsize,
+    call_budget: Mutex<CallBudget>,
 }
 
 impl VmShared {
@@ -88,6 +97,10 @@ impl VmShared {
             event_tx,
             done_sent: AtomicBool::new(false),
             pending_calls: AtomicUsize::new(0),
+            call_budget: Mutex::new(CallBudget {
+                pending_arg_bytes: HashMap::new(),
+                queued_arg_bytes: 0,
+            }),
         }
     }
 
@@ -102,6 +115,28 @@ impl VmShared {
     fn send_terminal(&self, event: VmEvent) {
         if !self.done_sent.swap(true, Ordering::AcqRel) {
             let _ = self.event_tx.unbounded_send(event);
+        }
+    }
+
+    fn try_reserve_call(&self, id: u64, arg_bytes: usize) -> bool {
+        let mut budget = self.call_budget.lock().unwrap_or_else(|e| e.into_inner());
+        let next_count = budget.pending_arg_bytes.len().saturating_add(1);
+        let next_bytes = budget.queued_arg_bytes.saturating_add(arg_bytes);
+        if next_count > MAX_IN_FLIGHT_CALLS || next_bytes > MAX_QUEUED_CALL_ARG_BYTES {
+            return false;
+        }
+        budget.pending_arg_bytes.insert(id, arg_bytes);
+        budget.queued_arg_bytes = next_bytes;
+        self.pending_calls.store(next_count, Ordering::Release);
+        true
+    }
+
+    fn release_call(&self, id: u64) {
+        let mut budget = self.call_budget.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(bytes) = budget.pending_arg_bytes.remove(&id) {
+            budget.queued_arg_bytes = budget.queued_arg_bytes.saturating_sub(bytes);
+            self.pending_calls
+                .store(budget.pending_arg_bytes.len(), Ordering::Release);
         }
     }
 }
@@ -142,7 +177,12 @@ fn run_vm_thread(
     };
 
     runtime.set_memory_limit(config.memory_limit_bytes);
-    runtime.set_max_stack_size(config.max_stack_size);
+    // Clamp stack guard into [64 KiB, 2 MiB]: QuickJS disables stack checks when set to 0,
+    // and rquickjs converts values > 16 MiB into 0, which would crash the host thread stack.
+    let effective_stack_size = config
+        .max_stack_size
+        .clamp(MIN_MAX_STACK_SIZE, MAX_MAX_STACK_SIZE);
+    runtime.set_max_stack_size(effective_stack_size);
 
     let int_shared = shared.clone();
     let int_abort = config.abort.clone();
@@ -253,12 +293,41 @@ fn run_vm_session(
         return Ok(());
     }
 
-    // 2. Event loop: drain microtasks -> check completion/stall -> await next host tool result.
+    // 2. Event loop: run a bounded microtask batch -> drain ready host completions ->
+    //    check completion/stall -> block on next host tool result only when no microtasks remain.
     loop {
-        drain_jobs(runtime, shared, &config.abort, &config.cancelled, deadline)?;
+        let has_more_jobs = drain_job_batch(
+            runtime,
+            shared,
+            &config.abort,
+            &config.cancelled,
+            deadline,
+            JOBS_PER_POLL,
+        )?;
 
         if shared.is_done() {
             return Ok(());
+        }
+
+        // Drain all ready host completions between microtask batches so tight microtask loops
+        // (e.g. `while (!done) await Promise.resolve()`) cannot starve pending tool settlements.
+        loop {
+            match host_rx.try_recv() {
+                Ok(msg) => {
+                    if !apply_host_msg(msg, context, &settle_fn, shared, config, deadline)? {
+                        return Ok(());
+                    }
+                    if shared.is_done() {
+                        return Ok(());
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+
+        if has_more_jobs || runtime.is_job_pending() {
+            continue;
         }
 
         if shared.pending_calls.load(Ordering::Acquire) == 0 {
@@ -286,34 +355,15 @@ fn run_vm_session(
         }
 
         match wait_for_host_msg(host_rx, &config.abort, &config.cancelled, deadline) {
-            WaitOutcome::Msg(HostMsg::ToolResult { id, ok, payload }) => {
-                shared.pending_calls.fetch_sub(1, Ordering::AcqRel);
-                context.with(|ctx| -> Result<(), VmEvent> {
-                    let settle = settle_fn
-                        .clone()
-                        .restore(&ctx)
-                        .map_err(|err| VmEvent::SandboxError(format!("failed to restore settle(): {err}")))?;
-                    let res = match payload {
-                        Some(p) => settle.call::<_, ()>((id as f64, ok, p)),
-                        None => settle.call::<_, ()>((id as f64, ok)),
-                    };
-                    match res {
-                        Ok(()) => Ok(()),
-                        Err(_) if shared.is_done() => Ok(()),
-                        Err(err) => Err(classify_rquickjs_error(
-                            &ctx,
-                            err,
-                            &config.abort,
-                            &config.cancelled,
-                            deadline,
-                        )),
-                    }
-                })?;
+            WaitOutcome::Msg(msg) => {
+                if !apply_host_msg(msg, context, &settle_fn, shared, config, deadline)? {
+                    return Ok(());
+                }
                 if shared.is_done() {
                     return Ok(());
                 }
             }
-            WaitOutcome::Msg(HostMsg::Stop) | WaitOutcome::Disconnected => {
+            WaitOutcome::Disconnected => {
                 return Ok(());
             }
             WaitOutcome::Timeout => {
@@ -326,17 +376,58 @@ fn run_vm_session(
     }
 }
 
-fn drain_jobs(
+fn apply_host_msg(
+    msg: HostMsg,
+    context: &Context,
+    settle_fn: &Persistent<Function<'static>>,
+    shared: &VmShared,
+    config: &VmLaunchConfig,
+    deadline: Option<Instant>,
+) -> Result<bool, VmEvent> {
+    match msg {
+        HostMsg::ToolResult { id, ok, payload } => {
+            shared.release_call(id);
+            context.with(|ctx| -> Result<(), VmEvent> {
+                let settle = settle_fn
+                    .clone()
+                    .restore(&ctx)
+                    .map_err(|err| VmEvent::SandboxError(format!("failed to restore settle(): {err}")))?;
+                let res = match payload {
+                    Some(p) => settle.call::<_, ()>((id as f64, ok, p)),
+                    None => settle.call::<_, ()>((id as f64, ok)),
+                };
+                match res {
+                    Ok(()) => Ok(()),
+                    Err(_) if shared.is_done() => Ok(()),
+                    Err(err) => Err(classify_rquickjs_error(
+                        &ctx,
+                        err,
+                        &config.abort,
+                        &config.cancelled,
+                        deadline,
+                    )),
+                }
+            })?;
+            Ok(true)
+        }
+        HostMsg::Stop => Ok(false),
+    }
+}
+
+fn drain_job_batch(
     runtime: &Runtime,
     shared: &VmShared,
     abort: &Option<Arc<AtomicBool>>,
     cancelled: &Arc<AtomicBool>,
     deadline: Option<Instant>,
-) -> Result<(), VmEvent> {
-    let mut jobs_since_check = 0usize;
-    while runtime.is_job_pending() {
+    max_jobs: usize,
+) -> Result<bool, VmEvent> {
+    for _ in 0..max_jobs {
+        if !runtime.is_job_pending() {
+            return Ok(false);
+        }
         if shared.is_done() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(reason) = check_interrupt(abort, cancelled, deadline) {
             return Err(reason);
@@ -344,20 +435,13 @@ fn drain_jobs(
         match runtime.execute_pending_job() {
             Ok(true) => {
                 if shared.is_done() {
-                    return Ok(());
-                }
-                jobs_since_check += 1;
-                if jobs_since_check >= JOBS_PER_POLL {
-                    jobs_since_check = 0;
-                    if let Some(reason) = check_interrupt(abort, cancelled, deadline) {
-                        return Err(reason);
-                    }
+                    return Ok(false);
                 }
             }
-            Ok(false) => break,
+            Ok(false) => return Ok(false),
             Err(job_err) => {
                 if shared.is_done() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Some(reason) = check_interrupt(abort, cancelled, deadline) {
                     return Err(reason);
@@ -369,7 +453,10 @@ fn drain_jobs(
             }
         }
     }
-    Ok(())
+    if let Some(reason) = check_interrupt(abort, cancelled, deadline) {
+        return Err(reason);
+    }
+    Ok(runtime.is_job_pending())
 }
 
 enum WaitOutcome {
@@ -456,7 +543,17 @@ fn handle_bridge(
             let id = a.and_then(|v| v.as_number()).unwrap_or(0.0) as u64;
             let name = value_to_string(b).unwrap_or_default();
             let args_json = value_to_string(c);
-            shared.pending_calls.fetch_add(1, Ordering::AcqRel);
+            let arg_bytes = args_json.as_ref().map_or(0, String::len);
+            if !shared.try_reserve_call(id, arg_bytes) {
+                shared.send_terminal(VmEvent::DoneErr(CodemodeError::script(
+                    Some("RangeError".to_string()),
+                    format!(
+                        "in-flight tool call budget exceeded (max {MAX_IN_FLIGHT_CALLS} calls / {MAX_QUEUED_CALL_ARG_BYTES} bytes)"
+                    ),
+                    None,
+                )));
+                return;
+            }
             shared.send_event(VmEvent::Call {
                 id,
                 name,

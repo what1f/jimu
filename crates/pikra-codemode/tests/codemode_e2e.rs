@@ -397,3 +397,287 @@ fn safety_guards_timeout_abort_oom_and_unsettled_promise() {
         );
     });
 }
+
+#[test]
+fn review_regressions_stack_drop_order_budget_microtasks_and_prelude() {
+    block_on(async {
+        // 1. Stack overflow protection: extreme `max_stack_size` (0 or 64 MiB) is clamped safely
+        //    so infinite JS recursion fails as a Script error instead of crashing the host thread.
+        for bad_stack in [0usize, 64 * 1024 * 1024] {
+            let stack_sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+                timeout_ms: Some(5_000),
+                max_stack_size: bad_stack,
+                ..Default::default()
+            });
+            let res = stack_sandbox
+                .execute(
+                    "function recurse() { return recurse(); } return recurse();",
+                    CodemodeExecuteOptions::default(),
+                )
+                .await;
+            assert!(!res.ok);
+            assert_eq!(
+                res.error.as_ref().map(|e| e.kind),
+                Some(CodemodeErrorKind::Script),
+                "max_stack_size={bad_stack} should catch stack overflow cleanly, got: {:?}",
+                res.error
+            );
+        }
+
+        // 2. CancelOnDrop order: dropping `execute()` early sets `ctx.abort` BEFORE dropping in-flight tool futures.
+        let saw_aborted_on_drop = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+
+        struct DropObserver {
+            abort: Arc<AtomicBool>,
+            saw_aborted: Arc<AtomicBool>,
+        }
+        impl Drop for DropObserver {
+            fn drop(&mut self) {
+                self.saw_aborted
+                    .store(self.abort.load(Ordering::Acquire), Ordering::Release);
+            }
+        }
+
+        let mut drop_sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: Some(60_000),
+            ..Default::default()
+        });
+        {
+            let saw_aborted_on_drop = saw_aborted_on_drop.clone();
+            let started_tx = started_tx.clone();
+            drop_sandbox
+                .register_tool(Arc::new(FnTool::new(
+                    "hold",
+                    "Holds until dropped and records abort flag state on Drop",
+                    move |_args, ctx| {
+                        let saw_aborted_on_drop = saw_aborted_on_drop.clone();
+                        let started_tx = started_tx.clone();
+                        async move {
+                            let _observer = DropObserver {
+                                abort: ctx.abort.clone(),
+                                saw_aborted: saw_aborted_on_drop,
+                            };
+                            if let Some(tx) = started_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            futures_util::future::pending::<Result<Value, String>>().await
+                        }
+                    },
+                )))
+                .unwrap();
+        }
+
+        {
+            let exec_fut = drop_sandbox.execute(
+                "await tools.hold();",
+                CodemodeExecuteOptions::default(),
+            );
+            futures_util::pin_mut!(exec_fut);
+            let race = futures_util::future::select(exec_fut, started_rx).await;
+            assert!(
+                matches!(race, futures_util::future::Either::Right(_)),
+                "hold tool should signal readiness before execute completes"
+            );
+            // Dropping `race` drops `exec_fut` early while `tools.hold()` is still in flight.
+        }
+        assert!(
+            saw_aborted_on_drop.load(Ordering::Acquire),
+            "CancelOnDrop must set tool abort flag BEFORE dropping in-flight tool futures"
+        );
+
+        // 3. Eager first-poll: fire-and-forget tool call starts deterministically before script returns.
+        let side_effect_ran = Arc::new(AtomicBool::new(false));
+        let mut eager_sandbox = CodemodeSandbox::new(CodemodeSandboxOptions::default());
+        {
+            let flag = side_effect_ran.clone();
+            eager_sandbox
+                .register_tool(Arc::new(FnTool::new(
+                    "fire",
+                    "Marks side effect immediately",
+                    move |_args, _ctx| {
+                        let flag = flag.clone();
+                        async move {
+                            flag.store(true, Ordering::Release);
+                            Ok(json!(true))
+                        }
+                    },
+                )))
+                .unwrap();
+        }
+        let eager_res = eager_sandbox
+            .execute(
+                r#"tools.fire(); return "done";"#,
+                CodemodeExecuteOptions::default(),
+            )
+            .await;
+        assert!(eager_res.ok, "unexpected error: {:?}", eager_res.error);
+        assert!(
+            side_effect_ran.load(Ordering::Acquire),
+            "fire-and-forget tool call must be eagerly polled"
+        );
+
+        // 4. Microtask starvation prevention: tight `await Promise.resolve()` loop must not starve ready tool completions.
+        let mut microtask_sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: Some(5_000),
+            ..Default::default()
+        });
+        microtask_sandbox
+            .register_tool(Arc::new(FnTool::new(
+                "fast",
+                "Returns immediately",
+                |_args, _ctx| async move { Ok(json!("ok")) },
+            )))
+            .unwrap();
+        let mt_res = microtask_sandbox
+            .execute(
+                r#"
+let settled = false;
+tools.fast().then(() => { settled = true; });
+while (!settled) {
+    await Promise.resolve();
+}
+return "unstarved";
+"#,
+                CodemodeExecuteOptions::default(),
+            )
+            .await;
+        assert!(mt_res.ok, "microtask loop should not starve tool completion: {:?}", mt_res.error);
+        assert_eq!(mt_res.value, Some(json!("unstarved")));
+
+        // 5. In-flight tool call count & queued argument payload budget enforcement.
+        let mut budget_sandbox = CodemodeSandbox::new(CodemodeSandboxOptions {
+            timeout_ms: Some(5_000),
+            ..Default::default()
+        });
+        budget_sandbox
+            .register_tool(Arc::new(FnTool::new(
+                "stall",
+                "Never finishes unless cancelled",
+                |_args, _ctx| async move {
+                    futures_util::future::pending::<Result<Value, String>>().await
+                },
+            )))
+            .unwrap();
+        let flood_res = budget_sandbox
+            .execute(
+                "for (let i = 0; i < 2000; i++) { tools.stall({ i }); } return 1;",
+                CodemodeExecuteOptions::default(),
+            )
+            .await;
+        assert!(!flood_res.ok);
+        assert_eq!(
+            flood_res.error.as_ref().map(|e| e.kind),
+            Some(CodemodeErrorKind::Script),
+            "call flood should fail cleanly with RangeError, got: {:?}",
+            flood_res.error
+        );
+        assert_eq!(
+            flood_res.error.as_ref().and_then(|e| e.name.as_deref()),
+            Some("RangeError")
+        );
+
+        let arg_flood_res = budget_sandbox
+            .execute(
+                r#"const big = "x".repeat(600000); for (let i = 0; i < 40; i++) { tools.stall(big); } return 1;"#,
+                CodemodeExecuteOptions::default(),
+            )
+            .await;
+        assert!(!arg_flood_res.ok);
+        assert_eq!(
+            arg_flood_res.error.as_ref().and_then(|e| e.name.as_deref()),
+            Some("RangeError")
+        );
+
+        // 5b. Host-side deadline enforcement settles promptly when awaiting a pending tool.
+        let deadline_res = budget_sandbox
+            .execute(
+                "await tools.stall();",
+                CodemodeExecuteOptions {
+                    timeout_ms: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(!deadline_res.ok);
+        assert_eq!(
+            deadline_res.error.as_ref().map(|e| e.kind),
+            Some(CodemodeErrorKind::Timeout)
+        );
+
+        // 6. `image()` magic-byte validation & `text()` primitive formatting.
+        let prelude_sandbox = CodemodeSandbox::new(CodemodeSandboxOptions::default());
+        // Valid minimal JPEG (FF D8 FF E0) and WebP (RIFF....WEBP) headers in base64:
+        let jpeg_b64 = "/9j/4AAQ";
+        let gif_b64 = "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
+        let webp_b64 = "UklGRhIAAABXRUJQ";
+        let prelude_script = format!(
+            r#"
+text(NaN);
+text(Infinity);
+text(1n);
+text(true);
+text(undefined);
+text(Symbol("tag"));
+text({{ k: 1 }});
+
+// Auto-detect MIME from decoded magic bytes
+image({{ data: "{TINY_PNG_B64}" }});
+image({{ data: "{jpeg_b64}" }});
+image({{ data: "{gif_b64}" }});
+image({{ data: "{webp_b64}" }});
+
+const rejects = [];
+for (const bad of [
+    "data:image/jpeg;base64,{TINY_PNG_B64}",
+    {{ data: "{TINY_PNG_B64}", mimeType: "image/jpeg" }},
+    "data:image/png;base64,aGVsbG8gd29ybGQ=",
+    {{ data: "aGVsbG8gd29ybGQ=", mimeType: "image/png" }},
+]) {{
+    let threw = false;
+    try {{
+        image(bad);
+    }} catch (e) {{
+        threw = e instanceof TypeError;
+    }}
+    rejects.push(threw);
+}}
+return rejects;
+"#
+        );
+        let prelude_res = prelude_sandbox
+            .execute(&prelude_script, CodemodeExecuteOptions::default())
+            .await;
+        assert!(prelude_res.ok, "prelude regression test failed: {:?}", prelude_res.error);
+        assert_eq!(prelude_res.value, Some(json!([true, true, true, true])));
+        assert_eq!(
+            prelude_res.output,
+            vec![
+                CodemodeOutputItem::Text { text: "NaN".to_string(), console: false },
+                CodemodeOutputItem::Text { text: "Infinity".to_string(), console: false },
+                CodemodeOutputItem::Text { text: "1".to_string(), console: false },
+                CodemodeOutputItem::Text { text: "true".to_string(), console: false },
+                CodemodeOutputItem::Text { text: "undefined".to_string(), console: false },
+                CodemodeOutputItem::Text { text: "Symbol(tag)".to_string(), console: false },
+                CodemodeOutputItem::Text { text: r#"{"k":1}"#.to_string(), console: false },
+                CodemodeOutputItem::Image {
+                    data: TINY_PNG_B64.to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+                CodemodeOutputItem::Image {
+                    data: jpeg_b64.to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                },
+                CodemodeOutputItem::Image {
+                    data: gif_b64.to_string(),
+                    mime_type: "image/gif".to_string(),
+                },
+                CodemodeOutputItem::Image {
+                    data: webp_b64.to_string(),
+                    mime_type: "image/webp".to_string(),
+                },
+            ]
+        );
+    });
+}

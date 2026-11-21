@@ -145,9 +145,12 @@ const PRELUDE_TEMPLATE: &str = r#"(function (bridge, toolsJson, storeJson) {
 	}
 
 	function format(value) {
-		if (typeof value === "string") return value;
+		const t = typeof value;
+		if (t === "string") return value;
 		if (value instanceof ErrorCtor) return errorText(value);
-		if (typeof value === "number") return String(value);
+		if (t === "number" || t === "bigint" || t === "boolean" || t === "undefined" || t === "symbol") {
+			return String(value);
+		}
 		try {
 			const json = stringify(value);
 			return json === undefined ? String(value) : json;
@@ -330,8 +333,17 @@ const PRELUDE_TEMPLATE: &str = r#"(function (bridge, toolsJson, storeJson) {
 
 	function text(value) {
 		let rendered;
-		if (typeof value === "string") {
+		const t = typeof value;
+		if (t === "string") {
 			rendered = value;
+		} else if (
+			t === "number" ||
+			t === "bigint" ||
+			t === "boolean" ||
+			t === "undefined" ||
+			t === "symbol"
+		) {
+			rendered = String(value);
 		} else {
 			try {
 				const json = stringify(value);
@@ -347,12 +359,77 @@ const PRELUDE_TEMPLATE: &str = r#"(function (bridge, toolsJson, storeJson) {
 		'image() expects a base64 data:image/<subtype>;base64,... URL, { image_url }, { type: "image", data, mimeType }, or { data, mime_type }';
 	const IMAGE_MIME_RE = /^image\/[a-z0-9][a-z0-9.+-]*$/;
 	const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
-	const IMAGE_SIGNATURES = [
-		["image/png", /^iVBORw0KGg/],
-		["image/jpeg", /^[/]9j[/](?!9)/],
-		["image/gif", /^R0lGOD[dl]h/],
-		["image/webp", /^UklG.{8}RUJQ/],
-	];
+	const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+	function decodeBase64Prefix(data, maxBytes) {
+		const out = [];
+		const limit = Math.min(data.length, Math.ceil(maxBytes / 3) * 4);
+		for (let i = 0; i < limit; i += 4) {
+			const c0 = B64_ALPHABET.indexOf(data[i]);
+			const c1 = B64_ALPHABET.indexOf(data[i + 1]);
+			const p2 = data[i + 2] === "=";
+			const p3 = data[i + 3] === "=";
+			const c2 = p2 ? 0 : B64_ALPHABET.indexOf(data[i + 2]);
+			const c3 = p3 ? 0 : B64_ALPHABET.indexOf(data[i + 3]);
+			if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0 || (p2 && !p3)) {
+				return null;
+			}
+			const n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+			out.push((n >> 16) & 0xff);
+			if (!p2) out.push((n >> 8) & 0xff);
+			if (!p3) out.push(n & 0xff);
+		}
+		return out;
+	}
+
+	function detectImageMime(bytes) {
+		if (!bytes || bytes.length < 3) return null;
+		// PNG: 89 50 4E 47 0D 0A 1A 0A
+		if (
+			bytes.length >= 8 &&
+			bytes[0] === 0x89 &&
+			bytes[1] === 0x50 &&
+			bytes[2] === 0x4e &&
+			bytes[3] === 0x47 &&
+			bytes[4] === 0x0d &&
+			bytes[5] === 0x0a &&
+			bytes[6] === 0x1a &&
+			bytes[7] === 0x0a
+		) {
+			return "image/png";
+		}
+		// JPEG: FF D8 FF
+		if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+			return "image/jpeg";
+		}
+		// GIF: GIF87a or GIF89a
+		if (
+			bytes.length >= 6 &&
+			bytes[0] === 0x47 &&
+			bytes[1] === 0x49 &&
+			bytes[2] === 0x46 &&
+			bytes[3] === 0x38 &&
+			(bytes[4] === 0x37 || bytes[4] === 0x39) &&
+			bytes[5] === 0x61
+		) {
+			return "image/gif";
+		}
+		// WebP: RIFF....WEBP
+		if (
+			bytes.length >= 12 &&
+			bytes[0] === 0x52 &&
+			bytes[1] === 0x49 &&
+			bytes[2] === 0x46 &&
+			bytes[3] === 0x46 &&
+			bytes[8] === 0x57 &&
+			bytes[9] === 0x45 &&
+			bytes[10] === 0x42 &&
+			bytes[11] === 0x50
+		) {
+			return "image/webp";
+		}
+		return null;
+	}
 
 	function rejectIfRemoteUrl(str) {
 		const trimmed = str.trim().toLowerCase();
@@ -393,18 +470,27 @@ const PRELUDE_TEMPLATE: &str = r#"(function (bridge, toolsJson, storeJson) {
 		if (data.length === 0 || data.length % 4 !== 0 || !BASE64_RE.test(data)) {
 			throw new TypeErrorCtor("invalid image output: image data is not valid base64");
 		}
-		let mime = typeof declaredMime === "string" ? declaredMime.trim().toLowerCase() : "";
-		if (mime === "") {
-			const head = data.slice(0, 16);
-			const sig = IMAGE_SIGNATURES.find(([, re]) => re.test(head));
-			if (!sig) {
-				throw new TypeErrorCtor("invalid image output: missing or unrecognized image MIME type");
-			}
-			mime = sig[0];
-		} else if (!IMAGE_MIME_RE.test(mime)) {
-			throw new TypeErrorCtor('invalid image output: unsupported MIME type "' + mime + '"');
+		const header = decodeBase64Prefix(data, 12);
+		const detectedMime = detectImageMime(header);
+		if (!detectedMime) {
+			throw new TypeErrorCtor("invalid image output: unrecognized or unsupported image payload");
 		}
-		return { data, mimeType: mime };
+		const declared = typeof declaredMime === "string" ? declaredMime.trim().toLowerCase() : "";
+		if (declared !== "") {
+			if (!IMAGE_MIME_RE.test(declared)) {
+				throw new TypeErrorCtor('invalid image output: unsupported MIME type "' + declared + '"');
+			}
+			if (declared !== detectedMime) {
+				throw new TypeErrorCtor(
+					'invalid image output: declared MIME type "' +
+						declared +
+						'" does not match detected "' +
+						detectedMime +
+						'"',
+				);
+			}
+		}
+		return { data, mimeType: detectedMime };
 	}
 
 	function image(item) {

@@ -1,5 +1,7 @@
 //! Lightweight zero-regex JSON Schema string `format` validators.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 pub(crate) fn check_format(format: &str, value: &str) -> bool {
     match format {
         "uuid" => is_uuid(value),
@@ -8,10 +10,20 @@ pub(crate) fn check_format(format: &str, value: &str) -> bool {
         "email" => is_email(value),
         "uri" => is_uri(value),
         "url" => is_url(value),
+        "ipv4" => is_ipv4(value),
+        "ipv6" => is_ipv6(value),
         "json-pointer" => is_json_pointer(value),
         // Unknown formats are annotations in JSON Schema and do not fail validation.
         _ => true,
     }
+}
+
+fn is_ipv4(s: &str) -> bool {
+    s.parse::<Ipv4Addr>().is_ok()
+}
+
+fn is_ipv6(s: &str) -> bool {
+    s.parse::<Ipv6Addr>().is_ok()
 }
 
 fn is_uuid(s: &str) -> bool {
@@ -32,7 +44,10 @@ fn is_uuid(s: &str) -> bool {
 }
 
 fn is_date(s: &str) -> bool {
-    let bytes = s.as_bytes();
+    is_date_bytes(s.as_bytes())
+}
+
+fn is_date_bytes(bytes: &[u8]) -> bool {
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return false;
     }
@@ -58,7 +73,7 @@ fn is_date_time(s: &str) -> bool {
     if bytes.len() < 20 {
         return false;
     }
-    if !is_date(&s[0..10]) {
+    if !is_date_bytes(&bytes[0..10]) {
         return false;
     }
     if !matches!(bytes[10], b'T' | b't') {
@@ -180,7 +195,7 @@ fn is_email_local_byte(b: u8) -> bool {
 }
 
 fn is_valid_domain(domain: &str) -> bool {
-    if domain.starts_with('.') || domain.ends_with('.') || !domain.contains('.') {
+    if domain.is_empty() || domain.starts_with('.') || domain.ends_with('.') {
         return false;
     }
     let mut last_label = "";
@@ -282,13 +297,16 @@ fn is_valid_authority(authority: &str, allow_empty_host: bool) -> bool {
         let Some((ip, tail)) = rest.split_once(']') else {
             return false;
         };
-        if ip.is_empty() || !ip.bytes().all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.')) {
+        if !is_valid_ip_literal(ip) {
             return false;
         }
         return match tail.strip_prefix(':') {
-            Some(port) => port.is_empty() || port.bytes().all(|b| b.is_ascii_digit()),
+            Some(port) => is_valid_port(port),
             None => tail.is_empty(),
         };
+    }
+    if hostport.contains('[') || hostport.contains(']') {
+        return false;
     }
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (h, Some(p)),
@@ -298,12 +316,59 @@ fn is_valid_authority(authority: &str, allow_empty_host: bool) -> bool {
         return false;
     }
     if let Some(port) = port
-        && !port.is_empty()
-        && !port.bytes().all(|b| b.is_ascii_digit())
+        && !is_valid_port(port)
     {
         return false;
     }
     true
+}
+
+fn is_valid_port(port: &str) -> bool {
+    if port.is_empty() {
+        return true;
+    }
+    port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
+fn is_valid_ip_literal(ip: &str) -> bool {
+    ip.parse::<Ipv6Addr>().is_ok() || is_valid_ipv_future(ip)
+}
+
+fn is_valid_ipv_future(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 || !matches!(bytes[0], b'v' | b'V') {
+        return false;
+    }
+    let Some(dot) = bytes[1..].iter().position(|&b| b == b'.') else {
+        return false;
+    };
+    let version = &bytes[1..1 + dot];
+    let rest = &bytes[2 + dot..];
+    if version.is_empty() || rest.is_empty() {
+        return false;
+    }
+    version.iter().all(u8::is_ascii_hexdigit)
+        && rest.iter().all(|&b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b':'
+                )
+        })
 }
 
 fn is_json_pointer(s: &str) -> bool {

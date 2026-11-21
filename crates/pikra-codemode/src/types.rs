@@ -22,6 +22,18 @@ pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 /// Default QuickJS JS stack guard limit (512 KiB).
 pub const DEFAULT_MAX_STACK_SIZE: usize = 512 * 1024;
 
+/// Minimum enforced QuickJS JS stack guard limit (64 KiB).
+pub const MIN_MAX_STACK_SIZE: usize = 64 * 1024;
+
+/// Maximum enforced QuickJS JS stack guard limit (2 MiB, safely below the 4 MiB VM thread stack).
+pub const MAX_MAX_STACK_SIZE: usize = 2 * 1024 * 1024;
+
+/// Maximum concurrent / queued in-flight tool calls per execution.
+pub const MAX_IN_FLIGHT_CALLS: usize = 1_024;
+
+/// Maximum aggregate byte length of queued / in-flight tool call argument payloads (16 MiB).
+pub const MAX_QUEUED_CALL_ARG_BYTES: usize = 16 * 1024 * 1024;
+
 /// Maximum JSON character length for a single `store(key, value)` entry (256 KiB).
 pub const MAX_STORE_VALUE_CHARS: usize = 256 * 1024;
 

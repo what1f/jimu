@@ -325,6 +325,8 @@ fn unicode_lengths_formats_and_numeric_precision() {
         ("date-time", "2026-02-28T23:59:59.123+08:00", "2026-02-29T12:00:00Z"),
         ("date", "2024-02-29", "2025-02-29"),
         ("uuid", "550e8400-e29b-41d4-a716-446655440000", "550e8400-e29b-41d4-a716-44665544000z"),
+        ("ipv4", "127.0.0.1", "256.0.0.1"),
+        ("ipv6", "2001:db8::1", "2001:db8:::1"),
         ("json-pointer", "/properties/a~1b/c~0d", "no-leading-slash"),
     ];
     for (fmt, good, bad) in cases {
@@ -335,4 +337,160 @@ fn unicode_lengths_formats_and_numeric_precision() {
             .unwrap_err();
         assert_eq!(err.issues[0].message, format!("must be a valid {fmt}"));
     }
+}
+
+#[test]
+fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
+    // 1. Multi-byte UTF-8 input >= 20 bytes where byte offset 10 splits a UTF-8 char must never panic.
+    let dt_schema = CompiledSchema::compile(with_format(str_schema(), "date-time")).unwrap();
+    let d_schema = CompiledSchema::compile(with_format(str_schema(), "date")).unwrap();
+    for weird in ["你好世界你好世界", "🚀🚀🚀🚀🚀🚀", "2024-01-0好T00:00:00Z"] {
+        assert!(dt_schema.validate(&json!(weird)).is_err());
+        assert!(d_schema.validate(&json!(weird)).is_err());
+    }
+
+    // 2. IPv4, IPv6 bracket literal + IPvFuture in URI/URL, port <= 65535, and single-label email.
+    let uri_schema = CompiledSchema::compile(with_format(str_schema(), "uri")).unwrap();
+    assert!(uri_schema.validate(&json!("http://[::1]:8080/api")).is_ok());
+    assert!(uri_schema.validate(&json!("http://[v1.fe80::a+en1]/x")).is_ok());
+    assert!(uri_schema.validate(&json!("https://example.com:65535/")).is_ok());
+    assert!(uri_schema.validate(&json!("http://[not-ipv6]/x")).is_err());
+    assert!(uri_schema.validate(&json!("https://example.com:65536/")).is_err());
+    assert!(uri_schema.validate(&json!("http://[::1]:99999/")).is_err());
+
+    let email_schema = CompiledSchema::compile(with_format(str_schema(), "email")).unwrap();
+    assert!(email_schema.validate(&json!("dev@localhost")).is_ok());
+    assert!(email_schema.validate(&json!("dev@12345")).is_err());
+
+    // 3. Pass 1 & Pass 3 `$ref` cycles combined with `allOf` producing Cow::Owned must terminate cleanly.
+    let cyclic_allof = CompiledSchema::compile(json!({
+        "$defs": {
+            "Loop": {
+                "allOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "n": { "type": ["integer", "null"] },
+                            "opt": { "type": "string" }
+                        }
+                    },
+                    { "$ref": "#/$defs/Loop" }
+                ]
+            }
+        },
+        "$ref": "#/$defs/Loop"
+    }))
+    .unwrap();
+    assert_eq!(
+        cyclic_allof.coerce(&json!({ "n": "42", "opt": null })),
+        json!({ "n": 42 })
+    );
+
+    // 4. Pass 2 `$ref` memoization must preserve exact object key order per array element.
+    let item_list = CompiledSchema::compile(json!({
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {
+                    "n": { "type": "integer" },
+                    "x": { "type": "integer" }
+                }
+            }
+        },
+        "type": "array",
+        "items": { "$ref": "#/$defs/Item" }
+    }))
+    .unwrap();
+    let coerced_list = item_list
+        .coerce_and_validate(&json!([
+            { "n": "1", "x": 0 },
+            { "x": 0, "n": "1" }
+        ]))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_string(&coerced_list).unwrap(),
+        r#"[{"n":1,"x":0},{"x":0,"n":1}]"#
+    );
+
+    // 5. Pass 3 primitive coercion rules: no truncation of "3.5" on ["integer", "null"],
+    //    and ["boolean", "number"] coerces "1" -> 1 while "true"/"false" -> bool.
+    let nullable_int = CompiledSchema::compile(json!({ "type": ["integer", "null"] })).unwrap();
+    assert_eq!(nullable_int.coerce(&json!("3.5")), json!("3.5"));
+    assert!(nullable_int.coerce_and_validate(&json!("3.5")).is_err());
+
+    let bool_or_num = CompiledSchema::compile(json!({ "type": ["boolean", "number"] })).unwrap();
+    assert_eq!(bool_or_num.coerce_and_validate(&json!("1")).unwrap(), json!(1));
+    assert_eq!(bool_or_num.coerce_and_validate(&json!("true")).unwrap(), json!(true));
+    assert_eq!(bool_or_num.coerce_and_validate(&json!("false")).unwrap(), json!(false));
+
+    // 6. Pass 1 optional `$ref` property null handling + inherited `required` across `$ref`.
+    let ref_nulls = CompiledSchema::compile(json!({
+        "$defs": {
+            "NullableStr": { "type": ["string", "null"] },
+            "StrictStr": { "type": "string" },
+            "Base": {
+                "type": "object",
+                "properties": {
+                    "req_field": { "$ref": "#/$defs/StrictStr" },
+                    "opt_nullable": { "$ref": "#/$defs/NullableStr" },
+                    "opt_strict": { "$ref": "#/$defs/StrictStr" }
+                }
+            }
+        },
+        "$ref": "#/$defs/Base",
+        "required": ["req_field"]
+    }))
+    .unwrap();
+    assert_eq!(
+        ref_nulls.coerce(&json!({
+            "req_field": null,
+            "opt_nullable": null,
+            "opt_strict": null
+        })),
+        json!({
+            "req_field": null,
+            "opt_nullable": null
+        })
+    );
+
+    // 7. Huge bounds (u64::MAX / 1e30) must reject short strings/arrays/objects instead of being skipped.
+    let huge_str = CompiledSchema::compile(json!({ "type": "string", "minLength": u64::MAX })).unwrap();
+    assert!(huge_str.validate(&json!("abc")).is_err());
+    let huge_arr = CompiledSchema::compile(json!({ "type": "array", "minItems": 1e30 })).unwrap();
+    assert!(huge_arr.validate(&json!([1, 2])).is_err());
+    let huge_obj =
+        CompiledSchema::compile(json!({ "type": "object", "minProperties": u64::MAX })).unwrap();
+    assert!(huge_obj.validate(&json!({ "a": 1 })).is_err());
+
+    // 8. Exact `multipleOf` precision even when decimal scaling exceeds u128 range.
+    let mult_one = CompiledSchema::compile(json!({ "type": "number", "multipleOf": 1 })).unwrap();
+    assert!(mult_one.validate(&json!(1e-50)).is_err());
+    assert!(mult_one.validate(&json!(1e50)).is_ok());
+    let mult_three = CompiledSchema::compile(json!({ "type": "number", "multipleOf": 3 })).unwrap();
+    assert!(mult_three.validate(&json!(1e50)).is_err());
+    let mult_tiny =
+        CompiledSchema::compile(json!({ "type": "number", "multipleOf": 1e-52 })).unwrap();
+    assert!(mult_tiny.validate(&json!(1e-50)).is_ok());
+
+    // 9. RFC 6901 JSON Pointer percent-decoding before splitting, ~1/~0 unescaping, and rejecting leading zeros.
+    let pct_pointer = CompiledSchema::compile(json!({
+        "$defs": {
+            "a/b": { "type": "integer" },
+            "t~k": { "type": "boolean" }
+        },
+        "type": "object",
+        "properties": {
+            "slash": { "$ref": "#%2F%24defs%2Fa~1b" },
+            "tilde": { "$ref": "#/$defs/t~0k" }
+        }
+    }))
+    .unwrap();
+    assert!(pct_pointer.validate(&json!({ "slash": 7, "tilde": true })).is_ok());
+    assert!(pct_pointer.validate(&json!({ "slash": "bad" })).is_err());
+
+    let leading_zero_idx = CompiledSchema::compile(json!({
+        "allOf": [{ "type": "string" }, { "minLength": 1 }],
+        "$ref": "#/allOf/01"
+    }));
+    assert!(leading_zero_idx.is_err());
 }

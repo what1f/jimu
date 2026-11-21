@@ -8,29 +8,39 @@ const VALID_TYPES: &[&str] = &[
     "string", "integer", "number", "boolean", "null", "array", "object",
 ];
 
-/// Resolves a local JSON Pointer (`#` or `#/...`) inside `root`.
+/// Resolves a local JSON Pointer (`#` or `#/...`) inside `root` per RFC 6901.
 pub(crate) fn resolve_pointer<'a>(
     root: &'a Value,
     reference: &str,
 ) -> Result<&'a Value, SchemaCompileError> {
-    if reference == "#" {
-        return Ok(root);
-    }
-    let Some(fragment) = reference.strip_prefix("#/") else {
+    let Some(raw_fragment) = reference.strip_prefix('#') else {
         return Err(SchemaCompileError(format!(
             "unsupported $ref '{reference}': only local JSON pointer references ('#' or '#/...') are supported"
         )));
     };
+    if raw_fragment.is_empty() {
+        return Ok(root);
+    }
+    let decoded_fragment = percent_decode(raw_fragment, reference)?;
+    if decoded_fragment.is_empty() {
+        return Ok(root);
+    }
+    let Some(pointer_body) = decoded_fragment.strip_prefix('/') else {
+        return Err(SchemaCompileError(format!(
+            "unsupported $ref '{reference}': JSON pointer fragment must start with '/'"
+        )));
+    };
     let mut current = root;
-    for raw_segment in fragment.split('/') {
-        let decoded = percent_decode(raw_segment);
-        let segment = unescape_pointer_segment(&decoded);
+    for raw_segment in pointer_body.split('/') {
+        let segment = unescape_pointer_segment(raw_segment, reference)?;
         current = match current {
             Value::Object(map) => map.get(&segment).ok_or_else(|| {
-                SchemaCompileError(format!("unresolved $ref '{reference}': missing segment '{segment}'"))
+                SchemaCompileError(format!(
+                    "unresolved $ref '{reference}': missing segment '{segment}'"
+                ))
             })?,
             Value::Array(arr) => {
-                let idx = segment.parse::<usize>().map_err(|_| {
+                let idx = parse_array_index(&segment).ok_or_else(|| {
                     SchemaCompileError(format!(
                         "unresolved $ref '{reference}': invalid array index '{segment}'"
                     ))
@@ -249,9 +259,20 @@ fn is_non_negative_int(v: &Value) -> bool {
     }
 }
 
-fn unescape_pointer_segment(s: &str) -> String {
+fn parse_array_index(segment: &str) -> Option<usize> {
+    let bytes = segment.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    segment.parse::<usize>().ok()
+}
+
+fn unescape_pointer_segment(s: &str, reference: &str) -> Result<String, SchemaCompileError> {
     if !s.contains('~') {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -260,31 +281,38 @@ fn unescape_pointer_segment(s: &str) -> String {
             match chars.next() {
                 Some('1') => out.push('/'),
                 Some('0') => out.push('~'),
-                Some(other) => {
-                    out.push('~');
-                    out.push(other);
+                _ => {
+                    return Err(SchemaCompileError(format!(
+                        "invalid JSON pointer escape in $ref '{reference}'"
+                    )));
                 }
-                None => out.push('~'),
             }
         } else {
             out.push(c);
         }
     }
-    out
+    Ok(out)
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode(s: &str, reference: &str) -> Result<String, SchemaCompileError> {
     if !s.contains('%') {
-        return s.to_string();
+        return Ok(s.to_string());
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
-        {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(SchemaCompileError(format!(
+                    "invalid percent-encoding in $ref '{reference}'"
+                )));
+            }
+            let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) else {
+                return Err(SchemaCompileError(format!(
+                    "invalid percent-encoding in $ref '{reference}'"
+                )));
+            };
             out.push((hi << 4) | lo);
             i += 3;
             continue;
@@ -292,7 +320,11 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    String::from_utf8(out).map_err(|_| {
+        SchemaCompileError(format!(
+            "invalid UTF-8 in percent-decoded $ref '{reference}'"
+        ))
+    })
 }
 
 fn hex_val(b: u8) -> Option<u8> {
