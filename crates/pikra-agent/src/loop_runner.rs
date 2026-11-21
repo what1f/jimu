@@ -121,6 +121,7 @@ pub struct AgentLoopConfig {
     pub session_id: Option<String>,
     pub headers: Vec<(String, Option<String>)>,
     pub sampling_params: Map<String, Value>,
+    pub max_tool_result_bytes: Option<usize>,
     pub rollback_first_turn_on_failure: bool,
     pub system_prompt_updated: bool,
     pub tools_updated: bool,
@@ -145,6 +146,7 @@ impl AgentLoopConfig {
             session_id: None,
             headers: Vec::new(),
             sampling_params: Map::new(),
+            max_tool_result_bytes: Some(crate::DEFAULT_MAX_TOOL_RESULT_BYTES),
             rollback_first_turn_on_failure: false,
             system_prompt_updated: false,
             tools_updated: false,
@@ -521,6 +523,7 @@ pub(crate) async fn agent_loop_with_queues(
                         &tool_calls,
                         &tool_snapshot,
                         config.tool_execution_mode,
+                        config.max_tool_result_bytes,
                         &cancel,
                         Arc::clone(&emit),
                     )

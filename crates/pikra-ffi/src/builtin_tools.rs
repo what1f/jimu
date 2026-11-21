@@ -5,21 +5,19 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, HttpTransport};
-#[cfg(not(target_os = "ios"))]
-use pikra_tools::BashTool;
 use pikra_tools::{
     ApplyPatchTool, EditTool, FindTool, GrepTool, ReadTool, SleepTool, ToolDefinitionOverride,
     WakeGate, WebFetchConfig, WebFetchTool, WorkspaceToolsConfig, WriteTool,
     wrap_tool_with_override,
 };
-#[cfg(all(unix, not(target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 use pikra_tools::{
     BackgroundEventCallback, ExecCommandTool, MonitorManager, MonitorTool, ProcessSessionManager,
     WriteStdinTool,
 };
 use serde::Deserialize;
 use serde_json::Value;
-#[cfg(all(unix, not(target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
@@ -60,7 +58,7 @@ pub struct PikraBuiltinCallbacks {
 struct HostCallbacks {
     ctx: SendCallbackCtx,
     environment: Option<PikraBuiltinEnvProviderFn>,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     background_event: Option<PikraEventFn>,
     destroy: Option<PikraVoidDoneFn>,
 }
@@ -79,14 +77,14 @@ pub struct PikraBuiltinEnvCompletion(oneshot::Sender<Vec<(String, String)>>);
 struct EnvConfig {
     cwd: PathBuf,
     max_output_bytes: Option<usize>,
-    default_bash_timeout_ms: Option<u64>,
+    default_exec_timeout_ms: Option<u64>,
     #[cfg(not(target_os = "ios"))]
     shell_max_output_bytes: Option<usize>,
 }
 
 type Cleanup = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 // Erasing the manager type keeps its destructor out of binaries that omit its factories.
-#[cfg(all(unix, not(target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 type ManagerSlot = OnceLock<Box<dyn Any + Send + Sync>>;
 
 #[derive(Default)]
@@ -103,11 +101,11 @@ struct BuiltinEnv {
     shell_max_output_bytes: Option<usize>,
     transport: Option<Arc<dyn HttpTransport>>,
     wake_gate: WakeGate,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     background_event: Option<BackgroundEventCallback>,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     process_manager: ManagerSlot,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     monitor_manager: ManagerSlot,
     state: Mutex<RunState>,
     idle: Notify,
@@ -175,7 +173,7 @@ impl BuiltinEnv {
         }
     }
 
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     fn manager<T: Clone + Send + Sync + 'static>(
         &self,
         slot: &ManagerSlot,
@@ -202,7 +200,7 @@ impl BuiltinEnv {
             .clone())
     }
 
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     fn process_manager(&self) -> Result<ProcessSessionManager, String> {
         self.manager(
             &self.process_manager,
@@ -211,7 +209,7 @@ impl BuiltinEnv {
         )
     }
 
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     fn monitor_manager(&self) -> Result<MonitorManager, String> {
         self.manager(&self.monitor_manager, MonitorManager::new, |manager| {
             Box::pin(async move { manager.shutdown().await })
@@ -274,7 +272,7 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
             Arc::new(HostCallbacks {
                 ctx: SendCallbackCtx(callbacks.ctx),
                 environment: callbacks.environment,
-                #[cfg(all(unix, not(target_os = "ios")))]
+                #[cfg(not(target_os = "ios"))]
                 background_event: callbacks.background_event,
                 destroy: callbacks.destroy,
             })
@@ -283,7 +281,9 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
         if let Some(max) = config.max_output_bytes {
             workspace.max_output_bytes = max;
         }
-        workspace.default_bash_timeout_ms = config.default_bash_timeout_ms;
+        if let Some(timeout_ms) = config.default_exec_timeout_ms {
+            workspace.default_exec_timeout_ms = Some(timeout_ms);
+        }
         if let Some(host) = &host
             && let Some(provide) = host.environment
         {
@@ -297,7 +297,7 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
                 Box::pin(async move { rx.await.unwrap_or_default() })
             }));
         }
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let background_event = host.and_then(|host| {
             let send = host.background_event?;
             let callback: BackgroundEventCallback = Arc::new(move |event| {
@@ -319,11 +319,11 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
             shell_max_output_bytes: config.shell_max_output_bytes,
             transport,
             wake_gate: WakeGate::new(),
-            #[cfg(all(unix, not(target_os = "ios")))]
+            #[cfg(not(target_os = "ios"))]
             background_event,
-            #[cfg(all(unix, not(target_os = "ios")))]
+            #[cfg(not(target_os = "ios"))]
             process_manager: OnceLock::new(),
-            #[cfg(all(unix, not(target_os = "ios")))]
+            #[cfg(not(target_os = "ios"))]
             monitor_manager: OnceLock::new(),
             state: Mutex::default(),
             idle: Notify::new(),
@@ -474,36 +474,38 @@ builtin_factory!(pikra_builtin_tool_web_fetch, false, |env| {
 });
 builtin_factory!(
     #[cfg(not(target_os = "ios"))]
-    pikra_builtin_tool_bash,
+    pikra_builtin_tool_exec_command_oneshot,
     false,
     |env| {
-        let config = match env.shell_max_output_bytes {
-            Some(max) => Arc::new((*env.config).clone().with_max_output_bytes(max)),
-            None => env.config.clone(),
-        };
-        Ok(BashTool::new(config))
+        match env.shell_max_output_bytes {
+            Some(max) => {
+                let config = Arc::new((*env.config).clone().with_max_output_bytes(max));
+                Ok(ExecCommandTool::one_shot_with_structured_cap(config, max))
+            }
+            None => Ok(ExecCommandTool::one_shot(env.config.clone())),
+        }
     }
 );
 builtin_factory!(
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     pikra_builtin_tool_exec_command,
     false,
     |env| Ok(ExecCommandTool::new(env.process_manager()?))
 );
 builtin_factory!(
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     pikra_builtin_tool_write_stdin,
     false,
     |env| Ok(WriteStdinTool::new(env.process_manager()?))
 );
 builtin_factory!(
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     pikra_builtin_tool_monitor,
     false,
     |env| Ok(MonitorTool::new(env.monitor_manager()?))
 );
 
-#[cfg(any(target_os = "ios", not(unix)))]
+#[cfg(target_os = "ios")]
 macro_rules! unavailable_subprocess {
     ($(#[$attr:meta])* $name:ident) => {
         $(#[$attr])*
@@ -513,23 +515,19 @@ macro_rules! unavailable_subprocess {
             out_error: *mut *mut c_char,
         ) -> *mut PikraBuiltinTool {
             catch_handle(out_error, || {
-                Err(if cfg!(target_os = "ios") {
-                    "subprocess tools are unavailable on iOS".into()
-                } else {
-                    "subprocess tools are unavailable on this platform".into()
-                })
+                Err("subprocess tools are unavailable on iOS".into())
             })
         }
     };
 }
 
 #[cfg(target_os = "ios")]
-unavailable_subprocess!(pikra_builtin_tool_bash);
-#[cfg(any(target_os = "ios", not(unix)))]
+unavailable_subprocess!(pikra_builtin_tool_exec_command_oneshot);
+#[cfg(target_os = "ios")]
 unavailable_subprocess!(pikra_builtin_tool_exec_command);
-#[cfg(any(target_os = "ios", not(unix)))]
+#[cfg(target_os = "ios")]
 unavailable_subprocess!(pikra_builtin_tool_write_stdin);
-#[cfg(any(target_os = "ios", not(unix)))]
+#[cfg(target_os = "ios")]
 unavailable_subprocess!(pikra_builtin_tool_monitor);
 
 #[unsafe(no_mangle)]

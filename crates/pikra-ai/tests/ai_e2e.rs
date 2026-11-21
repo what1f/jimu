@@ -1313,3 +1313,34 @@ fn hidden_user_flags_preserve_provider_request_bytes() {
         assert!(!body.contains("is_meta") && !body.contains("isMeta"));
     }
 }
+
+#[test]
+fn model_defaults_and_context_window_max_tokens_clamping() {
+    let m = Model::new(
+        "claude-sonnet-4-6",
+        "anthropic",
+        ApiKind::AnthropicMessages,
+        "https://api.anthropic.com",
+    );
+    assert_eq!(m.context_window, pikra_ai::DEFAULT_CONTEXT_WINDOW);
+    assert_eq!(m.max_output_tokens, pikra_ai::DEFAULT_MAX_OUTPUT_TOKENS);
+
+    // 200k window with 160k token input (~640KB) + 128k max_output_tokens must clamp max_tokens
+    // below remaining context room instead of sending 128k and hitting upstream 400.
+    let mut constrained = m;
+    constrained.context_window = 200_000;
+    constrained.max_output_tokens = 128_000;
+    let heavy_input = "a".repeat(160_000 * 4);
+    let ctx = TranscriptContext::new(
+        "",
+        Vec::new(),
+        vec![Message::User(UserMessage::text(heavy_input, 1))],
+    );
+    let body =
+        anthropic_messages::build_request_body(&constrained, &ctx, &SimpleStreamOptions::default());
+    let sent_max = body["max_tokens"].as_u64().unwrap();
+    assert!(
+        (30_000..=36_000).contains(&sent_max),
+        "unexpected clamped max_tokens={sent_max}"
+    );
+}

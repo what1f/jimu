@@ -2,10 +2,100 @@
 
 use crate::{
     ApiKind, AssistantBlock, AssistantMessage, ContentPart, ImageContent, Message, Model,
-    StopReason, TextContent, ToolCall, ToolResultMessage,
+    ResolvedTranscript, StopReason, TextContent, ToolCall, ToolResultMessage,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+
+const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
+const CONTEXT_SAFETY_RATIO_PCT: u64 = 15;
+const MIN_OUTPUT_WITH_RATIO_MARGIN: u64 = 32_768;
+const IMAGE_INPUT_TOKEN_ESTIMATE: u64 = 1_200;
+
+/// Clamp `max_tokens` into the remaining context window while leaving a safety margin for
+/// upstream tokenizer variance (matching Pi's `clampMaxTokensToContext`).
+pub fn clamp_max_tokens_to_context(
+    model: &Model,
+    resolved: &ResolvedTranscript,
+    max_tokens: u32,
+) -> u32 {
+    if model.context_window == 0 {
+        return max_tokens.max(1);
+    }
+    let input = estimate_resolved_input_tokens(resolved);
+    let ratio_margin = input.saturating_mul(CONTEXT_SAFETY_RATIO_PCT).div_ceil(100);
+    let margin = CONTEXT_SAFETY_TOKENS.max(ratio_margin);
+    let cw = u64::from(model.context_window);
+    let mut room = cw.saturating_sub(input).saturating_sub(margin);
+    if room < MIN_OUTPUT_WITH_RATIO_MARGIN {
+        room = MIN_OUTPUT_WITH_RATIO_MARGIN.min(
+            cw.saturating_sub(input)
+                .saturating_sub(CONTEXT_SAFETY_TOKENS),
+        );
+    }
+    let room_u32 = u32::try_from(room.max(1)).unwrap_or(u32::MAX);
+    max_tokens.min(room_u32).max(1)
+}
+
+fn estimate_resolved_input_tokens(resolved: &ResolvedTranscript) -> u64 {
+    let mut bytes = resolved.system_prompt.len() as u64;
+    let mut images = 0u64;
+    for tool in &resolved.tools {
+        bytes = bytes
+            .saturating_add(tool.name.len() as u64)
+            .saturating_add(tool.description.len() as u64)
+            .saturating_add(
+                serde_json::to_string(&tool.parameters)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(64),
+            );
+    }
+    for msg in &resolved.messages {
+        match msg {
+            Message::System(s) => {
+                bytes = bytes.saturating_add(crate::render_system_message_text(s).len() as u64);
+            }
+            Message::User(u) => {
+                for part in &u.content {
+                    match part {
+                        ContentPart::Text(t) => bytes = bytes.saturating_add(t.text.len() as u64),
+                        ContentPart::Image(_) => images = images.saturating_add(1),
+                    }
+                }
+            }
+            Message::Assistant(a) => {
+                for block in &a.content {
+                    match block {
+                        AssistantBlock::Text(t) => {
+                            bytes = bytes.saturating_add(t.text.len() as u64)
+                        }
+                        AssistantBlock::Thinking(th) => {
+                            bytes = bytes.saturating_add(th.thinking.len() as u64)
+                        }
+                        AssistantBlock::ToolCall(tc) => {
+                            bytes = bytes.saturating_add(tc.name.len() as u64).saturating_add(
+                                serde_json::to_string(&tc.arguments)
+                                    .map(|s| s.len() as u64)
+                                    .unwrap_or(32),
+                            );
+                        }
+                    }
+                }
+            }
+            Message::ToolResult(tr) => {
+                for part in &tr.content {
+                    match part {
+                        ContentPart::Text(t) => bytes = bytes.saturating_add(t.text.len() as u64),
+                        ContentPart::Image(_) => images = images.saturating_add(1),
+                    }
+                }
+            }
+        }
+    }
+    bytes
+        .div_ceil(4)
+        .saturating_add(images.saturating_mul(IMAGE_INPUT_TOKEN_ESTIMATE))
+}
 
 pub const NON_VISION_USER_IMAGE_PLACEHOLDER: &str =
     "(image omitted: model does not support images)";

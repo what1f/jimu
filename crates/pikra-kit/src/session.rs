@@ -132,6 +132,9 @@ pub struct KitSessionConfig {
     pub cache_retention: CacheRetention,
     pub headers: Vec<(String, Option<String>)>,
     pub sampling_params: Map<String, Value>,
+    /// Global byte ceiling applied to each LLM-facing tool result message.
+    /// Defaults to `Some(pikra_agent::DEFAULT_MAX_TOOL_RESULT_BYTES)` (64 KiB).
+    pub max_tool_result_bytes: Option<usize>,
 }
 
 impl KitSessionConfig {
@@ -166,6 +169,7 @@ impl KitSessionConfig {
             cache_retention: CacheRetention::default(),
             headers: Vec::new(),
             sampling_params: Map::new(),
+            max_tool_result_bytes: Some(pikra_agent::DEFAULT_MAX_TOOL_RESULT_BYTES),
         }
     }
 
@@ -526,6 +530,7 @@ impl KitSession {
         agent_cfg.get_api_key = config.get_api_key.clone();
         agent_cfg.temperature = config.temperature;
         agent_cfg.max_tokens = config.max_tokens;
+        agent_cfg.max_tool_result_bytes = config.max_tool_result_bytes;
         agent_cfg.cache_retention = config.cache_retention;
         agent_cfg.session_id = Some(session_id);
         agent_cfg.headers = config.headers.clone();

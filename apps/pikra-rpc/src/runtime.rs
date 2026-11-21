@@ -26,14 +26,14 @@ use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
     SessionEntryPayload, SessionEvent, SessionManager, SessionStore, prepare_flushed_prompt,
 };
-#[cfg(all(unix, not(target_os = "ios")))]
+#[cfg(not(target_os = "ios"))]
 use pikra_tools::{
     BackgroundEventCallback, BackgroundToolEvent, ExecCommandTool, MonitorManager, MonitorTool,
     ProcessSessionManager, WriteStdinTool, format_background_events_xml,
 };
 use pikra_tools::{
-    BuiltinToolSet, SleepTool, WakeGate, WebFetchConfig, WebFetchTool, WorkspaceTools,
-    WorkspaceToolsConfig,
+    BuiltinToolKind, BuiltinToolSet, SleepTool, WakeGate, WebFetchConfig, WebFetchTool,
+    WorkspaceTools, WorkspaceToolsConfig,
 };
 use serde_json::{Map, json};
 use std::collections::VecDeque;
@@ -47,8 +47,8 @@ use uuid::Uuid;
 
 const SKILLS_CONTEXT_NAME: &str = "skills";
 const RPC_MODEL_CUSTOM_TYPE: &str = "pikra.rpc.model";
-const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+const DEFAULT_CONTEXT_WINDOW: u32 = pikra_ai::DEFAULT_CONTEXT_WINDOW;
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = pikra_ai::DEFAULT_MAX_OUTPUT_TOKENS;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedRpcModel {
@@ -285,7 +285,7 @@ pub struct RpcRuntime {
     js_runtime: Option<Arc<JsExtensionRuntime>>,
     skill_discovery: SkillDiscoveryConfig,
     instruction_discovery: InstructionDiscoveryConfig,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     background_tools: Mutex<Option<(ProcessSessionManager, MonitorManager)>>,
     no_session: bool,
     compaction_config: Mutex<CompactionConfig>,
@@ -301,7 +301,7 @@ pub struct RpcRuntime {
 
 struct BuiltSessionTools {
     resident: Vec<Arc<dyn AgentTool>>,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     background_tools: Option<(ProcessSessionManager, MonitorManager)>,
 }
 
@@ -318,12 +318,17 @@ fn build_session_tools(
     inbox: &BackgroundInbox,
 ) -> BuiltSessionTools {
     let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     let mut background_tools = None;
 
     if !no_tools {
+        let enabled_tools = if cfg!(target_os = "ios") {
+            BuiltinToolSet::all()
+        } else {
+            BuiltinToolSet::all().without(BuiltinToolKind::ExecCommand)
+        };
         let workspace = WorkspaceToolsConfig::new(cwd)
-            .with_enabled_tools(BuiltinToolSet::all())
+            .with_enabled_tools(enabled_tools)
             .with_env_provider(Arc::new(|| {
                 Box::pin(async {
                     if std::env::var_os("AI_AGENT").is_none() {
@@ -335,7 +340,7 @@ fn build_session_tools(
             }));
         let wake_gate = WakeGate::new();
         resident.extend(WorkspaceTools::build(workspace.clone()));
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         {
             let sender = inbox.sender();
             let bg_callback: BackgroundEventCallback = Arc::new(move |event| {
@@ -424,7 +429,7 @@ fn build_session_tools(
 
     BuiltSessionTools {
         resident,
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         background_tools,
     }
 }
@@ -509,7 +514,7 @@ impl RpcRuntime {
             &inbox,
         );
         let resident = built_tools.resident;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let background_tools = built_tools.background_tools;
         let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
 
@@ -571,7 +576,7 @@ impl RpcRuntime {
             js_runtime,
             skill_discovery,
             instruction_discovery,
-            #[cfg(all(unix, not(target_os = "ios")))]
+            #[cfg(not(target_os = "ios"))]
             background_tools: Mutex::new(background_tools),
             no_session: args.no_session,
             compaction_config: Mutex::new(compaction),
@@ -1328,13 +1333,13 @@ impl RpcRuntime {
     }
 
     pub async fn shutdown_tools(&self) {
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let tools = self
             .background_tools
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         if let Some((processes, monitors)) = tools {
             tokio::join!(processes.shutdown(), monitors.shutdown());
         }
@@ -1623,7 +1628,7 @@ impl RpcRuntime {
             &fresh_inbox,
         );
         let tools = built_tools.resident;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let fresh_bg_tools = built_tools.background_tools;
 
         let (session_manager, agent, instructions) = build_session_and_agent(
@@ -1666,7 +1671,7 @@ impl RpcRuntime {
             .resident_tools
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = tools;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         {
             *self
                 .background_tools
@@ -1735,7 +1740,7 @@ impl RpcRuntime {
             &fresh_inbox,
         );
         let tools = built_tools.resident;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let fresh_bg_tools = built_tools.background_tools;
 
         let (session_manager, agent, instructions) = build_session_and_agent(
@@ -1793,7 +1798,7 @@ impl RpcRuntime {
             .resident_tools
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = tools;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         {
             *self
                 .background_tools

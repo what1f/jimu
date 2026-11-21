@@ -154,7 +154,7 @@ typedef struct PikraBuiltinCallbacks {
     PikraVoidDoneFn destroy;
 } PikraBuiltinCallbacks;
 
-/* Config JSON takes cwd, optional max_output_bytes and default_bash_timeout_ms.
+/* Config JSON takes cwd, optional max_output_bytes and default_exec_timeout_ms.
  * Either callbacks table may be NULL. On success the environment owns the callback
  * contexts until their destroy functions run. On failure ownership stays with the caller.
  * Background callbacks run on worker threads and must enqueue and return promptly. */
@@ -183,7 +183,7 @@ PikraBuiltinTool *pikra_builtin_tool_sleep(PikraBuiltinEnv *env, char **out_erro
 PikraBuiltinTool *pikra_builtin_tool_web_fetch(PikraBuiltinEnv *env, char **out_error);
 
 /* Subprocess constructors report an invalid argument on iOS. */
-PikraBuiltinTool *pikra_builtin_tool_bash(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_exec_command_oneshot(PikraBuiltinEnv *env, char **out_error);
 PikraBuiltinTool *pikra_builtin_tool_exec_command(PikraBuiltinEnv *env, char **out_error);
 PikraBuiltinTool *pikra_builtin_tool_write_stdin(PikraBuiltinEnv *env, char **out_error);
 PikraBuiltinTool *pikra_builtin_tool_monitor(PikraBuiltinEnv *env, char **out_error);

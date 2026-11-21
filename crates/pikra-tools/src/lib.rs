@@ -6,19 +6,17 @@
 
 #[cfg(feature = "patch")]
 mod apply_patch;
-#[cfg(all(feature = "shell", not(target_os = "ios")))]
-mod bash;
 #[cfg(feature = "patch")]
 mod edit;
 #[cfg(feature = "sleep")]
 mod events;
-#[cfg(all(feature = "shell", unix, not(target_os = "ios")))]
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 mod exec_session;
 #[cfg(feature = "search")]
 mod find;
 #[cfg(feature = "search")]
 mod grep;
-#[cfg(all(feature = "monitor", unix, not(target_os = "ios")))]
+#[cfg(all(feature = "monitor", not(target_os = "ios")))]
 mod monitor;
 mod override_spec;
 #[cfg(feature = "fs")]
@@ -36,8 +34,6 @@ pub mod web;
 
 #[cfg(feature = "patch")]
 pub use apply_patch::ApplyPatchTool;
-#[cfg(all(feature = "shell", not(target_os = "ios")))]
-pub use bash::BashTool;
 #[cfg(feature = "patch")]
 pub use edit::EditTool;
 #[cfg(feature = "sleep")]
@@ -45,13 +41,13 @@ pub use events::{
     BackgroundEventCallback, BackgroundToolEvent, MonitorStopReason, ShellStopReason, WakeGate,
     WakeOutcome, format_background_events_xml,
 };
-#[cfg(all(feature = "shell", unix, not(target_os = "ios")))]
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 pub use exec_session::{ExecCommandTool, ProcessSessionManager, WriteStdinTool};
 #[cfg(feature = "search")]
 pub use find::FindTool;
 #[cfg(feature = "search")]
 pub use grep::GrepTool;
-#[cfg(all(feature = "monitor", unix, not(target_os = "ios")))]
+#[cfg(all(feature = "monitor", not(target_os = "ios")))]
 pub use monitor::{MonitorConfig, MonitorManager, MonitorTool};
 pub use override_spec::{
     DescriptionOverride, OverriddenTool, ToolDefinitionOverride, wrap_tool_with_override,
@@ -60,7 +56,7 @@ pub use override_spec::{
 pub use read::ReadTool;
 #[cfg(feature = "sleep")]
 pub use sleep::SleepTool;
-pub use util::{TruncatedOutput, truncate_output};
+pub use util::{TruncatedOutput, truncate_head, truncate_output, truncate_tail_spillover};
 #[cfg(feature = "web-fetch")]
 pub use web::{HostResolver, WebFetchConfig, WebFetchTool};
 #[cfg(feature = "fs")]
@@ -73,13 +69,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Default maximum output bytes per tool result (1 MiB).
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Default maximum model-facing output bytes per tool result (50 KiB, matching Pi).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+
+/// Default maximum model-facing output lines per tool result (2,000, matching Pi & Claude Code).
+pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
+
+/// Maximum structured output bytes retained for programmatic callers such as codemode (1 MiB).
+pub const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Default timeout (120 seconds) for one-shot `ExecCommandTool::one_shot` executions.
+pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 120_000;
 
 /// Default directories skipped during recursive workspace `find`.
 pub const DEFAULT_IGNORE_DIRS: &[&str] = &[".git", "node_modules", "target"];
 
-/// Host-supplied async environment provider injected into `bash` subprocesses.
+/// Host-supplied async environment provider injected into shell subprocesses.
 pub type EnvProvider = Arc<dyn Fn() -> BoxFuture<'static, Vec<(String, String)>> + Send + Sync>;
 
 /// Canonical built-in local workspace tool kinds.
@@ -89,7 +94,7 @@ pub enum BuiltinToolKind {
     Read,
     Write,
     Edit,
-    Bash,
+    ExecCommand,
     Find,
     Grep,
     ApplyPatch,
@@ -101,7 +106,7 @@ impl BuiltinToolKind {
         BuiltinToolKind::Read,
         BuiltinToolKind::Write,
         BuiltinToolKind::Edit,
-        BuiltinToolKind::Bash,
+        BuiltinToolKind::ExecCommand,
         BuiltinToolKind::Find,
         BuiltinToolKind::Grep,
         BuiltinToolKind::ApplyPatch,
@@ -113,7 +118,7 @@ impl BuiltinToolKind {
             Self::Read | Self::Write => cfg!(feature = "fs"),
             Self::Edit | Self::ApplyPatch => cfg!(feature = "patch"),
             Self::Find | Self::Grep => cfg!(feature = "search"),
-            Self::Bash => cfg!(all(feature = "shell", not(target_os = "ios"))),
+            Self::ExecCommand => cfg!(all(feature = "shell", not(target_os = "ios"))),
         }
     }
 
@@ -122,7 +127,7 @@ impl BuiltinToolKind {
             Self::Read => "read",
             Self::Write => "write",
             Self::Edit => "edit",
-            Self::Bash => "bash",
+            Self::ExecCommand => "exec_command",
             Self::Find => "find",
             Self::Grep => "grep",
             Self::ApplyPatch => "apply_patch",
@@ -142,7 +147,7 @@ impl BuiltinToolSet {
             BuiltinToolKind::Read => 1 << 0,
             BuiltinToolKind::Write => 1 << 1,
             BuiltinToolKind::Edit => 1 << 2,
-            BuiltinToolKind::Bash => 1 << 3,
+            BuiltinToolKind::ExecCommand => 1 << 3,
             BuiltinToolKind::Find => 1 << 4,
             BuiltinToolKind::Grep => 1 << 5,
             BuiltinToolKind::ApplyPatch => 1 << 6,
@@ -162,7 +167,7 @@ impl BuiltinToolSet {
         Self::read_only()
             .with(BuiltinToolKind::Write)
             .with(BuiltinToolKind::Edit)
-            .with(BuiltinToolKind::Bash)
+            .with(BuiltinToolKind::ExecCommand)
     }
 
     pub const fn read_only() -> Self {
@@ -245,14 +250,16 @@ pub struct WorkspaceToolsConfig {
     pub enabled_tools: BuiltinToolSet,
     /// Definition and argument overrides for individual built-in tools.
     pub tool_overrides: HashMap<BuiltinToolKind, ToolDefinitionOverride>,
-    /// Optional dynamic environment provider for `bash` (e.g. login-shell PATH injection).
+    /// Optional dynamic environment provider for shell subprocesses (e.g. login-shell PATH injection).
     pub env_provider: Option<EnvProvider>,
-    /// Maximum UTF-8 output bytes for tools with variable-length output (default 1 MiB).
+    /// Maximum model-facing UTF-8 output bytes for tools with variable-length output (default 50 KiB).
     pub max_output_bytes: usize,
-    /// Optional explicit shell executable for `bash` (defaults to `/bin/sh` on Unix, `cmd` on Windows).
+    /// Maximum model-facing output lines for tools with variable-length output (default 2,000).
+    pub max_output_lines: usize,
+    /// Optional explicit shell executable (defaults to `/bin/sh` on Unix, `cmd` on Windows).
     pub shell: Option<String>,
-    /// Optional default timeout in milliseconds for `bash` when the tool call omits `timeout_ms`.
-    pub default_bash_timeout_ms: Option<u64>,
+    /// Optional default timeout in milliseconds for one-shot `ExecCommandTool::one_shot` (default 120s).
+    pub default_exec_timeout_ms: Option<u64>,
     /// Directory names skipped during recursive searches.
     pub ignore_dirs: Vec<String>,
 }
@@ -264,8 +271,9 @@ impl std::fmt::Debug for WorkspaceToolsConfig {
             .field("enabled_tools", &self.enabled_tools)
             .field("has_env_provider", &self.env_provider.is_some())
             .field("max_output_bytes", &self.max_output_bytes)
+            .field("max_output_lines", &self.max_output_lines)
             .field("shell", &self.shell)
-            .field("default_bash_timeout_ms", &self.default_bash_timeout_ms)
+            .field("default_exec_timeout_ms", &self.default_exec_timeout_ms)
             .field("ignore_dirs", &self.ignore_dirs)
             .finish()
     }
@@ -279,8 +287,9 @@ impl WorkspaceToolsConfig {
             tool_overrides: HashMap::new(),
             env_provider: None,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
             shell: None,
-            default_bash_timeout_ms: None,
+            default_exec_timeout_ms: Some(DEFAULT_EXEC_TIMEOUT_MS),
             ignore_dirs: DEFAULT_IGNORE_DIRS
                 .iter()
                 .map(|s| (*s).to_string())
@@ -312,13 +321,18 @@ impl WorkspaceToolsConfig {
         self
     }
 
+    pub fn with_max_output_lines(mut self, max_output_lines: usize) -> Self {
+        self.max_output_lines = max_output_lines;
+        self
+    }
+
     pub fn with_shell(mut self, shell: impl Into<String>) -> Self {
         self.shell = Some(shell.into());
         self
     }
 
-    pub fn with_default_bash_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
-        self.default_bash_timeout_ms = timeout_ms;
+    pub fn with_default_exec_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.default_exec_timeout_ms = timeout_ms;
         self
     }
 
@@ -395,7 +409,7 @@ impl WorkspaceTools {
             #[cfg(feature = "patch")]
             BuiltinToolKind::ApplyPatch => Some(Arc::new(ApplyPatchTool::new(cfg))),
             #[cfg(all(feature = "shell", not(target_os = "ios")))]
-            BuiltinToolKind::Bash => Some(Arc::new(BashTool::new(cfg))),
+            BuiltinToolKind::ExecCommand => Some(Arc::new(ExecCommandTool::one_shot(cfg))),
             #[cfg(feature = "search")]
             BuiltinToolKind::Find => Some(Arc::new(FindTool::new(cfg))),
             #[cfg(feature = "search")]

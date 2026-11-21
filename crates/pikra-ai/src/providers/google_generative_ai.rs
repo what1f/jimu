@@ -288,7 +288,8 @@ pub fn build_request_body(
     if let Some(temperature) = options.temperature {
         gen_cfg.insert("temperature".into(), json!(temperature));
     }
-    if let Some(max_tokens) = options.max_tokens {
+    if let Some(raw_max_tokens) = options.max_tokens {
+        let max_tokens = crate::clamp_max_tokens_to_context(model, &resolved, raw_max_tokens);
         gen_cfg.insert("maxOutputTokens".into(), json!(max_tokens));
     }
     if model.supports_reasoning

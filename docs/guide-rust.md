@@ -54,7 +54,7 @@ pub async fn run_example(workspace: &std::path::Path, api_key: String) -> Result
             BuiltinToolKind::ApplyPatch,
             BuiltinToolKind::Find,
             BuiltinToolKind::Grep,
-            BuiltinToolKind::Bash,
+            BuiltinToolKind::ExecCommand,
         ]);
     let builtin_tools = WorkspaceTools::build(tools_cfg);
 

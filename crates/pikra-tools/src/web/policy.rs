@@ -20,7 +20,7 @@ pub struct WebFetchConfig {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            max_output_bytes: 128 * 1024,
+            max_output_bytes: crate::DEFAULT_MAX_OUTPUT_BYTES,
             max_download_bytes: 10 * 1024 * 1024,
             allow_private_hosts: false,
             host_resolver: None,

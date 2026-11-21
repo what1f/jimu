@@ -670,7 +670,7 @@ pub(crate) struct Session {
     last_steer: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     pub(crate) mcp_config: Vec<acp::McpServer>,
     mcp: Vec<Arc<McpClient>>,
-    #[cfg(all(unix, not(target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     local_processes: Option<(
         pikra_tools::ProcessSessionManager,
         pikra_tools::MonitorManager,
@@ -738,14 +738,19 @@ impl Session {
         });
         opts.compaction.compaction_reserve_tokens = cfg.compact_tokens;
         opts.compaction_strategy = Some(compaction.clone());
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let mut local_processes = None;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let bg_sender: Arc<std::sync::OnceLock<pikra_kit::BackgroundEventSender>> =
             Arc::new(std::sync::OnceLock::new());
         if cfg.enable_tools {
+            let enabled = if cfg!(target_os = "ios") {
+                BuiltinToolSet::all()
+            } else {
+                BuiltinToolSet::all().without(pikra_tools::BuiltinToolKind::ExecCommand)
+            };
             let workspace = WorkspaceToolsConfig::new(&meta.cwd)
-                .with_enabled_tools(BuiltinToolSet::all())
+                .with_enabled_tools(enabled)
                 .with_env_provider(Arc::new(|| {
                     Box::pin(async {
                         if std::env::var_os("AI_AGENT").is_none() {
@@ -757,7 +762,7 @@ impl Session {
                 }));
             let gate = WakeGate::new();
             let mut tools = WorkspaceTools::build(workspace.clone());
-            #[cfg(all(unix, not(target_os = "ios")))]
+            #[cfg(not(target_os = "ios"))]
             {
                 use pikra_tools::{
                     BackgroundEventCallback, BackgroundToolEvent, ExecCommandTool, MonitorManager,
@@ -857,7 +862,7 @@ impl Session {
         ));
         let kit = KitSession::new(model_stream, opts)
             .map_err(|_| failed("Could not open the session."))?;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         let _ = bg_sender.set(kit.background_sender());
         let mut session = Self {
             record,
@@ -869,7 +874,7 @@ impl Session {
             last_steer: Mutex::default(),
             mcp_config,
             mcp: Vec::new(),
-            #[cfg(all(unix, not(target_os = "ios")))]
+            #[cfg(not(target_os = "ios"))]
             local_processes,
             lease,
         };
@@ -1038,7 +1043,7 @@ impl Session {
         self.kit.abort_now();
         self.turn.wait().await;
         self.kit.abort().await;
-        #[cfg(all(unix, not(target_os = "ios")))]
+        #[cfg(not(target_os = "ios"))]
         if let Some((processes, monitors)) = &self.local_processes {
             tokio::join!(processes.shutdown(), monitors.shutdown());
         }

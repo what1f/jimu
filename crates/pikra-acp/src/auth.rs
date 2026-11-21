@@ -32,6 +32,7 @@ struct Builtin {
     env: &'static [&'static str],
     models: &'static [&'static str],
     context: u32,
+    max_output: u32,
     images: bool,
 }
 
@@ -43,7 +44,8 @@ static BUILTINS: &[Builtin] = &[
         url: "https://api.anthropic.com",
         env: &["ANTHROPIC_API_KEY"],
         models: &["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"],
-        context: 200_000,
+        context: 1_000_000,
+        max_output: 128_000,
         images: true,
     },
     Builtin {
@@ -54,6 +56,7 @@ static BUILTINS: &[Builtin] = &[
         env: &["OPENAI_API_KEY"],
         models: &["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
         context: 272_000,
+        max_output: 128_000,
         images: true,
     },
     Builtin {
@@ -64,6 +67,7 @@ static BUILTINS: &[Builtin] = &[
         env: &[],
         models: &["gpt-5.4", "gpt-5.3-codex"],
         context: 272_000,
+        max_output: 128_000,
         images: true,
     },
     Builtin {
@@ -74,17 +78,19 @@ static BUILTINS: &[Builtin] = &[
         env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         models: &["gemini-2.5-pro", "gemini-2.5-flash"],
         context: 1_048_576,
+        max_output: 65_536,
         images: true,
     },
     Builtin {
         id: "deepseek",
         title: "DeepSeek",
-        api: ApiKind::OpenaiCompletions,
-        url: "https://api.deepseek.com",
+        api: ApiKind::OpenaiResponses,
+        url: "https://api.deepseek.com/v1",
         env: &["DEEPSEEK_API_KEY"],
-        models: &["deepseek-chat", "deepseek-reasoner"],
-        context: 128_000,
-        images: false,
+        models: &["deepseek-flash", "deepseek-v4-pro"],
+        context: 1_000_000,
+        max_output: 384_000,
+        images: true,
     },
     Builtin {
         id: "openrouter",
@@ -98,6 +104,7 @@ static BUILTINS: &[Builtin] = &[
             "google/gemini-2.5-pro",
         ],
         context: 200_000,
+        max_output: 64_000,
         images: true,
     },
 ];
@@ -127,6 +134,7 @@ enum CustomModel {
         id: String,
         name: Option<String>,
         context_window: Option<u32>,
+        max_output_tokens: Option<u32>,
         supports_images: Option<bool>,
         #[serde(default)]
         thinking_levels: Option<Vec<ThinkingLevel>>,
@@ -532,12 +540,21 @@ impl Auth {
             (api, url)
         };
         let mut model = Model::new(id, provider, api, url);
-        model.supports_images = entry.is_none_or(|e| e.images);
+        model.supports_images = match (provider, id) {
+            ("deepseek", "deepseek-v4-pro") => false,
+            _ => entry.is_none_or(|e| e.images),
+        };
         model.supports_reasoning = true;
-        model.context_window = self
-            .config
-            .context_window
-            .unwrap_or_else(|| entry.map_or(272_000, |e| e.context));
+        let default_context = match (provider, id) {
+            ("anthropic", "claude-haiku-4-5") => 200_000,
+            _ => entry.map_or(272_000, |e| e.context),
+        };
+        let default_max_output = match (provider, id) {
+            ("anthropic", "claude-haiku-4-5") => 64_000,
+            _ => entry.map_or(pikra_ai::DEFAULT_MAX_OUTPUT_TOKENS, |e| e.max_output),
+        };
+        model.context_window = self.config.context_window.unwrap_or(default_context);
+        model.max_output_tokens = self.config.max_output_tokens.unwrap_or(default_max_output);
         model.cost = match id {
             "gpt-5.4" if provider == "openai" => ModelCost {
                 input: 2.5,
@@ -556,6 +573,7 @@ impl Auth {
         if let Some(CustomModel::Spec {
             name,
             context_window,
+            max_output_tokens,
             supports_images,
             ..
         }) = route.and_then(|route| route.models.iter().find(|spec| spec.id() == id))
@@ -565,6 +583,9 @@ impl Auth {
             }
             if let Some(window) = context_window {
                 model.context_window = *window;
+            }
+            if let Some(max_out) = max_output_tokens {
+                model.max_output_tokens = *max_out;
             }
             if let Some(images) = supports_images {
                 model.supports_images = *images;

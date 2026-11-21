@@ -1,9 +1,8 @@
 use crate::WorkspaceToolsConfig;
-use crate::bash::{ProcessGroupGuard, build_shell_command};
 use crate::events::{
     BackgroundEventCallback, BackgroundEvents, BackgroundToolEvent, ShellStopReason, WakeGate,
 };
-use crate::util::{BoundedOutputBuffer, resolve_path};
+use crate::util::{TailSpilloverBuffer, display_path, resolve_path};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{
@@ -12,15 +11,22 @@ use pikra_schema::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+#[cfg(unix)]
+use tokio::io::Interest;
+#[cfg(unix)]
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, watch};
 use tokio::time::{Instant, sleep_until};
@@ -28,7 +34,96 @@ use tokio::time::{Instant, sleep_until};
 const DEFAULT_MAX_SESSIONS: usize = 16;
 const DEFAULT_EXEC_YIELD_MS: u64 = 10_000;
 const DEFAULT_STDIN_YIELD_MS: u64 = 5_000;
+const MAX_TIMEOUT_MS: u64 = 86_400_000;
+const MAX_COMMAND_BYTES: usize = 65_536;
 pub(crate) const OUTPUT_CHUNK_BYTES: usize = 8192;
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if let Ok(pgid) = i32::try_from(pid)
+        && pgid > 0
+    {
+        // SAFETY: Sending SIGKILL to the negative process group id we created via
+        // `Command::process_group(0)` / `setsid()` terminates the child and every descendant.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
+
+pub(crate) struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    pub(crate) fn kill_now(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            kill_process_group(pid);
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
+}
+
+pub(crate) fn build_shell_command(shell: Option<&str>, command: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let bin = shell.unwrap_or("/bin/sh");
+        let mut cmd = Command::new(bin);
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+
+    #[cfg(not(unix))]
+    {
+        let bin = shell.unwrap_or("cmd");
+        let mut cmd = Command::new(bin);
+        cmd.arg("/C").arg(command);
+        cmd
+    }
+}
+
+fn shell_exit_code(status: Option<ExitStatus>, timed_out: bool) -> i32 {
+    if timed_out {
+        return 124;
+    }
+    let Some(status) = status else {
+        return 1;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(1)
+}
+
+#[cfg(unix)]
+fn format_signal_notice(status: Option<ExitStatus>) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match status.and_then(|s| s.signal()) {
+        Some(sig) => format!("Command terminated by signal {sig}."),
+        None => "Command failed.".to_string(),
+    }
+}
+
+#[cfg(not(unix))]
+fn format_signal_notice(_status: Option<ExitStatus>) -> String {
+    "Command failed.".to_string()
+}
 
 /// Owns running commands and a bounded set of completed background sessions
 /// whose final output can still be collected. Clones share the same sessions.
@@ -136,6 +231,8 @@ impl ProcessSessionManager {
         let (child, input, output) = spawn_process(process, true, args.tty)
             .map_err(|err| format!("Could not start command: {err}"))?;
         let deadline = args.timeout_ms.and_then(deadline_after_ms);
+        let max_bytes = self.0.workspace.max_output_bytes;
+        let max_lines = self.0.workspace.max_output_lines;
         let session = Arc::new(Session {
             id,
             cwd,
@@ -143,12 +240,13 @@ impl ProcessSessionManager {
             input: AsyncMutex::new(input),
             changed: Notify::new(),
             state: Mutex::new(SessionState {
-                unread: BoundedOutputBuffer::new(self.0.workspace.max_output_bytes),
+                unread: TailSpilloverBuffer::new(max_bytes, max_lines),
                 has_output: false,
                 backgrounded: args.background,
                 exit: None,
             }),
-            max_output_bytes: self.0.workspace.max_output_bytes,
+            max_output_bytes: max_bytes,
+            max_output_lines: max_lines,
         });
         sessions.next_id = id;
         sessions.active.insert(id, session.clone());
@@ -177,8 +275,6 @@ impl ProcessSessionManager {
                         .active
                         .remove(&id);
                 }
-                // A shutting-down runtime may drop the worker before it publishes
-                // its result. Unblock any caller that already holds this session.
                 cleanup_session
                     .state
                     .lock()
@@ -200,8 +296,6 @@ impl ProcessSessionManager {
         explicit_background: bool,
     ) -> Result<AgentToolResult, String> {
         let (unread, exit) = {
-            // Use the same lock order as process completion so a command can
-            // only become a background session while reserving a slot.
             let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let mut state = session.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.exit.is_none() && !state.backgrounded {
@@ -260,10 +354,11 @@ struct Session {
     changed: Notify,
     state: Mutex<SessionState>,
     max_output_bytes: usize,
+    max_output_lines: usize,
 }
 
 struct SessionState {
-    unread: BoundedOutputBuffer,
+    unread: TailSpilloverBuffer,
     has_output: bool,
     backgrounded: bool,
     exit: Option<ProcessExit>,
@@ -280,15 +375,17 @@ impl Session {
         }
     }
 
-    fn take_output(&self, state: &mut SessionState) -> BoundedOutputBuffer {
+    fn take_output(&self, state: &mut SessionState) -> TailSpilloverBuffer {
         state.has_output = false;
         std::mem::replace(
             &mut state.unread,
-            BoundedOutputBuffer::new(self.max_output_bytes),
+            TailSpilloverBuffer::new(self.max_output_bytes, self.max_output_lines),
         )
     }
 
-    fn render(&self, unread: BoundedOutputBuffer, exit: Option<ProcessExit>) -> AgentToolResult {
+    fn render(&self, unread: TailSpilloverBuffer, exit: Option<ProcessExit>) -> AgentToolResult {
+        let (structured_out, structured_trunc) = unread.structured_prefix();
+        let structured_out = structured_out.into_owned();
         let output = unread.render(self.max_output_bytes);
         let text = if exit.is_none() {
             let status_line = format!("[session_id: {}, status: running]", self.id);
@@ -310,13 +407,26 @@ impl Session {
             details["truncated"] = json!(true);
             details["omitted_bytes"] = json!(output.omitted_bytes);
         }
+        if let Some(path) = &output.full_output_path {
+            details["full_output_path"] = json!(path);
+        }
         if let Some(exit) = exit {
-            if exit.reason == ProcessEnd::Timeout {
+            let timed_out = exit.reason == ProcessEnd::Timeout;
+            if timed_out {
                 details["timed_out"] = json!(true);
             }
-            result.is_error = exit.reason == ProcessEnd::Timeout
+            result.is_error = timed_out
                 || (exit.reason == ProcessEnd::Exited
                     && !exit.status.is_some_and(|status| status.success()));
+            let mut structured = json!({
+                "exit_code": shell_exit_code(exit.status, timed_out),
+                "output": structured_out,
+                "output_truncated": structured_trunc,
+            });
+            if let Some(path) = &output.full_output_path {
+                structured["full_output_path"] = json!(path);
+            }
+            result.structured_content = Some(structured);
         }
         result.details = details;
         result
@@ -386,13 +496,42 @@ async fn run_shell(
 }
 
 #[derive(Clone)]
+enum ExecBackend {
+    Interactive(ProcessSessionManager),
+    OneShot {
+        workspace: Arc<WorkspaceToolsConfig>,
+        structured_cap: usize,
+    },
+}
+
+#[derive(Clone)]
 pub struct ExecCommandTool {
-    manager: ProcessSessionManager,
+    backend: ExecBackend,
 }
 
 impl ExecCommandTool {
     pub fn new(manager: ProcessSessionManager) -> Self {
-        Self { manager }
+        Self {
+            backend: ExecBackend::Interactive(manager),
+        }
+    }
+
+    /// Construct a stateless one-shot command executor for hosts that do not expose `write_stdin`
+    /// (defaults to `WorkspaceToolsConfig::default_exec_timeout_ms`, 120 seconds).
+    pub fn one_shot(workspace: Arc<WorkspaceToolsConfig>) -> Self {
+        Self::one_shot_with_structured_cap(workspace, crate::STRUCTURED_OUTPUT_MAX_BYTES)
+    }
+
+    pub fn one_shot_with_structured_cap(
+        workspace: Arc<WorkspaceToolsConfig>,
+        structured_cap: usize,
+    ) -> Self {
+        Self {
+            backend: ExecBackend::OneShot {
+                workspace,
+                structured_cap,
+            },
+        }
     }
 }
 
@@ -420,35 +559,70 @@ impl Drop for PendingExec {
 
 impl AgentTool for ExecCommandTool {
     fn definition(&self) -> ToolDefinition {
-        let parameters = obj_schema([
-            (
-                "command",
-                with_description(str_schema(), "Shell command to run."),
-                true,
-            ),
-            ("cwd", str_schema(), false),
-            (
-                "yield_time_ms",
-                with_bounds(int_schema(), Some(0.0), None),
-                false,
-            ),
-            (
-                "timeout_ms",
-                with_bounds(int_schema(), Some(1.0), None),
-                false,
-            ),
-            ("background", bool_schema(), false),
-            (
-                "tty",
-                with_description(bool_schema(), "Use an interactive terminal."),
-                false,
-            ),
-        ]);
-        ToolDefinition {
-            name: "exec_command".into(),
-            description: "Run a shell command. Use write_stdin to continue a running command."
-                .into(),
-            parameters,
+        match &self.backend {
+            ExecBackend::Interactive(_) => {
+                let mut fields = vec![
+                    (
+                        "command",
+                        with_description(str_schema(), "Shell command to run."),
+                        true,
+                    ),
+                    ("cwd", str_schema(), false),
+                    (
+                        "yield_time_ms",
+                        with_bounds(int_schema(), Some(0.0), None),
+                        false,
+                    ),
+                    (
+                        "timeout_ms",
+                        with_bounds(int_schema(), Some(1.0), Some(MAX_TIMEOUT_MS as f64)),
+                        false,
+                    ),
+                    ("background", bool_schema(), false),
+                ];
+                #[cfg(unix)]
+                fields.push((
+                    "tty",
+                    with_description(bool_schema(), "Use an interactive terminal."),
+                    false,
+                ));
+                ToolDefinition {
+                    name: "exec_command".into(),
+                    description:
+                        "Run a shell command. Use write_stdin to continue a running command."
+                            .into(),
+                    parameters: obj_schema(fields),
+                }
+            }
+            ExecBackend::OneShot { .. } => ToolDefinition {
+                name: "exec_command".into(),
+                description:
+                    "Run a shell command in the workspace directory with an optional working directory and timeout."
+                        .into(),
+                parameters: obj_schema([
+                    (
+                        "command",
+                        with_description(str_schema(), "Shell command to execute."),
+                        true,
+                    ),
+                    (
+                        "cwd",
+                        with_description(
+                            str_schema(),
+                            "Working directory for the command (relative to workspace cwd or absolute).",
+                        ),
+                        false,
+                    ),
+                    (
+                        "timeout_ms",
+                        with_description(
+                            with_bounds(int_schema(), Some(1.0), Some(MAX_TIMEOUT_MS as f64)),
+                            "Optional timeout in milliseconds before terminating the process group.",
+                        ),
+                        false,
+                    ),
+                ]),
+            },
         }
     }
 
@@ -464,50 +638,284 @@ impl AgentTool for ExecCommandTool {
         on_update: ToolProgressCallback,
     ) -> BoxFuture<'_, Result<AgentToolResult, String>> {
         Box::pin(async move {
-            let args: ExecArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
-            if args.timeout_ms == Some(0) {
-                return Err("timeout_ms must be at least 1.".into());
-            }
-            let (cwd, command) = prepare_shell(
-                &self.manager.0.workspace,
-                &args.command,
-                args.cwd.as_deref(),
-                &cancel,
-            )
-            .await?;
-            let (updates, mut progress) = mpsc::channel(16);
-            let session = self
-                .manager
-                .start(args.command.clone(), cwd, command, &args, updates)?;
-            let mut pending = PendingExec(Some(session.control.clone()));
-            let yield_ms = args.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS);
-            if !args.background && yield_ms > 0 {
-                let deadline = deadline_after_ms(yield_ms);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            session.control.stop();
-                            session.control.wait_done().await;
-                            return Err("Operation aborted".into());
-                        }
-                        _ = wait_deadline(deadline) => break,
-                        Some(chunk) = progress.recv() => {
-                            on_update(AgentToolResult::text(String::from_utf8_lossy(&chunk)));
-                        }
-                        _ = session.control.wait_done() => break,
-                    }
+            match &self.backend {
+                ExecBackend::Interactive(manager) => {
+                    execute_interactive(manager, args, cancel, on_update).await
                 }
+                ExecBackend::OneShot {
+                    workspace,
+                    structured_cap,
+                } => execute_one_shot(workspace, *structured_cap, args, cancel, on_update).await,
             }
-            let result = self.manager.collect_exec(&session, args.background);
-            if result.is_err() {
-                session.control.stop();
-                session.control.wait_done().await;
-            }
-            pending.0 = None;
-            result
         })
     }
+}
+
+async fn execute_interactive(
+    manager: &ProcessSessionManager,
+    args: Value,
+    cancel: CancelToken,
+    on_update: ToolProgressCallback,
+) -> Result<AgentToolResult, String> {
+    let args: ExecArgs = serde_json::from_value(args).map_err(|error| error.to_string())?;
+    if let Some(ms) = args.timeout_ms
+        && !(1..=MAX_TIMEOUT_MS).contains(&ms)
+    {
+        return Err(format!(
+            "timeout_ms must be an integer between 1 and {MAX_TIMEOUT_MS}."
+        ));
+    }
+    let (cwd, command) = prepare_shell(
+        &manager.0.workspace,
+        &args.command,
+        args.cwd.as_deref(),
+        &cancel,
+    )
+    .await?;
+    let (updates, mut progress) = mpsc::channel(16);
+    let session = manager.start(args.command.clone(), cwd, command, &args, updates)?;
+    let mut pending = PendingExec(Some(session.control.clone()));
+    let yield_ms = args.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS);
+    if !args.background && yield_ms > 0 {
+        let deadline = deadline_after_ms(yield_ms);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    session.control.stop();
+                    session.control.wait_done().await;
+                    return Err("Operation aborted".into());
+                }
+                _ = wait_deadline(deadline) => break,
+                Some(chunk) = progress.recv() => {
+                    on_update(AgentToolResult::text(String::from_utf8_lossy(&chunk)));
+                }
+                _ = session.control.wait_done() => break,
+            }
+        }
+    }
+    let result = manager.collect_exec(&session, args.background);
+    if result.is_err() {
+        session.control.stop();
+        session.control.wait_done().await;
+    }
+    pending.0 = None;
+    result
+}
+
+async fn execute_one_shot(
+    workspace: &WorkspaceToolsConfig,
+    structured_cap: usize,
+    args: Value,
+    cancel: CancelToken,
+    on_update: ToolProgressCallback,
+) -> Result<AgentToolResult, String> {
+    if cancel.is_cancelled() {
+        return Err("Operation aborted".into());
+    }
+    let command_str = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing required string argument: command".to_string())?;
+    let timeout_ms = match args.get("timeout_ms") {
+        None | Some(Value::Null) => workspace.default_exec_timeout_ms,
+        Some(v) => Some(
+            v.as_u64()
+                .filter(|&n| (1..=MAX_TIMEOUT_MS).contains(&n))
+                .ok_or_else(|| {
+                    format!("timeout_ms must be an integer between 1 and {MAX_TIMEOUT_MS}")
+                })?,
+        ),
+    };
+    let (cwd, process) = prepare_shell(
+        workspace,
+        command_str,
+        args.get("cwd").and_then(Value::as_str),
+        &cancel,
+    )
+    .await?;
+    let shown_cwd = display_path(&workspace.cwd, &cwd);
+    let (mut child, _, mut output) = spawn_process(process, false, false)
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    let mut buffer = TailSpilloverBuffer::with_structured_cap(
+        workspace.max_output_bytes,
+        workspace.max_output_lines,
+        structured_cap,
+    );
+    let deadline = timeout_ms.and_then(deadline_after_ms);
+    let mut aborted = false;
+    let mut timed_out = false;
+
+    let mut chunks = [[0u8; OUTPUT_CHUNK_BYTES]; 2];
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                aborted = true;
+                child.control.stop();
+                break;
+            }
+            _ = wait_deadline(deadline) => {
+                timed_out = true;
+                child.control.stop();
+                break;
+            }
+            next = output.next(&mut chunks) => {
+                match next {
+                    Some((_, slice)) => {
+                        buffer.push(slice);
+                        on_update(AgentToolResult::text(String::from_utf8_lossy(slice)));
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    drop(output);
+
+    let exit = if aborted {
+        let _ = child.wait(None, None).await;
+        None
+    } else if timed_out {
+        Some(child.wait(Some(Instant::now()), None).await)
+    } else {
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                aborted = true;
+                child.control.stop();
+                let _ = child.wait(None, None).await;
+                None
+            }
+            res = child.wait(deadline, None) => Some(res),
+        };
+        if res.is_some_and(|e| e.reason == ProcessEnd::Timeout) {
+            timed_out = true;
+        }
+        res
+    };
+
+    if aborted {
+        let notice = "Command aborted.";
+        let (text, truncated, omitted_bytes, full_path) =
+            render_with_notice(&buffer, workspace.max_output_bytes, notice);
+        let mut res = AgentToolResult::error(text);
+        let mut details = json!({
+            "cwd": shown_cwd,
+            "aborted": true,
+            "truncated": truncated,
+            "omitted_bytes": omitted_bytes,
+        });
+        if let Some(p) = full_path {
+            details["full_output_path"] = json!(p);
+        }
+        res.details = details;
+        return Ok(res);
+    }
+
+    let (structured_out, structured_trunc) = buffer.structured_prefix();
+    let structured_out = structured_out.into_owned();
+
+    if timed_out {
+        let ms = timeout_ms.unwrap_or(0);
+        let notice = format!("Command timed out after {ms}ms.");
+        let (text, truncated, omitted_bytes, full_path) =
+            render_with_notice(&buffer, workspace.max_output_bytes, &notice);
+        let mut res = AgentToolResult::error(text);
+        let mut details = json!({
+            "cwd": shown_cwd,
+            "timed_out": true,
+            "timeout_ms": ms,
+            "truncated": truncated,
+            "omitted_bytes": omitted_bytes,
+        });
+        let mut structured = json!({
+            "exit_code": 124,
+            "output": structured_out,
+            "output_truncated": structured_trunc,
+        });
+        if let Some(p) = full_path {
+            details["full_output_path"] = json!(p);
+            structured["full_output_path"] = json!(p);
+        }
+        res.details = details;
+        res.structured_content = Some(structured);
+        return Ok(res);
+    }
+
+    let status = exit.and_then(|e| e.status);
+    let code = status.and_then(|s| s.code());
+    if status.is_some_and(|s| s.success()) {
+        let rendered = buffer.render(workspace.max_output_bytes);
+        let mut res = AgentToolResult::text(rendered.text);
+        let mut details = json!({
+            "cwd": shown_cwd,
+            "exit_code": code.unwrap_or(0),
+            "truncated": rendered.truncated,
+            "omitted_bytes": rendered.omitted_bytes,
+        });
+        let mut structured = json!({
+            "exit_code": 0,
+            "output": structured_out,
+            "output_truncated": structured_trunc,
+        });
+        if let Some(p) = rendered.full_output_path {
+            details["full_output_path"] = json!(p);
+            structured["full_output_path"] = json!(p);
+        }
+        res.details = details;
+        res.structured_content = Some(structured);
+        Ok(res)
+    } else {
+        let notice = match code {
+            Some(c) => format!("Command exited with code {c}."),
+            None => format_signal_notice(status),
+        };
+        let (text, truncated, omitted_bytes, full_path) =
+            render_with_notice(&buffer, workspace.max_output_bytes, &notice);
+        let mut res = AgentToolResult::error(text);
+        let mut details = json!({
+            "cwd": shown_cwd,
+            "exit_code": code,
+            "truncated": truncated,
+            "omitted_bytes": omitted_bytes,
+        });
+        let mut structured = json!({
+            "exit_code": shell_exit_code(status, false),
+            "output": structured_out,
+            "output_truncated": structured_trunc,
+        });
+        if let Some(p) = full_path {
+            details["full_output_path"] = json!(p);
+            structured["full_output_path"] = json!(p);
+        }
+        res.details = details;
+        res.structured_content = Some(structured);
+        Ok(res)
+    }
+}
+
+fn render_with_notice(
+    buffer: &TailSpilloverBuffer,
+    max_bytes: usize,
+    notice: &str,
+) -> (String, bool, usize, Option<PathBuf>) {
+    let sep_and_notice_len = notice.len() + 1;
+    let body_budget = max_bytes.saturating_sub(sep_and_notice_len);
+    let rendered = buffer.render(body_budget);
+    let text = if rendered.text.is_empty() {
+        notice.to_string()
+    } else if rendered.text.ends_with('\n') {
+        format!("{}{notice}", rendered.text)
+    } else {
+        format!("{}\n{notice}", rendered.text)
+    };
+    (
+        text,
+        rendered.truncated,
+        rendered.omitted_bytes,
+        rendered.full_output_path,
+    )
 }
 
 #[derive(Clone)]
@@ -592,8 +1000,7 @@ impl AgentTool for WriteStdinTool {
                         _ = session.wait_until(|state| state.exit.is_some()) => {},
                         result = write => {
                             if let Err(err) = result
-                                && !matches!(err.kind(), io::ErrorKind::BrokenPipe)
-                                && err.raw_os_error() != Some(libc::EIO)
+                                && !is_closed_input_error(&err)
                             {
                                 return Err(format!("Could not send input: {err}"));
                             }
@@ -626,12 +1033,26 @@ impl AgentTool for WriteStdinTool {
     }
 }
 
+fn is_closed_input_error(err: &io::Error) -> bool {
+    if matches!(err.kind(), io::ErrorKind::BrokenPipe) {
+        return true;
+    }
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::EIO) {
+        return true;
+    }
+    false
+}
+
 pub(crate) async fn prepare_shell(
     workspace: &WorkspaceToolsConfig,
     command: &str,
     cwd: Option<&str>,
     cancel: &CancelToken,
 ) -> Result<(PathBuf, Command), String> {
+    if command.is_empty() || command.len() > MAX_COMMAND_BYTES || command.contains('\0') {
+        return Err("Command must contain 1 to 65536 bytes without NUL.".into());
+    }
     if command.trim().is_empty() {
         return Err("command must not be empty.".into());
     }
@@ -772,8 +1193,6 @@ impl ProcessChild {
             } => (ProcessEnd::Interrupted, None),
             result = self.child.wait() => (ProcessEnd::Exited, result.ok()),
         };
-        // A shell may exit while descendants still own its pipes. Terminate the
-        // group before waiting for EOF, even when the leader exited naturally.
         self.control.kill_group();
         let status = match status {
             Some(status) => Some(status),
@@ -794,6 +1213,7 @@ impl Drop for ProcessChild {
 
 pub(crate) enum ProcessInput {
     Pipe(ChildStdin),
+    #[cfg(unix)]
     Terminal(Arc<AsyncFd<File>>),
 }
 
@@ -801,6 +1221,7 @@ impl ProcessInput {
     async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
         match self {
             Self::Pipe(pipe) => pipe.write_all(data).await,
+            #[cfg(unix)]
             Self::Terminal(master) => {
                 while !data.is_empty() {
                     let written = match master
@@ -839,6 +1260,7 @@ pub(crate) enum OutputStream {
 
 pub(crate) enum ProcessOutput {
     Pipes(Option<ChildStdout>, Option<ChildStderr>),
+    #[cfg(unix)]
     Terminal(Arc<AsyncFd<File>>),
 }
 
@@ -849,6 +1271,7 @@ impl ProcessOutput {
     ) -> Option<(OutputStream, &'a [u8])> {
         let [out, err] = buffers;
         match self {
+            #[cfg(unix)]
             Self::Terminal(master) => loop {
                 match master
                     .async_io(Interest::READABLE, |mut fd| {
@@ -902,6 +1325,7 @@ pub(crate) fn spawn_process(
     tty: bool,
 ) -> io::Result<(ProcessChild, Option<ProcessInput>, ProcessOutput)> {
     command.kill_on_drop(true);
+    #[cfg(unix)]
     let terminal = if tty {
         Some(attach_pty(&mut command)?)
     } else {
@@ -916,12 +1340,30 @@ pub(crate) fn spawn_process(
             .stderr(Stdio::piped());
         None
     };
+    #[cfg(not(unix))]
+    {
+        if tty {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Interactive terminal (tty) is only supported on Unix platforms",
+            ));
+        }
+        command
+            .stdin(if writable {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
     let mut child = command.spawn()?;
     let control = Arc::new(ProcessControl {
         group: Mutex::new(ProcessGroupGuard::new(child.id())),
         stopped: CancelToken::new(),
         done: watch::channel(false).0,
     });
+    #[cfg(unix)]
     let (input, output) = match terminal {
         Some(master) => (
             Some(ProcessInput::Terminal(master.clone())),
@@ -932,9 +1374,15 @@ pub(crate) fn spawn_process(
             ProcessOutput::Pipes(child.stdout.take(), child.stderr.take()),
         ),
     };
+    #[cfg(not(unix))]
+    let (input, output) = (
+        child.stdin.take().map(ProcessInput::Pipe),
+        ProcessOutput::Pipes(child.stdout.take(), child.stderr.take()),
+    );
     Ok((ProcessChild { control, child }, input, output))
 }
 
+#[cfg(unix)]
 fn attach_pty(command: &mut Command) -> io::Result<Arc<AsyncFd<File>>> {
     let (mut master, mut slave) = (-1, -1);
     let mut size = libc::winsize {

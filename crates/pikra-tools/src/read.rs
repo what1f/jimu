@@ -7,7 +7,8 @@ use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_descrip
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-const DEFAULT_READ_LIMIT: usize = 800;
+const DEFAULT_READ_LIMIT: usize = 2_000;
+const MAX_LINE_CHARS: usize = 2_000;
 const BINARY_SNIFF_BYTES: usize = 8192;
 
 /// Built-in `read` tool for reading UTF-8 text files with optional 1-based line offset & limit.
@@ -48,7 +49,7 @@ impl AgentTool for ReadTool {
                     "limit",
                     with_description(
                         with_bounds(int_schema(), Some(1.0), None),
-                        "Maximum number of lines to return (defaults to 800).",
+                        "Maximum number of lines to return (defaults to 2000).",
                     ),
                     false,
                 ),
@@ -159,37 +160,86 @@ impl AgentTool for ReadTool {
             }
 
             let start_idx = offset - 1;
-            let end_idx = start_idx.saturating_add(limit).min(total_lines);
+            let effective_limit = limit.min(config.max_output_lines.max(1));
+            let end_idx = start_idx.saturating_add(effective_limit).min(total_lines);
             let slice = &lines[start_idx..end_idx];
 
+            let footer_reserve = format!(
+                "\n[Showing lines {offset}-{total_lines} of {total_lines}. Use offset={} to read more.]",
+                total_lines + 1
+            )
+            .len();
+            let stream_budget = config.max_output_bytes.saturating_sub(footer_reserve);
+
             let mut formatted = String::new();
+            let mut shown_count = 0usize;
+            let mut raw_consumed_bytes = 0usize;
+            let mut hit_byte_budget = false;
+            let mut any_line_clipped = false;
+
             for (i, line) in slice.iter().enumerate() {
-                if i > 0 {
-                    formatted.push('\n');
-                }
                 let line_no = offset + i;
                 let clean_line = line.strip_suffix('\r').unwrap_or(line);
-                formatted.push_str(&format!("{line_no}: {clean_line}"));
+                let formatted_line = if clean_line.len() > MAX_LINE_CHARS
+                    && clean_line.chars().nth(MAX_LINE_CHARS).is_some()
+                {
+                    any_line_clipped = true;
+                    let total_chars = clean_line.chars().count();
+                    let cut = clean_line
+                        .char_indices()
+                        .nth(MAX_LINE_CHARS)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(clean_line.len());
+                    format!(
+                        "{line_no}: {} ... [line truncated, {total_chars} chars]",
+                        &clean_line[..cut]
+                    )
+                } else {
+                    format!("{line_no}: {clean_line}")
+                };
+
+                let sep = usize::from(shown_count > 0);
+                if shown_count > 0
+                    && stream_budget > 0
+                    && formatted.len() + sep + formatted_line.len() > stream_budget
+                {
+                    hit_byte_budget = true;
+                    break;
+                }
+                if shown_count > 0 {
+                    formatted.push('\n');
+                }
+                formatted.push_str(&formatted_line);
+                raw_consumed_bytes += clean_line.len() + 1;
+                shown_count += 1;
             }
 
-            let lines_truncated = end_idx < total_lines;
-            if lines_truncated {
-                let next_offset = end_idx + 1;
+            let shown_end = offset + shown_count.saturating_sub(1);
+            let lines_truncated = shown_end < total_lines;
+            if lines_truncated && shown_count > 0 {
+                let next_offset = shown_end + 1;
                 formatted.push_str(&format!(
-                    "\n[Showing lines {offset}-{end_idx} of {total_lines}. Use offset={next_offset} to read more.]"
+                    "\n[Showing lines {offset}-{shown_end} of {total_lines}. Use offset={next_offset} to read more.]"
                 ));
             }
 
             let trunc = truncate_output(&formatted, config.max_output_bytes);
+            let omitted_bytes = if trunc.truncated {
+                trunc.omitted_bytes
+            } else if lines_truncated || any_line_clipped {
+                text.len().saturating_sub(raw_consumed_bytes)
+            } else {
+                0
+            };
             let mut res = AgentToolResult::text(trunc.text);
             res.details = json!({
                 "path": shown,
                 "offset": offset,
                 "limit": limit,
                 "total_lines": total_lines,
-                "returned_lines": slice.len(),
-                "truncated": lines_truncated || trunc.truncated,
-                "omitted_bytes": trunc.omitted_bytes,
+                "returned_lines": shown_count,
+                "truncated": lines_truncated || hit_byte_budget || any_line_clipped || trunc.truncated,
+                "omitted_bytes": omitted_bytes,
             });
             Ok(res)
         })

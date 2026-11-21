@@ -108,22 +108,14 @@ pub(crate) fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-#[cfg(all(
-    unix,
-    not(target_os = "ios"),
-    any(feature = "shell", feature = "monitor")
-))]
+#[cfg(all(not(target_os = "ios"), any(feature = "shell", feature = "monitor")))]
 #[derive(Clone)]
 pub(crate) struct BackgroundEvents {
     pub wake_gate: WakeGate,
     pub callback: Option<BackgroundEventCallback>,
 }
 
-#[cfg(all(
-    unix,
-    not(target_os = "ios"),
-    any(feature = "shell", feature = "monitor")
-))]
+#[cfg(all(not(target_os = "ios"), any(feature = "shell", feature = "monitor")))]
 impl BackgroundEvents {
     pub fn emit(&self, event: BackgroundToolEvent) {
         let reason = match &event {

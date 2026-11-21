@@ -466,7 +466,7 @@ impl Bridge {
                         .map(|v| v.round() as u64)
                 })
             })
-            .map_or(Duration::from_secs(600), |ms| {
+            .map_or(Duration::from_secs(120), |ms| {
                 Duration::from_millis(ms.clamp(1, 86_400_000))
             });
         if cancel.is_cancelled() {
@@ -555,10 +555,16 @@ impl Bridge {
                 )
                 .await;
         }
-        let text = output
+        let raw_text = output
             .as_ref()
             .map(|output| output.output.as_str())
             .unwrap_or_default();
+        let trunc = pikra_tools::truncate_tail_spillover(
+            raw_text,
+            pikra_tools::DEFAULT_MAX_OUTPUT_BYTES,
+            pikra_tools::DEFAULT_MAX_OUTPUT_LINES,
+        );
+        let text = trunc.text.as_str();
         if cancel.is_cancelled() {
             return Ok(AgentToolResult::error(format!(
                 "Command cancelled.\n{text}"
@@ -583,7 +589,7 @@ impl Bridge {
                 .map_or_else(String::new, |signal| format!(" ({signal})"))
         ));
         result.is_error = exit.exit_code != Some(0) || output.is_err();
-        if output.is_ok_and(|output| output.truncated) {
+        if !trunc.truncated && output.is_ok_and(|output| output.truncated) {
             result
                 .content
                 .push(pikra_ai::ContentPart::Text(pikra_ai::TextContent::plain(
@@ -720,7 +726,33 @@ impl AgentTool for IdeTool {
                             .await
                     {
                         return match result {
-                            Ok(content) => Ok(AgentToolResult::text(content)),
+                            Ok(content) => {
+                                let clipped: String = content
+                                    .lines()
+                                    .map(|line| {
+                                        if line.len() > 2_000 && line.chars().nth(2_000).is_some() {
+                                            let total = line.chars().count();
+                                            let cut = line
+                                                .char_indices()
+                                                .nth(2_000)
+                                                .map_or(line.len(), |(idx, _)| idx);
+                                            format!(
+                                                "{} ... [line truncated, {total} chars]",
+                                                &line[..cut]
+                                            )
+                                        } else {
+                                            line.to_owned()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let trunc = pikra_tools::truncate_head(
+                                    &clipped,
+                                    pikra_tools::DEFAULT_MAX_OUTPUT_BYTES,
+                                    pikra_tools::DEFAULT_MAX_OUTPUT_LINES,
+                                );
+                                Ok(AgentToolResult::text(trunc.text))
+                            }
                             Err(_) if cancel.is_cancelled() => Err("Operation cancelled.".into()),
                             Err(err) => Err(err.message),
                         };
@@ -737,7 +769,12 @@ impl AgentTool for IdeTool {
                         .ok_or("The edit was not approved.")?;
                     return edits::apply(&self.bridge, &changes, &cancel).await;
                 }
-                "bash" if self.bridge.capabilities.terminal => {
+                "exec_command"
+                    if self.bridge.capabilities.terminal
+                        && !args["tty"].as_bool().unwrap_or(false)
+                        && !args["background"].as_bool().unwrap_or(false)
+                        && args.get("yield_time_ms").is_none() =>
+                {
                     return self.bridge.terminal(&id, &args, &cancel).await;
                 }
                 _ => {}
@@ -860,7 +897,7 @@ pub(crate) fn presentation(name: &str) -> (acp::ToolKind, &str) {
         "write" => (Edit, "Write file"),
         "edit" => (Edit, "Edit file"),
         "apply_patch" => (Edit, "Apply patch"),
-        "bash" | "exec_command" => (Execute, "Run command"),
+        "exec_command" => (Execute, "Run command"),
         "write_stdin" => (Execute, "Send terminal input"),
         "monitor" => (Execute, "Monitor command"),
         "sleep" => (Other, "Wait"),

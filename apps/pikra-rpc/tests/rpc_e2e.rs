@@ -371,16 +371,18 @@ export default function(pikra) {
         "apply_patch",
         "find",
         "grep",
-        "bash",
+        "exec_command",
+        "write_stdin",
+        "monitor",
         "sleep",
         "web_fetch",
     ] {
         assert!(tools.contains(&name), "missing default tool {name}");
     }
-    #[cfg(unix)]
-    for name in ["exec_command", "write_stdin", "monitor"] {
-        assert!(tools.contains(&name), "missing default tool {name}");
-    }
+    assert!(
+        !tools.contains(&"bash"),
+        "legacy duplicate bash tool must not be registered"
+    );
     assert_eq!(
         state_resp["data"]["extensions"].as_array().unwrap().len(),
         1

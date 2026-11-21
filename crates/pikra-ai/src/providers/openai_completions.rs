@@ -236,7 +236,8 @@ pub fn build_request_body(
         body.insert("tools".into(), Value::Array(convert_tools(&resolved.tools)));
     }
 
-    if let Some(max_tokens) = options.max_tokens {
+    if let Some(raw_max_tokens) = options.max_tokens {
+        let max_tokens = crate::clamp_max_tokens_to_context(model, &resolved, raw_max_tokens);
         let field = match model.compat.as_ref().and_then(|c| c.max_tokens_field) {
             Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
             Some(MaxTokensField::MaxTokens) => "max_tokens",

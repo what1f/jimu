@@ -351,12 +351,13 @@ async fn patch_trailing_newline_grep_fifo_unreadable_and_bash_bounds_work() {
         );
     }
 
-    // 3. BashTool rejects timeout_ms > 86_400_000, omits AI_AGENT=pikra, and handles invalid UTF-8 lossily.
+    // 3. ExecCommandTool::one_shot rejects timeout_ms > 86_400_000, omits AI_AGENT=pikra,
+    //    handles invalid UTF-8 lossily, and ReadTool caps minified lines > 2,000 chars.
     #[cfg(not(target_os = "ios"))]
     {
-        let bash = pikra_tools::BashTool::new(config.clone());
+        let exec = pikra_tools::ExecCommandTool::one_shot(config.clone());
         let err = run(
-            &bash,
+            &exec,
             json!({"command": "echo hi", "timeout_ms": 86_400_001}),
         )
         .await
@@ -364,14 +365,14 @@ async fn patch_trailing_newline_grep_fifo_unreadable_and_bash_bounds_work() {
         assert!(err.contains("86400000"), "{err}");
 
         let env_out = run(
-            &bash,
+            &exec,
             json!({"command": "printf '%s' \"${AI_AGENT:-unset}\""}),
         )
         .await
         .unwrap();
         assert_eq!(text(&env_out), "unset");
 
-        let invalid_utf8 = run(&bash, json!({"command": "printf 'ok\\377tail'"}))
+        let invalid_utf8 = run(&exec, json!({"command": "printf 'ok\\377tail'"}))
             .await
             .unwrap();
         let structured = invalid_utf8.structured_content.as_ref().unwrap();
@@ -382,4 +383,18 @@ async fn patch_trailing_newline_grep_fifo_unreadable_and_bash_bounds_work() {
             "{structured}"
         );
     }
+
+    let minified = root.join("minified.js");
+    fs::write(&minified, format!("{}\nshort\n", "x".repeat(5_000))).unwrap();
+    let read_tool = pikra_tools::ReadTool::new(config.clone());
+    let read_min = run(&read_tool, json!({"path": "minified.js"}))
+        .await
+        .unwrap();
+    let read_min_text = text(&read_min);
+    assert!(
+        read_min_text.contains("[line truncated, 5000 chars]"),
+        "{read_min_text}"
+    );
+    assert!(read_min_text.contains("2: short"), "{read_min_text}");
+    assert_eq!(read_min.details["truncated"], json!(true));
 }

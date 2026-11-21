@@ -24,15 +24,15 @@ cargo build --release -p pikra-acp
    ```
    登录凭证以 `0600` 权限保存在 `~/.pikra/auth.json`（若本机已通过 Codex CLI 登录过 `~/.codex/auth.json`，也会自动只读复用并在刷新时写入 `~/.pikra/auth.json`）。也可以直接在编辑器面板点击登录按钮触发内置终端登录流程。
 3. **自定义服务商与模型矩阵（`~/.pikra/acp/providers.json`）**：
-   支持覆写内置服务商或新增自定义服务商，按模型声明显示名、上下文窗口、图片支持（`supports_images`）与可选思考档位（`thinking_levels`，支持 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）：
+   支持覆写内置服务商或新增自定义服务商，按模型声明显示名、上下文窗口（`context_window`）、最大输出（`max_output_tokens`）、图片支持（`supports_images`）与可选思考档位（`thinking_levels`，支持 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）：
    ```json
    {
      "deepseek": {
        "api": "openai-responses",
        "base_url": "https://api.deepseek.com/v1",
        "models": [
-         { "id": "deepseek-flash", "name": "DeepSeek Flash", "context_window": 128000, "supports_images": true, "thinking_levels": ["low", "high", "max"] },
-         { "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "context_window": 128000, "supports_images": true, "thinking_levels": ["low", "high", "max"] }
+         { "id": "deepseek-flash", "name": "DeepSeek Flash", "context_window": 1000000, "max_output_tokens": 384000, "supports_images": true, "thinking_levels": ["low", "high", "max"] },
+         { "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "context_window": 1000000, "max_output_tokens": 384000, "supports_images": true, "thinking_levels": ["low", "high", "max"] }
        ]
      }
    }

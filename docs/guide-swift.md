@@ -93,7 +93,7 @@ for try await event in stream {
 ### 3.1 按需挂载内置工作区工具（自动死代码裁剪）
 内置工具底层全部由 Rust `pikra-tools` 单一实现驱动，每个工具对应独立的构造入口：
 - **打包自动瘦身**：Xcode Release 编译默认开启 `-dead_strip`，你的代码里没引用的重型工具（如内嵌 `ripgrep` 的 `grep` 或内嵌 Defuddle HTML 解析器的 `webFetch`）会在最终打 `.app` 包时被链接器整块剔除。
-- **平台边界**：`read`、`write`、`edit`、`applyPatch`、`find`、`grep`、`sleep`、`webFetch` 在 **macOS 与 iOS 全可用**；涉及子进程的 `bash` / `execCommand` / `writeStdin` / `monitor` 仅在 **macOS** 可用（iOS 编译期自动隔离）。
+- **平台边界**：`read`、`write`、`edit`、`applyPatch`、`find`、`grep`、`sleep`、`webFetch` 在 **macOS 与 iOS 全可用**；涉及子进程的 `execCommandOneShot` / `execCommand` / `writeStdin` / `monitor` 仅在 **macOS** 可用（iOS 编译期自动隔离）。
 - **定制描述与 Schema**：每个内置工具均支持传入覆盖配置（改工具名、替换/追加描述文案、隐藏特定可选参数并固定默认值）。
 
 ### 3.2 用 Swift 闭包注册宿主专属工具

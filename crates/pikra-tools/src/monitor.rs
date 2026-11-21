@@ -175,21 +175,32 @@ impl MonitorManager {
         .await?;
         let (log_dir, is_default_dir) = match &self.0.config.monitor_log_dir {
             Some(path) => (self.0.workspace.cwd.join(path), false),
-            None => (
-                // SAFETY: geteuid is always safe to call and returns the caller's effective UID.
-                std::env::temp_dir().join(format!("agent-monitors-{}", unsafe { libc::geteuid() })),
-                true,
-            ),
+            None => {
+                #[cfg(unix)]
+                let name = format!("agent-monitors-{}", unsafe { libc::geteuid() });
+                #[cfg(not(unix))]
+                let name = "agent-monitors".to_string();
+                (std::env::temp_dir().join(name), true)
+            }
         };
         let log_dir =
             std::path::absolute(log_dir).map_err(|err| format!("Invalid log directory: {err}"))?;
         if is_default_dir {
-            let mut builder = tokio::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(&log_dir)
-                .await
-                .map_err(|err| format!("Could not create log directory: {err}"))?;
+            #[cfg(unix)]
+            {
+                let mut builder = tokio::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder
+                    .create(&log_dir)
+                    .await
+                    .map_err(|err| format!("Could not create log directory: {err}"))?;
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::fs::create_dir_all(&log_dir)
+                    .await
+                    .map_err(|err| format!("Could not create log directory: {err}"))?;
+            }
         } else {
             tokio::fs::create_dir_all(&log_dir)
                 .await
@@ -201,10 +212,13 @@ impl MonitorManager {
         let seq = NEXT_MONITOR.fetch_add(1, Ordering::Relaxed);
         let id = format!("{}-{}-{seq}", std::process::id(), now.as_nanos());
         let log_path = log_dir.join(format!("{id}.log"));
-        let log = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut open_opts = OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            open_opts.mode(0o600);
+        }
+        let log = open_opts
             .open(&log_path)
             .await
             .map_err(|err| format!("Could not create monitor log: {err}"))?;

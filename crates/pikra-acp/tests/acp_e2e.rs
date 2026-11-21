@@ -155,7 +155,7 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
     let model = ModelFixture::start(vec![
         read,
         tool("patch-id", "apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: input.txt\n@@\n head\n-unsaved\n+new buffer\n*** End Patch"})),
-        tool("bash-id", "bash", json!({"command":"printf fixture"})),
+        tool("bash-id", "exec_command", json!({"command":"printf fixture"})),
         text("Finished."),
     ]).await;
     let workspace = tempfile::tempdir().unwrap();
@@ -530,7 +530,11 @@ async fn persisted_sessions_replay_before_load_response_and_preserve_options() {
             "write",
             json!({"path":"test.txt","content":"accepted"}),
         ),
-        tool("shell", "bash", json!({"command":"printf local-shell"})),
+        tool(
+            "shell",
+            "exec_command",
+            json!({"command":"printf local-shell"}),
+        ),
         text("Workspace updated."),
     ])
     .await;
@@ -773,7 +777,7 @@ async fn cancellation_steering_mcp_and_compaction_use_the_same_session() {
     let model = ModelFixture::start(vec![
         tool(
             "cancelled",
-            "bash",
+            "exec_command",
             json!({"command":"printf should-not-run"}),
         ),
         tool("echo", "mcp_local_echo", json!({"text":"MCP roundtrip"})),

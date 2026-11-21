@@ -48,7 +48,7 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
 | `pikra-session` | 追加式会话树（内存 / JSONL）、分支 `fork`、具名 `<system-reminder>` 去重、保前缀压缩 | 仅依赖 `pikra-agent` |
 | `pikra-durable` | 可选单机 SQLite WAL（`IMMEDIATE` + `synchronous=FULL`）事务级 Checkpoint、租约隔离与恢复 | 仅无外部调度器的嵌入式守护进程选用 |
 | `pikra-js` | QuickJS 动态扩展运行时（注册自定义工具与回合/工具级钩子，支持热重载） | 流式高频 `delta` 事件严禁跨 JS 边界 |
-| `pikra-tools` | 模块化内置工具箱（`fs`、`patch`、`search`、`shell`、`monitor`、`sleep`、`web-fetch` + Schema 覆盖） | 子进程工具（`bash`、`exec_command`、`write_stdin`、`monitor`）必须用 `#[cfg(not(target_os = "ios"))]` 隔离，确保全仓库可通过 `aarch64-apple-ios` 编译 |
+| `pikra-tools` | 模块化内置工具箱（`fs`、`patch`、`search`、`shell`、`monitor`、`sleep`、`web-fetch` + Schema 覆盖） | 子进程工具（`exec_command`、`write_stdin`、`monitor`）必须用 `#[cfg(not(target_os = "ios"))]` 隔离，确保全仓库可通过 `aarch64-apple-ios` 编译 |
 | `pikra-kit` | 高阶无头会话组装（可扩展 `SkillCatalog` + 增量 Diff、BM25 `tool_search`、MCP、后台唤醒收件箱） | 默认关 `stdio` 时零 `tokio` |
 | `pikra-acp` | 标准 Agent Client Protocol（ACP v1 + 编辑器扩展）库与独立二进制 `pikra-acp` | `stdout` 仅输出 JSON-RPC 2.0 报文；**严禁**被 `pikra-ffi` 引用 |
 | `pikra-ffi` | C-ABI 桥接层（供 Swift `PikraKit` 等原生 SDK 链接） | **严禁**引入 `pikra-http` / `reqwest` / `rustls` / `pikra-acp` |
@@ -73,7 +73,7 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
    - **OpenAI Responses / Completions**：同模型保留 `item_id` 与加密推理签名，跨模型切换时自动剥离私有签名降级为纯文本；Completions 工具结果中的图片拆为紧随的用户多模态消息块保留视觉上下文。
    - **助手正文纯净**：严禁往助手 `text` 块拼接长度截断等系统提示，截断一律通过 `StopReason::Length` 表达。
 5. **进程、安全与取消收尾**：
-   - **零孤儿进程**：所有子进程（`bash`、`exec_command`、`monitor`、stdio MCP）必须独立成进程组，超时、取消或会话关闭时对整个负进程组发送 `SIGKILL` 并回收句柄。
+   - **零孤儿进程**：所有子进程（`exec_command`、`monitor`、stdio MCP）必须独立成进程组，超时、取消或会话关闭时对整个负进程组发送 `SIGKILL` 并回收句柄。
    - **取消收尾义务**：`abort()` 即使在事件流未被外部轮询时也必须推进底层取消收尾，清理未消费的 `steer` 队列，确保紧接着的下一轮调用绝不误报 `Busy`。
    - **网络与文件安全**：Swift `URLSession` 必须使用无痕会话（`ephemeral`、`urlCache = nil`）；`web_fetch` 默认拦截环回、局域网与云元数据内网地址（含重定向跳数检查）；`write`/`edit`/`apply_patch` 遇到软链接时写入真实目标文件而非破坏软链接本身。
 

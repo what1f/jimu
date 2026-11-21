@@ -1,5 +1,5 @@
 use crate::WorkspaceToolsConfig;
-use crate::util::{check_cancelled, display_path, resolve_path, truncate_output};
+use crate::util::{check_cancelled, display_path, resolve_path, truncate_head};
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
 use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
@@ -227,7 +227,7 @@ pub(crate) fn search_result(
     } else {
         rows.join("\n")
     };
-    let trunc = truncate_output(&text, config.max_output_bytes);
+    let trunc = truncate_head(&text, config.max_output_bytes, config.max_output_lines);
     let mut result = AgentToolResult::text(trunc.text);
     result.details = json!({
         "path": display_path(&config.cwd, root),

@@ -251,11 +251,93 @@ fn close_progress_gate(gate: &Arc<Mutex<bool>>) {
     *active = false;
 }
 
-fn to_tool_result_message(finalized: &FinalizedToolCall) -> ToolResultMessage {
+/// Default global engine ceiling (64 KiB) for text inside a single LLM-facing [`ToolResultMessage`].
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
+fn truncate_str_middle(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let full_marker_max = format!("\n[... truncated {} bytes ...]\n", text.len()).len();
+    if max_bytes <= full_marker_max {
+        let mut end = max_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return text[..end].to_string();
+    }
+    let avail = max_bytes - full_marker_max;
+    let head_budget = avail / 2;
+    let tail_budget = avail - head_budget;
+    let mut head_end = head_budget.min(text.len());
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(tail_budget).max(head_end);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n[... truncated {omitted} bytes ...]\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+fn cap_tool_result_content(
+    content: &[pikra_ai::ContentPart],
+    max_bytes: Option<usize>,
+) -> Vec<pikra_ai::ContentPart> {
+    let Some(limit) = max_bytes else {
+        return content.to_vec();
+    };
+    let total_text_bytes: usize = content
+        .iter()
+        .map(|part| match part {
+            pikra_ai::ContentPart::Text(t) => t.text.len(),
+            pikra_ai::ContentPart::Image(_) => 0,
+        })
+        .sum();
+    if total_text_bytes <= limit {
+        return content.to_vec();
+    }
+
+    let mut remaining = limit;
+    let mut out = Vec::with_capacity(content.len());
+    for part in content {
+        match part {
+            pikra_ai::ContentPart::Image(img) => {
+                out.push(pikra_ai::ContentPart::Image(img.clone()));
+            }
+            pikra_ai::ContentPart::Text(t) => {
+                if t.text.len() <= remaining {
+                    remaining -= t.text.len();
+                    out.push(pikra_ai::ContentPart::Text(t.clone()));
+                } else if remaining > 0 {
+                    let truncated = truncate_str_middle(&t.text, remaining);
+                    remaining = 0;
+                    out.push(pikra_ai::ContentPart::Text(pikra_ai::TextContent::plain(
+                        truncated,
+                    )));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn to_tool_result_message(
+    finalized: &FinalizedToolCall,
+    max_tool_result_bytes: Option<usize>,
+) -> ToolResultMessage {
     ToolResultMessage {
         tool_call_id: finalized.tool_call.id.clone(),
         tool_name: finalized.tool_call.name.clone(),
-        content: finalized.result.content.clone(),
+        content: cap_tool_result_content(&finalized.result.content, max_tool_result_bytes),
         is_error: finalized.result.is_error,
         timestamp: now_ms(),
     }
@@ -305,7 +387,7 @@ pub(crate) fn fail_truncated_tool_calls(
             )),
         };
         emit_tool_execution_end(&finalized, emit);
-        let msg = to_tool_result_message(&finalized);
+        let msg = to_tool_result_message(&finalized, None);
         emit_tool_result_message(&msg, emit);
         tool_results.push(msg);
     }
@@ -376,6 +458,7 @@ pub(crate) async fn execute_tool_batch(
     tool_calls: &[ToolCall],
     snapshot: &AgentContextSnapshot,
     global_mode: ToolExecutionMode,
+    max_tool_result_bytes: Option<usize>,
     cancel: &CancelToken,
     emit: Arc<dyn Fn(AgentEvent) + Send + Sync>,
 ) -> ExecutedToolBatch {
@@ -391,6 +474,7 @@ pub(crate) async fn execute_tool_batch(
             assistant_message,
             tool_calls,
             snapshot,
+            max_tool_result_bytes,
             cancel,
             emit,
         )
@@ -402,6 +486,7 @@ pub(crate) async fn execute_tool_batch(
             assistant_message,
             tool_calls,
             snapshot,
+            max_tool_result_bytes,
             cancel,
             emit,
         )
@@ -409,12 +494,14 @@ pub(crate) async fn execute_tool_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_batch_sequential(
     tools: &[Arc<dyn AgentTool>],
     middlewares: &[Arc<dyn AgentMiddleware>],
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
     snapshot: &AgentContextSnapshot,
+    max_tool_result_bytes: Option<usize>,
     cancel: &CancelToken,
     emit: Arc<dyn Fn(AgentEvent) + Send + Sync>,
 ) -> ExecutedToolBatch {
@@ -470,7 +557,7 @@ async fn execute_tool_batch_sequential(
             result,
         };
         emit_tool_execution_end(&finalized, emit.as_ref());
-        let msg = to_tool_result_message(&finalized);
+        let msg = to_tool_result_message(&finalized, max_tool_result_bytes);
         emit_tool_result_message(&msg, emit.as_ref());
         tool_results.push(msg);
         finalized_calls.push(finalized);
@@ -482,12 +569,14 @@ async fn execute_tool_batch_sequential(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_batch_parallel(
     tools: &[Arc<dyn AgentTool>],
     middlewares: &[Arc<dyn AgentMiddleware>],
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
     snapshot: &AgentContextSnapshot,
+    max_tool_result_bytes: Option<usize>,
     cancel: &CancelToken,
     emit: Arc<dyn Fn(AgentEvent) + Send + Sync>,
 ) -> ExecutedToolBatch {
@@ -572,7 +661,7 @@ async fn execute_tool_batch_parallel(
     let mut ordered_finalized = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     for finalized in slots.into_iter().flatten() {
-        let msg = to_tool_result_message(&finalized);
+        let msg = to_tool_result_message(&finalized, max_tool_result_bytes);
         emit_tool_result_message(&msg, emit.as_ref());
         tool_results.push(msg);
         ordered_finalized.push(finalized);

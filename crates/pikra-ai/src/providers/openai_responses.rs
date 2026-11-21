@@ -270,7 +270,8 @@ pub fn build_request_body(
         body.insert("service_tier".into(), Value::String("priority".into()));
     }
 
-    if let Some(max_tokens) = options.max_tokens {
+    if let Some(raw_max_tokens) = options.max_tokens {
+        let max_tokens = crate::clamp_max_tokens_to_context(model, &resolved, raw_max_tokens);
         body.insert(
             "max_output_tokens".into(),
             json!(max_tokens.max(MIN_OUTPUT_TOKENS)),

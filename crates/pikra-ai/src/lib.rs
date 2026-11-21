@@ -13,9 +13,10 @@ pub use sse::{SseEvent, SseParser, SseStream};
 pub use transcript::{ResolvedTranscript, render_system_message_text};
 pub use transform::{
     ERROR_TOOL_IMAGE_PLACEHOLDER, NON_VISION_TOOL_IMAGE_PLACEHOLDER,
-    NON_VISION_USER_IMAGE_PLACEHOLDER, SplitErrorToolResult, normalize_tool_call_id_anthropic,
-    normalize_tool_call_id_openai_completions, normalize_tool_call_id_openai_responses, short_hash,
-    split_error_tool_result_images, transform_messages,
+    NON_VISION_USER_IMAGE_PLACEHOLDER, SplitErrorToolResult, clamp_max_tokens_to_context,
+    normalize_tool_call_id_anthropic, normalize_tool_call_id_openai_completions,
+    normalize_tool_call_id_openai_responses, short_hash, split_error_tool_result_images,
+    transform_messages,
 };
 pub use usage::{calculate_cost, clamp_prompt_cache_key, parse_tool_call_arguments};
 
@@ -212,6 +213,12 @@ pub struct Model {
     pub compat: Option<ModelCompat>,
 }
 
+/// Default context window size (tokens) for [`Model::new`].
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
+
+/// Default maximum output tokens for [`Model::new`].
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64_000;
+
 impl Model {
     pub fn new(
         id: impl Into<String>,
@@ -226,8 +233,8 @@ impl Model {
             provider: provider.into(),
             api,
             base_url: base_url.into(),
-            context_window: 128_000,
-            max_output_tokens: 8_192,
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             supports_images: false,
             supports_reasoning: false,
             cost: ModelCost::default(),

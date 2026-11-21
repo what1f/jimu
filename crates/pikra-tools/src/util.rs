@@ -1,11 +1,11 @@
-#[cfg(all(feature = "shell", not(target_os = "ios")))]
 use std::collections::VecDeque;
 #[cfg(any(
     feature = "fs",
     feature = "search",
     all(feature = "shell", not(target_os = "ios"))
 ))]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(feature = "fs")]
 use std::{
     collections::HashMap,
@@ -267,13 +267,14 @@ pub(crate) fn read_editable_text(
     Ok((text, meta.permissions()))
 }
 
-/// Result of UTF-8-safe head+tail truncation.
+/// Result of UTF-8-safe tool output truncation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncatedOutput {
     pub text: String,
     pub truncated: bool,
     pub original_bytes: usize,
     pub omitted_bytes: usize,
+    pub full_output_path: Option<PathBuf>,
 }
 
 fn floor_char_boundary(s: &str, idx: usize) -> usize {
@@ -298,6 +299,14 @@ fn ceil_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
+fn format_byte_limit(bytes: usize) -> String {
+    if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{}KB", bytes / 1024)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 /// Truncate UTF-8 text to at most `max_bytes`, keeping head + tail with a
 /// `[... truncated N bytes ...]` marker while strictly respecting UTF-8 char boundaries.
 pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
@@ -308,6 +317,7 @@ pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
             truncated: false,
             original_bytes,
             omitted_bytes: 0,
+            full_output_path: None,
         };
     }
 
@@ -317,6 +327,7 @@ pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
             truncated: true,
             original_bytes,
             omitted_bytes: original_bytes,
+            full_output_path: None,
         };
     }
 
@@ -334,6 +345,7 @@ pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
             truncated: true,
             original_bytes,
             omitted_bytes: original_bytes - end,
+            full_output_path: None,
         };
     };
 
@@ -362,34 +374,206 @@ pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
         truncated: true,
         original_bytes,
         omitted_bytes,
+        full_output_path: None,
     }
 }
 
-/// Memory-bounded streaming output collector preserving head + tail bytes up to `max_bytes`.
-#[cfg(all(feature = "shell", not(target_os = "ios")))]
-pub(crate) struct BoundedOutputBuffer {
-    max_bytes: usize,
-    head_cap: usize,
-    tail_cap: usize,
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    overflowed: bool,
-    total_bytes: usize,
+/// Truncate UTF-8 text from the head by both `max_lines` and `max_bytes` (whichever hits first).
+pub fn truncate_head(text: &str, max_bytes: usize, max_lines: usize) -> TruncatedOutput {
+    let original_bytes = text.len();
+    if original_bytes == 0 {
+        return TruncatedOutput {
+            text: String::new(),
+            truncated: false,
+            original_bytes: 0,
+            omitted_bytes: 0,
+            full_output_path: None,
+        };
+    }
+    if max_bytes == 0 || max_lines == 0 {
+        return TruncatedOutput {
+            text: String::new(),
+            truncated: true,
+            original_bytes,
+            omitted_bytes: original_bytes,
+            full_output_path: None,
+        };
+    }
+
+    let total_lines = text.lines().count().max(1);
+    if original_bytes <= max_bytes && total_lines <= max_lines {
+        return TruncatedOutput {
+            text: text.to_string(),
+            truncated: false,
+            original_bytes,
+            omitted_bytes: 0,
+            full_output_path: None,
+        };
+    }
+
+    let limit_label = format_byte_limit(max_bytes);
+    let notice_max = format!(
+        "\n[Showing first {total_lines} of {total_lines} lines ({limit_label} limit, {original_bytes} bytes omitted)]"
+    )
+    .len();
+    if max_bytes <= notice_max + 16 {
+        return truncate_output(text, max_bytes);
+    }
+
+    let content_budget = max_bytes - notice_max;
+    let mut kept_end = 0usize;
+    let mut kept_lines = 0usize;
+    for (idx, seg) in text.split_inclusive('\n').enumerate() {
+        if idx >= max_lines {
+            break;
+        }
+        if kept_end + seg.len() > content_budget {
+            if kept_lines == 0 {
+                kept_end = floor_char_boundary(seg, content_budget);
+                kept_lines = usize::from(kept_end > 0);
+            }
+            break;
+        }
+        kept_end += seg.len();
+        kept_lines += 1;
+    }
+
+    let head = text[..kept_end].trim_end_matches('\n');
+    let omitted_bytes = original_bytes.saturating_sub(head.len());
+    let notice = format!(
+        "\n[Showing first {kept_lines} of {total_lines} lines ({limit_label} limit, {omitted_bytes} bytes omitted)]"
+    );
+    let mut out = String::with_capacity(head.len() + notice.len());
+    out.push_str(head);
+    out.push_str(&notice);
+
+    TruncatedOutput {
+        text: out,
+        truncated: true,
+        original_bytes,
+        omitted_bytes,
+        full_output_path: None,
+    }
 }
 
-#[cfg(all(feature = "shell", not(target_os = "ios")))]
-impl BoundedOutputBuffer {
-    pub(crate) fn new(max_bytes: usize) -> Self {
-        let head_cap = max_bytes / 2;
-        let tail_cap = max_bytes.saturating_sub(head_cap);
+/// Truncate UTF-8 text keeping the tail (`max_lines` / `max_bytes`) and spilling the full text
+/// to a `0600` temporary file when truncated (matching Pi's shell output behavior).
+pub fn truncate_tail_spillover(text: &str, max_bytes: usize, max_lines: usize) -> TruncatedOutput {
+    let mut buf = TailSpilloverBuffer::with_structured_cap(max_bytes, max_lines, 0);
+    buf.push(text.as_bytes());
+    buf.render(max_bytes)
+}
+
+const MAX_SPILL_FILE_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(not(target_os = "ios"))]
+static NEXT_SPILL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn open_spill_temp_file() -> Option<(std::fs::File, PathBuf)> {
+    #[cfg(target_os = "ios")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[cfg(unix)]
+        let dir_name = format!("agent-tool-outputs-{}", unsafe { libc::geteuid() });
+        #[cfg(not(unix))]
+        let dir_name = "agent-tool-outputs".to_string();
+
+        let dir = std::env::temp_dir().join(dir_name);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&dir).ok()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&dir).ok()?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = NEXT_SPILL_ID.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("output-{}-{now}-{seq}.log", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path).ok()?;
+        let _ = file.flush();
+        Some((file, path))
+    }
+}
+
+/// Streaming shell output accumulator keeping a rolling tail for model context (`max_bytes` / `max_lines`),
+/// a bounded structured prefix (`structured_cap`, default 1 MiB) for programmatic callers (codemode),
+/// and spilling the full untruncated stream to a `0600` temp file when truncated.
+pub(crate) struct TailSpilloverBuffer {
+    max_bytes: usize,
+    max_lines: usize,
+    structured_cap: usize,
+    structured_head: Vec<u8>,
+    structured_overflowed: bool,
+    initial: Vec<u8>,
+    tail_cap: usize,
+    tail: VecDeque<u8>,
+    total_bytes: usize,
+    newline_count: usize,
+    ended_with_newline: bool,
+    spilling: bool,
+    spill_file: Option<std::fs::File>,
+    spill_path: Option<PathBuf>,
+    spilled_bytes: usize,
+}
+
+impl TailSpilloverBuffer {
+    #[cfg(all(feature = "shell", not(target_os = "ios")))]
+    pub(crate) fn new(max_bytes: usize, max_lines: usize) -> Self {
+        Self::with_structured_cap(max_bytes, max_lines, crate::STRUCTURED_OUTPUT_MAX_BYTES)
+    }
+
+    pub(crate) fn with_structured_cap(
+        max_bytes: usize,
+        max_lines: usize,
+        structured_cap: usize,
+    ) -> Self {
         Self {
             max_bytes,
-            head_cap,
-            tail_cap,
-            head: Vec::new(),
+            max_lines,
+            structured_cap,
+            structured_head: Vec::new(),
+            structured_overflowed: false,
+            initial: Vec::new(),
+            tail_cap: max_bytes.saturating_mul(2).max(4096),
             tail: VecDeque::new(),
-            overflowed: false,
             total_bytes: 0,
+            newline_count: 0,
+            ended_with_newline: false,
+            spilling: false,
+            spill_file: None,
+            spill_path: None,
+            spilled_bytes: 0,
+        }
+    }
+
+    fn logical_lines(&self) -> usize {
+        if self.total_bytes == 0 {
+            0
+        } else if self.ended_with_newline {
+            self.newline_count
+        } else {
+            self.newline_count + 1
         }
     }
 
@@ -398,30 +582,63 @@ impl BoundedOutputBuffer {
             return;
         }
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        self.newline_count = self
+            .newline_count
+            .saturating_add(chunk.iter().filter(|&&b| b == b'\n').count());
+        self.ended_with_newline = chunk.last() == Some(&b'\n');
 
-        if self.max_bytes == 0 {
-            self.overflowed = true;
-            return;
+        if self.structured_cap > 0 && !self.structured_overflowed {
+            let avail = self
+                .structured_cap
+                .saturating_sub(self.structured_head.len());
+            let take = avail.min(chunk.len());
+            self.structured_head.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                self.structured_overflowed = true;
+            }
+        } else if self.structured_cap == 0 {
+            self.structured_overflowed = true;
         }
 
-        if !self.overflowed {
-            if self.head.len() + chunk.len() <= self.max_bytes {
-                self.head.extend_from_slice(chunk);
+        Self::push_tail(&mut self.tail, self.tail_cap, chunk);
+
+        if !self.spilling {
+            if self.max_bytes > 0
+                && self.max_lines > 0
+                && self.total_bytes <= self.max_bytes
+                && self.logical_lines() <= self.max_lines
+            {
+                self.initial.extend_from_slice(chunk);
                 return;
             }
-            // Transition to bounded head + rolling tail mode while filling `head` up to
-            // `max_bytes` so small-budget renders (< compact marker length) still have a
-            // full prefix available.
-            self.overflowed = true;
-            let need = self.max_bytes.saturating_sub(self.head.len());
-            let take = need.min(chunk.len());
-            self.head.extend_from_slice(&chunk[..take]);
-            if self.head.len() > self.head_cap {
-                Self::push_tail(&mut self.tail, self.tail_cap, &self.head[self.head_cap..]);
+            self.spilling = true;
+            if let Some((file, path)) = open_spill_temp_file() {
+                self.spill_file = Some(file);
+                self.spill_path = Some(path);
+                let prev = std::mem::take(&mut self.initial);
+                self.write_spill(&prev);
+                self.write_spill(chunk);
+            } else {
+                self.initial.clear();
             }
-            Self::push_tail(&mut self.tail, self.tail_cap, &chunk[take..]);
         } else {
-            Self::push_tail(&mut self.tail, self.tail_cap, chunk);
+            self.write_spill(chunk);
+        }
+    }
+
+    fn write_spill(&mut self, bytes: &[u8]) {
+        use std::io::Write as _;
+        if bytes.is_empty() || self.spilled_bytes >= MAX_SPILL_FILE_BYTES {
+            return;
+        }
+        if let Some(file) = &mut self.spill_file {
+            let room = MAX_SPILL_FILE_BYTES - self.spilled_bytes;
+            let slice = &bytes[..bytes.len().min(room)];
+            if file.write_all(slice).is_ok() {
+                self.spilled_bytes += slice.len();
+            } else {
+                self.spill_file = None;
+            }
         }
     }
 
@@ -431,101 +648,178 @@ impl BoundedOutputBuffer {
         }
         if bytes.len() >= tail_cap {
             tail.clear();
-            let start = bytes.len() - tail_cap;
-            tail.extend(&bytes[start..]);
+            tail.extend(&bytes[bytes.len() - tail_cap..]);
             return;
         }
         let needed = tail.len() + bytes.len();
         if needed > tail_cap {
-            let drop_count = needed - tail_cap;
-            tail.drain(..drop_count);
+            tail.drain(..(needed - tail_cap));
         }
         tail.extend(bytes);
     }
 
-    pub(crate) fn prefix(&self) -> (std::borrow::Cow<'_, str>, bool) {
-        let bytes = if self.overflowed {
-            trim_incomplete_utf8_tail(&self.head)
+    #[cfg(all(feature = "shell", not(target_os = "ios")))]
+    pub(crate) fn structured_prefix(&self) -> (std::borrow::Cow<'_, str>, bool) {
+        if !self.spilling && !self.structured_overflowed {
+            (String::from_utf8_lossy(&self.initial), false)
         } else {
-            &self.head
-        };
-        (String::from_utf8_lossy(bytes), self.overflowed)
+            let bytes = trim_incomplete_utf8_tail(&self.structured_head);
+            (
+                String::from_utf8_lossy(bytes),
+                self.structured_overflowed || self.total_bytes > self.structured_head.len(),
+            )
+        }
     }
 
-    /// Render captured bytes into UTF-8 text bounded by `budget` (at most `self.max_bytes`).
     pub(crate) fn render(&self, budget: usize) -> TruncatedOutput {
         let effective_max = budget.min(self.max_bytes);
-        if !self.overflowed {
-            let raw = String::from_utf8_lossy(&self.head);
-            return truncate_output(&raw, effective_max);
+        let total_lines = self.logical_lines();
+
+        if let Some(file) = &self.spill_file {
+            use std::io::Write as _;
+            let _ = (&mut &*file).flush();
         }
 
-        if effective_max == 0 {
+        if !self.spilling && self.total_bytes <= effective_max && total_lines <= self.max_lines {
+            return TruncatedOutput {
+                text: String::from_utf8_lossy(&self.initial).into_owned(),
+                truncated: false,
+                original_bytes: self.total_bytes,
+                omitted_bytes: 0,
+                full_output_path: None,
+            };
+        }
+
+        let spill_path = self.spill_path.clone().or_else(|| {
+            if !self.initial.is_empty() {
+                let (mut file, path) = open_spill_temp_file()?;
+                use std::io::Write as _;
+                file.write_all(&self.initial).ok()?;
+                file.flush().ok()?;
+                Some(path)
+            } else {
+                None
+            }
+        });
+
+        if effective_max == 0 || self.max_lines == 0 {
             return TruncatedOutput {
                 text: String::new(),
                 truncated: true,
                 original_bytes: self.total_bytes,
                 omitted_bytes: self.total_bytes,
+                full_output_path: spill_path,
             };
         }
 
-        let head_clean = trim_incomplete_utf8_tail(&self.head);
         let tail_vec: Vec<u8> = self.tail.iter().copied().collect();
         let tail_clean = trim_incomplete_utf8_head(&tail_vec);
-
-        let head_str = String::from_utf8_lossy(head_clean);
         let tail_str = String::from_utf8_lossy(tail_clean);
 
-        let full_marker_max = format!("\n[... truncated {} bytes ...]\n", self.total_bytes).len();
-        let compact_marker_max = format!("[... truncated {} bytes ...]", self.total_bytes).len();
+        if let Some(path) = &spill_path {
+            let limit_label = format_byte_limit(effective_max);
+            let worst_notice = format!(
+                "\n\n[Showing lines {total_lines}-{total_lines} of {total_lines} ({limit_label} limit). Full output: {}]",
+                path.display()
+            );
+            if effective_max > worst_notice.len() + 24 {
+                let content_budget = effective_max - worst_notice.len();
+                let tail_slice =
+                    take_tail_lines_and_bytes(&tail_str, content_budget, self.max_lines);
+                let shown_lines = tail_slice.lines().count().max(1);
+                let start_line = total_lines.saturating_sub(shown_lines) + 1;
+                let notice = format!(
+                    "\n\n[Showing lines {start_line}-{total_lines} of {total_lines} ({limit_label} limit). Full output: {}]",
+                    path.display()
+                );
+                let omitted_bytes = self.total_bytes.saturating_sub(tail_slice.len());
+                let mut out = String::with_capacity(tail_slice.len() + notice.len());
+                out.push_str(tail_slice);
+                out.push_str(&notice);
+                return TruncatedOutput {
+                    text: out,
+                    truncated: true,
+                    original_bytes: self.total_bytes,
+                    omitted_bytes,
+                    full_output_path: spill_path,
+                };
+            }
+        }
 
-        let (marker_budget, padded) = if effective_max > full_marker_max {
-            (full_marker_max, true)
-        } else if effective_max >= compact_marker_max {
-            (compact_marker_max, false)
-        } else {
-            let end = floor_char_boundary(&head_str, effective_max);
-            return TruncatedOutput {
-                text: head_str[..end].to_string(),
+        // Small-budget fallback (e.g. tight byte budgets where full temp path won't fit):
+        // strictly honor `effective_max` while preserving the UTF-8 tail.
+        let full_marker_max = format!("[... truncated {} bytes ...]\n", self.total_bytes).len();
+        if effective_max > full_marker_max {
+            let tail_budget = effective_max - full_marker_max;
+            let tail_start =
+                ceil_char_boundary(&tail_str, tail_str.len().saturating_sub(tail_budget));
+            let tail_part = &tail_str[tail_start..];
+            let omitted_bytes = self.total_bytes.saturating_sub(tail_part.len());
+            let marker = format!("[... truncated {omitted_bytes} bytes ...]\n");
+            let mut out = String::with_capacity(marker.len() + tail_part.len());
+            out.push_str(&marker);
+            out.push_str(tail_part);
+            TruncatedOutput {
+                text: out,
                 truncated: true,
                 original_bytes: self.total_bytes,
-                omitted_bytes: self.total_bytes.saturating_sub(end),
-            };
-        };
-
-        let avail = effective_max - marker_budget;
-        let head_budget = avail / 2;
-        let tail_budget = avail - head_budget;
-
-        let head_end = floor_char_boundary(&head_str, head_budget);
-        let tail_start = ceil_char_boundary(&tail_str, tail_str.len().saturating_sub(tail_budget));
-
-        let head_part = &head_str[..head_end];
-        let tail_part = &tail_str[tail_start..];
-        let kept_bytes = head_part.len() + tail_part.len();
-        let omitted_bytes = self.total_bytes.saturating_sub(kept_bytes);
-
-        let marker = if padded {
-            format!("\n[... truncated {omitted_bytes} bytes ...]\n")
+                omitted_bytes,
+                full_output_path: spill_path,
+            }
         } else {
-            format!("[... truncated {omitted_bytes} bytes ...]")
-        };
-
-        let mut out = String::with_capacity(head_part.len() + marker.len() + tail_part.len());
-        out.push_str(head_part);
-        out.push_str(&marker);
-        out.push_str(tail_part);
-
-        TruncatedOutput {
-            text: out,
-            truncated: true,
-            original_bytes: self.total_bytes,
-            omitted_bytes,
+            let tail_start =
+                ceil_char_boundary(&tail_str, tail_str.len().saturating_sub(effective_max));
+            let tail_part = &tail_str[tail_start..];
+            let omitted_bytes = self.total_bytes.saturating_sub(tail_part.len());
+            TruncatedOutput {
+                text: tail_part.to_string(),
+                truncated: true,
+                original_bytes: self.total_bytes,
+                omitted_bytes,
+                full_output_path: spill_path,
+            }
         }
     }
 }
 
-/// Strip an incomplete UTF-8 multi-byte sequence from the end of a byte slice (up to 3 bytes).
+fn take_tail_lines_and_bytes(text: &str, max_bytes: usize, max_lines: usize) -> &str {
+    if text.is_empty() || max_bytes == 0 || max_lines == 0 {
+        return "";
+    }
+    let byte_floor = ceil_char_boundary(text, text.len().saturating_sub(max_bytes));
+    let bounded = &text[byte_floor..];
+
+    // If bounded had to cut mid-line and contains a newline with meaningful trailing content,
+    // snap to the next newline so the first displayed line isn't a broken fragment.
+    let snapped = if byte_floor > 0
+        && text.as_bytes().get(byte_floor - 1) != Some(&b'\n')
+        && let Some(nl) = bounded.find('\n')
+        && !bounded[nl + 1..].trim().is_empty()
+    {
+        &bounded[nl + 1..]
+    } else {
+        bounded
+    };
+
+    // Enforce `max_lines` from the end.
+    let bytes = snapped.as_bytes();
+    let end = if bytes.last() == Some(&b'\n') {
+        bytes.len().saturating_sub(1)
+    } else {
+        bytes.len()
+    };
+    let mut seen_lines = 0usize;
+    for i in (0..end).rev() {
+        if bytes[i] == b'\n' {
+            seen_lines += 1;
+            if seen_lines >= max_lines {
+                return &snapped[i + 1..];
+            }
+        }
+    }
+    snapped
+}
+
 #[cfg(all(feature = "shell", not(target_os = "ios")))]
 fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
     if bytes.is_empty() {
@@ -543,8 +837,6 @@ fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
     }
 }
 
-/// Strip leading UTF-8 continuation bytes (`0b10xx_xxxx`) from the start of a byte slice.
-#[cfg(all(feature = "shell", not(target_os = "ios")))]
 fn trim_incomplete_utf8_head(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     while start < bytes.len() && start < 4 && (bytes[start] & 0b1100_0000) == 0b1000_0000 {

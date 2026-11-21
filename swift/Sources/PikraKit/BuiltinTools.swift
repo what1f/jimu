@@ -82,9 +82,11 @@ public final class PikraWorkspaceEnvironment: @unchecked Sendable {
     fileprivate let raw: OpaquePointer
     private let events: AsyncStream<PikraBackgroundEvent>.Continuation
 
+    public static let defaultMaxOutputBytes: Int = 50 * 1024
+
     public convenience init(
         workspace: URL,
-        maxOutputBytes: Int = 1024 * 1024,
+        maxOutputBytes: Int = PikraWorkspaceEnvironment.defaultMaxOutputBytes,
         environment: (@Sendable () async -> [String: String])? = nil,
         httpClient: any PikraHTTPClient = PikraURLSessionHTTPClient()
     ) throws {
@@ -99,7 +101,7 @@ public final class PikraWorkspaceEnvironment: @unchecked Sendable {
 
     init(
         workspace: URL,
-        maxOutputBytes: Int = 1024 * 1024,
+        maxOutputBytes: Int = PikraWorkspaceEnvironment.defaultMaxOutputBytes,
         environment: (@Sendable () async -> [String: String])?,
         httpClient: any PikraHTTPClient = PikraURLSessionHTTPClient(),
         shellOutputLimit: Int?
@@ -113,7 +115,7 @@ public final class PikraWorkspaceEnvironment: @unchecked Sendable {
             "max_output_bytes": .integer(Int64(maxOutputBytes)),
         ]
         if let shellOutputLimit {
-            config["default_bash_timeout_ms"] = .integer(120_000)
+            config["default_exec_timeout_ms"] = .integer(120_000)
             config["shell_max_output_bytes"] = .integer(Int64(shellOutputLimit))
         }
         let json = try encodeJSONString(config)
@@ -252,8 +254,8 @@ public enum PikraBuiltinTools {
 
     #if os(macOS)
     @_alwaysEmitIntoClient
-    public static func bash(_ environment: PikraWorkspaceEnvironment, override: PikraToolDefinitionOverride? = nil) throws -> PikraTool {
-        try make(pikra_builtin_tool_bash, environment, override)
+    public static func execCommandOneShot(_ environment: PikraWorkspaceEnvironment, override: PikraToolDefinitionOverride? = nil) throws -> PikraTool {
+        try make(pikra_builtin_tool_exec_command_oneshot, environment, override)
     }
 
     @_alwaysEmitIntoClient

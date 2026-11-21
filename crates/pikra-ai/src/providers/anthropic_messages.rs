@@ -417,7 +417,8 @@ pub fn build_request_body(
 ) -> Value {
     let resolved = context.resolve();
     let cache_control = cache_control_value(options.cache_retention);
-    let max_tokens = options.max_tokens.unwrap_or(model.max_output_tokens);
+    let raw_max_tokens = options.max_tokens.unwrap_or(model.max_output_tokens);
+    let max_tokens = crate::clamp_max_tokens_to_context(model, &resolved, raw_max_tokens);
     let messages = convert_messages(model, &resolved.messages, cache_control.as_ref());
 
     let mut body = Map::new();

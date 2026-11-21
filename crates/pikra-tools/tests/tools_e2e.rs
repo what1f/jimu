@@ -381,9 +381,9 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     let alive_env = alive_fifo.to_string_lossy().to_string();
     let block_env = block_fifo.to_string_lossy().to_string();
 
-    let max_output_bytes = 200usize;
+    let max_output_bytes = 240usize;
     let cfg = WorkspaceToolsConfig::new(&root)
-        .with_enabled_tools([BuiltinToolKind::Bash])
+        .with_enabled_tools([BuiltinToolKind::ExecCommand])
         .with_max_output_bytes(max_output_bytes)
         .with_env_provider(Arc::new(move || {
             let alive = alive_env.clone();
@@ -400,26 +400,26 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     let model = test_model();
     let provider = Arc::new(FauxProvider::new());
 
-    // Run 1: verify env_provider + AI_AGENT=pikra, UTF-8-safe head+tail truncation on multi-byte output,
+    // Run 1: verify env_provider, UTF-8-safe tail truncation + temp file spillover on multi-byte output,
     // and non-zero exit code surfacing.
     provider.enqueue_events(turn_events(
         &model,
         vec![
             AssistantBlock::ToolCall(make_tool_call(
                 "c_env",
-                "bash",
+                "exec_command",
                 json!({ "command": "printf '%s|%s' \"$HOST_INJECTED_TOKEN\" \"$AI_AGENT\"" }),
             )),
             AssistantBlock::ToolCall(make_tool_call(
                 "c_utf8_trunc",
-                "bash",
+                "exec_command",
                 json!({
-                    "command": "printf 'HEAD_开始_'; i=0; while [ $i -lt 80 ]; do printf '你好世界🚀'; i=$((i+1)); done; printf '_结束_TAIL'"
+                    "command": "printf 'HEAD_开始_\\n'; i=0; while [ $i -lt 80 ]; do printf '你好世界🚀\\n'; i=$((i+1)); done; printf '_结束_TAIL'"
                 }),
             )),
             AssistantBlock::ToolCall(make_tool_call(
                 "c_nonzero",
-                "bash",
+                "exec_command",
                 json!({ "command": "printf 'boom'; exit 7" }),
             )),
         ],
@@ -427,18 +427,20 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     ));
     provider.enqueue_events(turn_events(
         &model,
-        vec![AssistantBlock::Text(TextContent::plain("bash checks ok"))],
+        vec![AssistantBlock::Text(TextContent::plain(
+            "exec_command checks ok",
+        ))],
         StopReason::Stop,
     ));
 
     let agent = Arc::new(Agent::new(
         provider.clone(),
         AgentConfig::new(model.clone())
-            .with_system_prompt("bash-e2e")
+            .with_system_prompt("exec-e2e")
             .with_tools(WorkspaceTools::build(cfg)),
     ));
 
-    let msgs = agent.prompt("check bash env and truncation").await.unwrap();
+    let msgs = agent.prompt("check exec env and truncation").await.unwrap();
     let results = tool_results_from(&msgs);
     let by_id = |id: &str| -> &ToolResultMessage {
         results
@@ -461,22 +463,26 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
         trunc_text.len()
     );
     assert!(
-        trunc_text.starts_with("HEAD_开始_"),
-        "missing UTF-8 head: {trunc_text:?}"
-    );
-    assert!(
-        trunc_text.ends_with("_结束_TAIL"),
+        trunc_text.contains("_结束_TAIL"),
         "missing UTF-8 tail: {trunc_text:?}"
     );
-    assert!(
-        trunc_text.contains("[... truncated "),
-        "missing truncation marker: {trunc_text:?}"
-    );
-    assert!(trunc_text.contains(" bytes ...]"));
     assert!(
         !trunc_text.contains('\u{FFFD}'),
         "UTF-8 char was corrupted: {trunc_text:?}"
     );
+    // Also verify default 50 KiB spillover writes full output to disk and cites Full output path.
+    let spill = pikra_tools::truncate_tail_spillover(
+        &format!("FIRST_LINE\n{}\nLAST_LINE", "middle-line\n".repeat(6_000)),
+        pikra_tools::DEFAULT_MAX_OUTPUT_BYTES,
+        pikra_tools::DEFAULT_MAX_OUTPUT_LINES,
+    );
+    assert!(spill.truncated);
+    assert!(spill.text.contains("LAST_LINE") && !spill.text.contains("FIRST_LINE"));
+    assert!(spill.text.contains("Full output:"));
+    let spill_path = spill.full_output_path.expect("spill temp file path");
+    let spilled_full = fs::read_to_string(&spill_path).unwrap();
+    assert!(spilled_full.starts_with("FIRST_LINE\n") && spilled_full.ends_with("LAST_LINE"));
+    let _ = fs::remove_file(&spill_path);
 
     let nonzero_res = by_id("c_nonzero");
     assert!(nonzero_res.is_error);
@@ -506,7 +512,7 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
         &model,
         vec![AssistantBlock::ToolCall(make_tool_call(
             "c_hang_pg",
-            "bash",
+            "exec_command",
             json!({
                 // Trailing `; true` prevents outer `/bin/sh` from tail-execing the inner `sh`,
                 // ensuring a true parent + grandchild process tree in the same process group.
@@ -644,26 +650,27 @@ async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head
         "rewritten through symlink\n"
     );
 
-    // 2. Tiny bash output budget (< compact marker length) with a single overflowing 70-byte chunk
-    //    must preserve the head prefix instead of returning empty output.
+    // 2. Tiny exec_command output budget (< compact marker length) with a single overflowing 70-byte chunk
+    //    must preserve the UTF-8 tail cleanly instead of returning empty or corrupted output, AND
+    //    AgentConfig::max_tool_result_bytes caps oversized custom tool results globally.
     let bash_cfg = WorkspaceToolsConfig::new(root)
-        .with_enabled_tools([BuiltinToolKind::Bash])
+        .with_enabled_tools([BuiltinToolKind::ExecCommand])
         .with_max_output_bytes(16);
     let bash_provider = Arc::new(FauxProvider::new());
-    let payload_70 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345";
+    let payload_70 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefXYZEND";
     assert_eq!(payload_70.len(), 70);
     bash_provider.enqueue_events(turn_events(
         &model,
         vec![
             AssistantBlock::ToolCall(make_tool_call(
                 "c_tiny_ascii",
-                "bash",
+                "exec_command",
                 json!({ "command": format!("printf '%s' '{payload_70}'") }),
             )),
             AssistantBlock::ToolCall(make_tool_call(
                 "c_tiny_utf8",
-                "bash",
-                json!({ "command": "printf 'a你好世界🚀0123456789abcdef0123456789abcdef'" }),
+                "exec_command",
+                json!({ "command": "printf '0123456789abcdef0123456789abcdef🚀你好世界z'" }),
             )),
         ],
         StopReason::ToolUse,
@@ -676,10 +683,10 @@ async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head
     let bash_agent = Agent::new(
         bash_provider,
         AgentConfig::new(model)
-            .with_system_prompt("tiny-bash-e2e")
+            .with_system_prompt("tiny-exec-e2e")
             .with_tools(WorkspaceTools::build(bash_cfg)),
     );
-    let bash_msgs = bash_agent.prompt("test tiny bash budget").await.unwrap();
+    let bash_msgs = bash_agent.prompt("test tiny exec budget").await.unwrap();
     let bash_results = tool_results_from(&bash_msgs);
 
     let ascii_res = bash_results
@@ -687,7 +694,7 @@ async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head
         .find(|r| r.tool_call_id == "c_tiny_ascii")
         .unwrap();
     assert!(!ascii_res.is_error);
-    assert_eq!(result_text(ascii_res), "0123456789abcdef");
+    assert_eq!(result_text(ascii_res), "6789abcdefXYZEND");
 
     let utf8_res = bash_results
         .iter()
@@ -695,7 +702,7 @@ async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head
         .unwrap();
     assert!(!utf8_res.is_error);
     let utf8_text = result_text(utf8_res);
-    assert_eq!(utf8_text, "a你好世界");
+    assert_eq!(utf8_text, "你好世界z");
     assert!(utf8_text.len() <= 16);
     assert!(!utf8_text.contains('\u{FFFD}'));
 }

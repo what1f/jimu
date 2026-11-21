@@ -11,7 +11,8 @@ const HELP: &str = "Usage: pikra-acp [options] [login|logout]\n\
   --instruction-max-bytes <bytes|none>  --instruction-file <path> (repeatable)\n\
   --no-user-instructions  --no-instructions\n\
   --no-tools  --enable-codemode  --compact-tokens <u32>  --context-window <u32>\n\
-  --thinking <level>  --fast  --mode <default|acceptEdits|plan|bypassPermissions>\n\
+  --max-output-tokens <u32>  --thinking <level>  --fast\n\
+  --mode <default|acceptEdits|plan|bypassPermissions>\n\
   --system-prompt <text>  -h, --help  -V, --version\n";
 
 pub async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
@@ -76,6 +77,13 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                     value()?
                         .parse()
                         .map_err(|_| "Expected a number for --context-window.")?,
+                )
+            }
+            "--max-output-tokens" => {
+                cfg.max_output_tokens = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "Expected a number for --max-output-tokens.")?,
                 )
             }
             "--thinking" => cfg.thinking = value()?.parse()?,

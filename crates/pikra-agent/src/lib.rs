@@ -13,7 +13,7 @@ pub use loop_runner::{
     AgentLoopConfig, AgentLoopOutcome, ApiKeyResolver, QueueSource, QueuedInput, agent_loop,
     agent_loop_continue,
 };
-pub use tool::{ClosureTool, run_tool_call};
+pub use tool::{ClosureTool, DEFAULT_MAX_TOOL_RESULT_BYTES, run_tool_call};
 
 use pikra_ai::{
     AssistantMessage, AssistantMessageEvent, BoxFuture, CancelToken, ContentPart, Message, Model,

@@ -1358,3 +1358,112 @@ fn explicit_system_prompt_and_tools_updates_override_reconstructed_leading_syste
         assert!(resolved2.tools.is_empty());
     });
 }
+
+#[test]
+fn engine_floodgate_caps_oversized_tool_results_while_preserving_codemode_structured_content() {
+    block_on(async {
+        let giant_text = format!("START_{}_END", "x".repeat(200_000));
+        let giant_for_tool = giant_text.clone();
+        let rogue_tool: Arc<dyn AgentTool> = Arc::new(ClosureTool::new(
+            ToolDefinition {
+                name: "rogue_mcp".into(),
+                description: "Returns 200KB text + 200KB structured payload".into(),
+                parameters: json!({"type": "object"}),
+            },
+            move |_id, _args, _cancel, _progress| {
+                let body = giant_for_tool.clone();
+                Box::pin(async move {
+                    let mut res = AgentToolResult::text(body.clone());
+                    res.structured_content = Some(json!({"full": body}));
+                    Ok(res)
+                })
+            },
+        ));
+
+        // Programmatic `run_tool_call` (used by codemode) still receives full 200KB structured_content.
+        let dummy_asst = pikra_ai::AssistantMessage {
+            content: Vec::new(),
+            api: pikra_ai::ApiKind::OpenaiResponses,
+            provider: "test".into(),
+            model: "m".into(),
+            response_id: None,
+            thinking_level: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            diagnostics: Vec::new(),
+            timestamp: 0,
+            duration_ms: None,
+        };
+        let tc = make_tool_call("c1", "rogue_mcp", json!({}), None);
+        let snap = pikra_agent::AgentContextSnapshot {
+            system_prompt: String::new(),
+            tools: Vec::new(),
+            messages: Vec::new(),
+            model: test_model("m"),
+            thinking_level: ThinkingLevel::Off,
+            fast: false,
+        };
+        let direct = pikra_agent::run_tool_call(
+            std::slice::from_ref(&rogue_tool),
+            &[],
+            &dummy_asst,
+            &tc,
+            &snap,
+            pikra_ai::CancelToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert_eq!(
+            direct.structured_content.unwrap()["full"]
+                .as_str()
+                .unwrap()
+                .len(),
+            giant_text.len()
+        );
+
+        // Agent loop caps LLM-bound ToolResultMessage at DEFAULT_MAX_TOOL_RESULT_BYTES (64 KiB).
+        let provider = ScriptedProvider::new(vec![
+            Box::new(move |model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::ToolCall(make_tool_call(
+                        "c1",
+                        "rogue_mcp",
+                        json!({}),
+                        None,
+                    ))],
+                    StopReason::ToolUse,
+                    Usage::default(),
+                    None,
+                )
+            }),
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("done"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+        ]);
+
+        let agent = Agent::new(
+            provider,
+            AgentConfig::new(test_model("m")).with_tools(vec![rogue_tool]),
+        );
+        let msgs = agent.prompt("run rogue").await.unwrap();
+        let tr = msgs
+            .iter()
+            .find_map(|m| match m {
+                AgentMessage::Llm(Message::ToolResult(tr)) => Some(tr),
+                _ => None,
+            })
+            .unwrap();
+        let llm_text = first_text(&tr.content);
+        assert!(llm_text.len() <= pikra_agent::DEFAULT_MAX_TOOL_RESULT_BYTES);
+        assert!(llm_text.starts_with("START_") && llm_text.ends_with("_END"));
+        assert!(llm_text.contains("[... truncated "));
+    });
+}

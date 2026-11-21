@@ -49,6 +49,10 @@ pub struct AgentConfig {
     pub headers: Vec<(String, Option<String>)>,
     pub sampling_params: Map<String, Value>,
     pub initial_messages: Vec<AgentMessage>,
+    /// Hard UTF-8 byte ceiling applied across all `ContentPart::Text` blocks of a single
+    /// LLM-facing [`ToolResultMessage`] (including MCP, host FFI, and extension tools).
+    /// Defaults to `Some(DEFAULT_MAX_TOOL_RESULT_BYTES)` (64 KiB); set to `None` to disable.
+    pub max_tool_result_bytes: Option<usize>,
     /// When `true`, if a prompt run fails or is aborted on the very first model request before
     /// any assistant response completes or any tool executes, the newly added prompt message is
     /// rolled back from `Agent` history and `AgentEvent::AgentEnd { user_message_kept: false }`
@@ -78,6 +82,7 @@ impl AgentConfig {
             headers: Vec::new(),
             sampling_params: Map::new(),
             initial_messages: Vec::new(),
+            max_tool_result_bytes: Some(crate::DEFAULT_MAX_TOOL_RESULT_BYTES),
             rollback_first_turn_on_failure: false,
         }
     }
@@ -129,6 +134,11 @@ impl AgentConfig {
 
     pub fn with_rollback_first_turn_on_failure(mut self, rollback: bool) -> Self {
         self.rollback_first_turn_on_failure = rollback;
+        self
+    }
+
+    pub fn with_max_tool_result_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.max_tool_result_bytes = max_bytes;
         self
     }
 }
@@ -256,6 +266,7 @@ struct AgentInner {
     session_id: Option<String>,
     headers: Vec<(String, Option<String>)>,
     sampling_params: Map<String, Value>,
+    max_tool_result_bytes: Option<usize>,
     rollback_first_turn_on_failure: bool,
 
     messages: Vec<AgentMessage>,
@@ -285,6 +296,7 @@ impl AgentInner {
             session_id: self.session_id.clone(),
             headers: self.headers.clone(),
             sampling_params: self.sampling_params.clone(),
+            max_tool_result_bytes: self.max_tool_result_bytes,
             rollback_first_turn_on_failure: self.rollback_first_turn_on_failure,
             system_prompt_updated: self.system_prompt_updated,
             tools_updated: self.tools_updated,
@@ -518,6 +530,7 @@ impl Agent {
             session_id: config.session_id,
             headers: config.headers,
             sampling_params: config.sampling_params,
+            max_tool_result_bytes: config.max_tool_result_bytes,
             rollback_first_turn_on_failure: config.rollback_first_turn_on_failure,
             messages: config.initial_messages,
             streaming_message: None,

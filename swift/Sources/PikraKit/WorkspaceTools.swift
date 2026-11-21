@@ -25,7 +25,7 @@ public struct PikraWorkspaceTools: Sendable {
         approval: PikraToolApproval? = nil,
         pluginID: String = "pikra-workspace",
         environment: (@Sendable () async -> [String: String])? = nil,
-        shellOutputLimit: Int = 1024 * 1024
+        shellOutputLimit: Int = PikraWorkspaceEnvironment.defaultMaxOutputBytes
     ) {
         self.workspace = workspace.standardizedFileURL
         self.approval = approval
@@ -68,7 +68,16 @@ public struct PikraWorkspaceTools: Sendable {
         case .sleep: (try PikraBuiltinTools.sleep(environment), .readOnly)
         case .webFetch: (try PikraBuiltinTools.webFetch(environment), .readOnly)
         #if os(macOS)
-        case .shell: (shell(try PikraBuiltinTools.bash(environment)), .dangerous)
+        case .shell:
+            (
+                shell(
+                    try PikraBuiltinTools.execCommandOneShot(
+                        environment,
+                        override: PikraToolDefinitionOverride(rename: "bash")
+                    )
+                ),
+                .dangerous
+            )
         case .execCommand: (try PikraBuiltinTools.execCommand(environment), .dangerous)
         case .writeStdin: (try PikraBuiltinTools.writeStdin(environment), .dangerous)
         case .monitor: (try PikraBuiltinTools.monitor(environment), .dangerous)
