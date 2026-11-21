@@ -712,3 +712,73 @@ return rejects;
         );
     });
 }
+
+#[test]
+fn sanitized_alias_never_steals_exact_raw_name_or_drops_all_tools_entry() {
+    block_on(async {
+        let mut sandbox = CodemodeSandbox::new(CodemodeSandboxOptions::default());
+
+        // Register hyphenated name BEFORE underscored name that matches its sanitized alias.
+        sandbox
+            .register_tool(Arc::new(FnTool::new(
+                "get-item",
+                "Hyphenated get-item tool",
+                |_args, _ctx| async move { Ok(json!("from:get-item")) },
+            )))
+            .unwrap();
+        sandbox
+            .register_tool(Arc::new(FnTool::new(
+                "get_item",
+                "Underscored get_item tool",
+                |_args, _ctx| async move { Ok(json!("from:get_item")) },
+            )))
+            .unwrap();
+        // Also test two non-identifier tools whose sanitized aliases collide with each other.
+        sandbox
+            .register_tool(Arc::new(FnTool::new(
+                "foo-bar",
+                "Hyphenated foo-bar",
+                |_args, _ctx| async move { Ok(json!("from:foo-bar")) },
+            )))
+            .unwrap();
+        sandbox
+            .register_tool(Arc::new(FnTool::new(
+                "foo.bar",
+                "Dotted foo.bar",
+                |_args, _ctx| async move { Ok(json!("from:foo.bar")) },
+            )))
+            .unwrap();
+
+        let res = sandbox
+            .execute(
+                r#"
+const dotGet = await tools.get_item();
+const bracketUnderscore = await tools["get_item"]();
+const bracketHyphen = await tools["get-item"]();
+const aliasFooBar = await tools.foo_bar();
+const bracketDotted = await tools["foo.bar"]();
+const all = ALL_TOOLS.map((t) => ({ name: t.name, rawName: t.rawName }));
+return { dotGet, bracketUnderscore, bracketHyphen, aliasFooBar, bracketDotted, all };
+"#,
+                CodemodeExecuteOptions::default(),
+            )
+            .await;
+
+        assert!(res.ok, "unexpected error: {:?}", res.error);
+        let val = res.value.expect("expected value");
+        assert_eq!(val["dotGet"], "from:get_item");
+        assert_eq!(val["bracketUnderscore"], "from:get_item");
+        assert_eq!(val["bracketHyphen"], "from:get-item");
+        assert_eq!(val["aliasFooBar"], "from:foo-bar");
+        assert_eq!(val["bracketDotted"], "from:foo.bar");
+        assert_eq!(
+            val["all"],
+            json!([
+                { "name": "get-item", "rawName": "get-item" },
+                { "name": "get_item", "rawName": "get_item" },
+                { "name": "foo_bar", "rawName": "foo-bar" },
+                { "name": "foo.bar", "rawName": "foo.bar" },
+            ])
+        );
+    });
+}

@@ -256,6 +256,17 @@ impl SessionManager {
         self.append_payload(SessionEntryPayload::Message { message })
     }
 
+    pub fn append_system_baseline(
+        &mut self,
+        system_prompt: impl Into<String>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<SessionEntry, SessionError> {
+        self.append_payload(SessionEntryPayload::SystemBaseline {
+            system_prompt: system_prompt.into(),
+            tools,
+        })
+    }
+
     pub fn append_model_change(
         &mut self,
         provider: impl Into<String>,
@@ -335,30 +346,32 @@ impl SessionManager {
     /// Returns the appended `SessionEntry` items (which callers can turn into `AgentMessage`s via
     /// [`context_block_to_agent_message`] immediately before the next user prompt).
     pub fn flush_pending_context(&mut self) -> Result<Vec<SessionEntry>, SessionError> {
-        let pending_named = std::mem::take(&mut self.pending_context);
-        let pending_ephemeral = std::mem::take(&mut self.pending_ephemeral_context);
-        let mut appended = Vec::with_capacity(pending_named.len() + pending_ephemeral.len());
+        let mut appended =
+            Vec::with_capacity(self.pending_context.len() + self.pending_ephemeral_context.len());
 
-        for (name, text) in pending_named {
+        while let Some((name, text)) = self.pending_context.first().cloned() {
             let hash = sha256_bytes(&text);
             if self.active_context_hashes.get(&name) == Some(&hash) {
+                self.pending_context.remove(0);
                 continue;
             }
             let entry = self.append_payload(SessionEntryPayload::ContextBlock {
                 name: name.clone(),
                 text: text.clone(),
             })?;
+            self.pending_context.remove(0);
             self.active_context_hashes.insert(name.clone(), hash);
             self.emit(SessionEvent::ContextAppended { name, text });
             appended.push(entry);
         }
 
-        for text in pending_ephemeral {
+        while let Some(text) = self.pending_ephemeral_context.first().cloned() {
             let name = "context".to_string();
             let entry = self.append_payload(SessionEntryPayload::ContextBlock {
                 name: name.clone(),
                 text: text.clone(),
             })?;
+            self.pending_ephemeral_context.remove(0);
             self.emit(SessionEvent::ContextAppended { name, text });
             appended.push(entry);
         }
@@ -453,7 +466,7 @@ impl SessionManager {
     /// Walk root -> active leaf and reconstruct the LLM-visible context.
     ///
     /// Invariants:
-    /// - The original `SystemBaseline` is ALWAYS preserved at index 0.
+    /// - The latest `SystemBaseline` on the active branch is ALWAYS placed at index 0.
     /// - If one or more `Compaction` entries exist on the branch, replay starts from ONLY the
     ///   latest `Compaction` summary + its kept tail (`first_kept_entry_id..compaction`) + entries
     ///   appended after the compaction (never stacking old summaries).
@@ -464,7 +477,6 @@ impl SessionManager {
         let mut system_prompt = String::new();
         let mut tools: Vec<ToolDefinition> = Vec::new();
         let mut baseline_timestamp: u64 = 0;
-        let mut has_baseline = false;
 
         let mut model: Option<(String, String)> = None;
         let mut thinking: Option<(ThinkingLevel, bool)> = None;
@@ -477,12 +489,9 @@ impl SessionManager {
                     system_prompt: sp,
                     tools: t,
                 } => {
-                    if !has_baseline {
-                        system_prompt = sp.clone();
-                        tools = t.clone();
-                        baseline_timestamp = entry.timestamp;
-                        has_baseline = true;
-                    }
+                    system_prompt = sp.clone();
+                    tools = t.clone();
+                    baseline_timestamp = entry.timestamp;
                 }
                 SessionEntryPayload::ModelChange { provider, model_id } => {
                     model = Some((provider.clone(), model_id.clone()));

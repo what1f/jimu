@@ -210,16 +210,27 @@ const PRELUDE_TEMPLATE: &str = r#"(function (bridge, toolsJson, storeJson) {
 	}
 
 	const tools = Object.create(null);
-	const allTools = [];
-	for (const { name, rawName, description } of parse(toolsJson)) {
+	const parsedTools = parse(toolsJson);
+	const registered = [];
+	// Pass 1: register every tool's exact rawName first so sanitized aliases cannot steal another tool's rawName.
+	for (const { name, rawName, description } of parsedTools) {
 		const fn = caller(rawName);
-		if (!(name in tools)) {
-			tools[name] = fn;
-			allTools.push(Object.freeze({ name, rawName, description }));
-		}
 		if (!(rawName in tools)) {
 			tools[rawName] = fn;
+			registered.push({ name, rawName, description, fn });
 		}
+	}
+	// Pass 2: bind sanitized aliases only when uncollided, and include every registered tool in ALL_TOOLS.
+	const allTools = [];
+	for (const { name, rawName, description, fn } of registered) {
+		let displayName = rawName;
+		if (name === rawName) {
+			displayName = name;
+		} else if (!(name in tools)) {
+			tools[name] = fn;
+			displayName = name;
+		}
+		allTools.push(Object.freeze({ name: displayName, rawName, description }));
 	}
 	Object.freeze(tools);
 	Object.freeze(allTools);

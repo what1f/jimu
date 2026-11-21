@@ -181,9 +181,11 @@ impl JsExtensionRuntime {
                 .registry
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            *reg = new_snapshot;
+            if new_snapshot.generation >= reg.generation {
+                *reg = new_snapshot;
+                self.inner.hook_mask.store(new_mask, Ordering::Release);
+            }
         }
-        self.inner.hook_mask.store(new_mask, Ordering::Release);
         Ok(())
     }
 

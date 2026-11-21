@@ -286,6 +286,7 @@ pub(crate) struct RegisteredToolMeta {
 /// Snapshot of registered tools, hooks, and loaded extension names for the active VM.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RegistrySnapshot {
+    pub generation: u64,
     pub tools: Vec<RegisteredToolMeta>,
     pub hook_mask: u8,
     pub loaded_extensions: Vec<String>,
@@ -363,6 +364,7 @@ pub(crate) fn parse_registry_snapshot(
     }
 
     Ok(RegistrySnapshot {
+        generation: 0,
         tools,
         hook_mask,
         loaded_extensions,

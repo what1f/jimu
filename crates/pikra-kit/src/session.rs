@@ -20,7 +20,7 @@ use pikra_codemode::CodemodeSandboxOptions;
 use pikra_session::{
     CompactionConfig, CompactionResult, CompactionStrategy, MemorySessionStore, SessionConfig,
     SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore, SessionTreeNode,
-    context_block_to_agent_message,
+    baseline_to_system_message, context_block_to_agent_message,
 };
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -239,17 +239,38 @@ impl Stream for KitEventStream<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KitActivity {
+    Idle,
+    RunningPrompt,
+    Compacting,
+}
+
+struct ActivityGuard {
+    activity: Arc<Mutex<KitActivity>>,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = KitActivity::Idle;
+    }
+}
+
 /// High-level headless session facade combining `Agent`, `SessionManager`, `SkillCatalog`,
 /// deferred tool gateway (`tool_search` + `call_tool`), optional `exec` codemode sandbox, and MCP.
 pub struct KitSession {
     provider: Arc<dyn StreamProvider>,
     agent: Agent,
     session: Arc<Mutex<SessionManager>>,
+    /// Resident tools excluding `exec` so `CodemodeExecTool` never forms an `Arc` cycle.
     resident_tools: Arc<Mutex<Vec<Arc<dyn AgentTool>>>>,
+    codemode_exec_tool: Option<Arc<dyn AgentTool>>,
     deferred_registry: Arc<DeferredToolRegistry>,
     skills: Mutex<SkillCatalog>,
     skill_roots: Vec<PathBuf>,
+    had_skills_catalog: Mutex<bool>,
     had_deferred_catalog: Mutex<bool>,
+    activity: Arc<Mutex<KitActivity>>,
     api_key: Option<String>,
     get_api_key: Option<ApiKeyResolver>,
     cache_retention: CacheRetention,
@@ -298,9 +319,17 @@ impl KitSession {
             }
         }
 
-        let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
+        // Keep `exec` out of `resident_tools_handle` so `CodemodeExecTool` never holds an
+        // `Arc` cycle back to itself (which would leak user tools after `KitSession` drops).
+        let resident_tools_handle = Arc::new(Mutex::new(
+            resident
+                .iter()
+                .filter(|t| t.definition().name != CODEMODE_EXEC_TOOL_NAME)
+                .cloned()
+                .collect(),
+        ));
 
-        if config.enable_codemode
+        let codemode_exec_tool = if config.enable_codemode
             && !resident
                 .iter()
                 .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
@@ -313,11 +342,14 @@ impl KitSession {
                 )
                 .with_middlewares(config.middlewares.clone()),
             );
-            resident.push(exec_tool);
-            *resident_tools_handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = resident.clone();
-        }
+            resident.push(Arc::clone(&exec_tool));
+            Some(exec_tool)
+        } else {
+            resident
+                .iter()
+                .find(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
+                .cloned()
+        };
 
         let resident_defs: Vec<ToolDefinition> = resident.iter().map(|t| t.definition()).collect();
         let store = config
@@ -347,8 +379,17 @@ impl KitSession {
             .unwrap_or(config.fast);
 
         let skills = SkillCatalog::discover(&config.skill_roots);
+        let mut had_skills_catalog = reconstructed
+            .all_branch_context_blocks
+            .contains_key(SKILLS_CONTEXT_NAME);
         if let Some(skills_xml) = skills.format_for_context() {
             session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
+            had_skills_catalog = true;
+        } else if had_skills_catalog {
+            session_manager.set_context(
+                SKILLS_CONTEXT_NAME,
+                "<available_skills>\n</available_skills>",
+            );
         }
 
         let mut had_deferred_catalog = false;
@@ -383,10 +424,13 @@ impl KitSession {
             agent,
             session: Arc::new(Mutex::new(session_manager)),
             resident_tools: resident_tools_handle,
+            codemode_exec_tool,
             deferred_registry,
             skills: Mutex::new(skills),
             skill_roots: config.skill_roots,
+            had_skills_catalog: Mutex::new(had_skills_catalog),
             had_deferred_catalog: Mutex::new(had_deferred_catalog),
+            activity: Arc::new(Mutex::new(KitActivity::Idle)),
             api_key: config.api_key,
             get_api_key: config.get_api_key,
             cache_retention: config.cache_retention,
@@ -449,6 +493,48 @@ impl KitSession {
 
     pub fn is_running(&self) -> bool {
         self.agent.is_running()
+            || *self.activity.lock().unwrap_or_else(|e| e.into_inner()) != KitActivity::Idle
+    }
+
+    fn try_begin_activity(&self, next: KitActivity) -> Result<ActivityGuard, KitError> {
+        let mut guard = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard != KitActivity::Idle || self.agent.is_running() {
+            return Err(KitError::Busy);
+        }
+        *guard = next;
+        Ok(ActivityGuard {
+            activity: Arc::clone(&self.activity),
+        })
+    }
+
+    fn with_idle_mutation<R>(
+        &self,
+        f: impl FnOnce() -> Result<R, KitError>,
+    ) -> Result<R, KitError> {
+        let guard = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard != KitActivity::Idle || self.agent.is_running() {
+            return Err(KitError::Busy);
+        }
+        f()
+    }
+
+    fn sync_agent_leading_system_message(
+        &self,
+        system_prompt: &str,
+        tools: &[ToolDefinition],
+    ) -> Result<(), KitError> {
+        let mut messages = self.agent.messages();
+        if let Some(AgentMessage::Llm(Message::System(sys))) = messages.first_mut() {
+            sys.content = system_prompt.to_string();
+            sys.tools_added = tools.to_vec();
+        } else {
+            messages.insert(
+                0,
+                baseline_to_system_message(system_prompt, tools, now_ms()),
+            );
+        }
+        self.agent.replace_messages(messages)?;
+        Ok(())
     }
 
     pub fn resident_tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -475,50 +561,79 @@ impl KitSession {
         let discovered = SkillCatalog::discover(&self.skill_roots);
         let formatted = discovered.format_for_context();
         *self.skills.lock().unwrap_or_else(|e| e.into_inner()) = discovered;
-        if let Some(xml) = formatted {
-            self.session
+        let mut had_catalog = self
+            .had_skills_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match formatted {
+            Some(xml) => {
+                *had_catalog = true;
+                self.session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_context(SKILLS_CONTEXT_NAME, xml)
+            }
+            None if *had_catalog => self
+                .session
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set_context(SKILLS_CONTEXT_NAME, xml)
-        } else {
-            false
+                .set_context(
+                    SKILLS_CONTEXT_NAME,
+                    "<available_skills>\n</available_skills>",
+                ),
+            None => false,
         }
     }
 
     // ---- Idle Configuration Updates (Zero Spurious Busy) ----
 
     pub fn set_model(&self, model: Model) -> Result<(), KitError> {
-        self.agent.set_model(model.clone())?;
-        self.session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_model_change(model.provider, model.id)?;
-        Ok(())
+        self.with_idle_mutation(|| {
+            self.agent.set_model(model.clone())?;
+            self.session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append_model_change(model.provider, model.id)?;
+            Ok(())
+        })
     }
 
     pub fn set_thinking_level(&self, level: ThinkingLevel) -> Result<(), KitError> {
-        self.agent.set_thinking_level(level)?;
-        let fast = self.agent.fast();
-        self.session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_thinking_change(level, fast)?;
-        Ok(())
+        self.with_idle_mutation(|| {
+            self.agent.set_thinking_level(level)?;
+            let fast = self.agent.fast();
+            self.session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append_thinking_change(level, fast)?;
+            Ok(())
+        })
     }
 
     pub fn set_fast(&self, fast: bool) -> Result<(), KitError> {
-        self.agent.set_fast(fast)?;
-        let level = self.agent.thinking_level();
-        self.session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_thinking_change(level, fast)?;
-        Ok(())
+        self.with_idle_mutation(|| {
+            self.agent.set_fast(fast)?;
+            let level = self.agent.thinking_level();
+            self.session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append_thinking_change(level, fast)?;
+            Ok(())
+        })
     }
 
     pub fn set_system_prompt(&self, prompt: impl Into<String>) -> Result<(), KitError> {
-        self.agent.set_system_prompt(prompt)?;
-        Ok(())
+        let prompt = prompt.into();
+        self.with_idle_mutation(|| {
+            let tool_defs = self.agent.tool_definitions();
+            self.session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append_system_baseline(&prompt, tool_defs.clone())?;
+            self.agent.set_system_prompt(&prompt)?;
+            self.sync_agent_leading_system_message(&prompt, &tool_defs)?;
+            Ok(())
+        })
     }
 
     /// Set or update a named `<system-reminder>` context block (deduplicated; NO-OP if unchanged).
@@ -542,12 +657,11 @@ impl KitSession {
     /// NEVER mutates the top-level resident `tools` array; updates the `"deferred_tools"`
     /// `<system-reminder>` catalog only when changed.
     pub fn upsert_tools(&self, tools: Vec<Arc<dyn AgentTool>>) -> Result<(), KitError> {
-        if self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
-        self.deferred_registry.upsert(tools);
-        self.sync_deferred_tools_context();
-        Ok(())
+        self.with_idle_mutation(|| {
+            self.deferred_registry.upsert(tools);
+            self.sync_deferred_tools_context();
+            Ok(())
+        })
     }
 
     /// Dynamically remove deferred tools by name while idle.
@@ -555,14 +669,13 @@ impl KitSession {
     /// NEVER mutates the top-level resident `tools` array; updates the `"deferred_tools"`
     /// `<system-reminder>` catalog only when changed.
     pub fn remove_tools(&self, names: &[&str]) -> Result<usize, KitError> {
-        if self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
-        let removed = self.deferred_registry.remove(names);
-        if removed > 0 {
-            self.sync_deferred_tools_context();
-        }
-        Ok(removed)
+        self.with_idle_mutation(|| {
+            let removed = self.deferred_registry.remove(names);
+            if removed > 0 {
+                self.sync_deferred_tools_context();
+            }
+            Ok(removed)
+        })
     }
 
     fn sync_deferred_tools_context(&self) {
@@ -600,60 +713,90 @@ impl KitSession {
         name_prefix: Option<&str>,
         cancel: CancelToken,
     ) -> Result<Vec<String>, KitError> {
-        if self.agent.is_running() {
+        if self.is_running() {
             return Err(KitError::Busy);
         }
         let discovered = client.list_tools(cancel).await?;
         let agent_tools = client.to_agent_tools(&discovered, name_prefix);
         let names: Vec<String> = agent_tools.iter().map(|t| t.definition().name).collect();
 
-        match mode {
-            McpToolRegistrationMode::Deferred => {
-                self.upsert_tools(agent_tools)?;
-            }
-            McpToolRegistrationMode::Resident => {
-                let mut resident = self
-                    .resident_tools
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                for tool in agent_tools {
-                    let name = tool.definition().name;
-                    if let Some(existing) =
-                        resident.iter_mut().find(|t| t.definition().name == name)
-                    {
-                        *existing = tool;
-                    } else {
-                        resident.push(tool);
+        self.with_idle_mutation(|| {
+            match mode {
+                McpToolRegistrationMode::Deferred => {
+                    self.deferred_registry.upsert(agent_tools);
+                    self.sync_deferred_tools_context();
+                }
+                McpToolRegistrationMode::Resident => {
+                    if !agent_tools.is_empty() {
+                        let mut next_resident = self
+                            .resident_tools
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let mut override_exec: Option<Arc<dyn AgentTool>> = None;
+                        for tool in agent_tools {
+                            let name = tool.definition().name;
+                            if name == CODEMODE_EXEC_TOOL_NAME {
+                                override_exec = Some(tool);
+                                continue;
+                            }
+                            if let Some(existing) = next_resident
+                                .iter_mut()
+                                .find(|t| t.definition().name == name)
+                            {
+                                *existing = tool;
+                            } else {
+                                next_resident.push(tool);
+                            }
+                        }
+
+                        let mut full_tools = next_resident.clone();
+                        if let Some(exec_tool) =
+                            override_exec.or_else(|| self.codemode_exec_tool.clone())
+                        {
+                            full_tools.push(exec_tool);
+                        }
+
+                        let updated_defs: Vec<ToolDefinition> =
+                            full_tools.iter().map(|t| t.definition()).collect();
+                        let current_prompt = self.agent.system_prompt();
+
+                        self.session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .append_system_baseline(&current_prompt, updated_defs.clone())?;
+                        self.agent.set_tools(full_tools)?;
+                        self.sync_agent_leading_system_message(&current_prompt, &updated_defs)?;
+                        *self
+                            .resident_tools
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = next_resident;
                     }
                 }
-                let updated = resident.clone();
-                drop(resident);
-                self.agent.set_tools(updated)?;
             }
-        }
+            Ok(())
+        })?;
         Ok(names)
     }
 
     /// Branch the session to `entry_id` without deleting sibling entries and re-sync `Agent`.
     pub fn fork(&self, entry_id: &str) -> Result<(), KitError> {
-        if self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
-        let reconstructed = {
-            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            session.fork(entry_id)?;
-            session.reconstruct_context()
-        };
-        self.deferred_registry.clear_seen_schemas();
-        self.agent.replace_messages(reconstructed.messages)?;
-        Ok(())
+        self.with_idle_mutation(|| {
+            let reconstructed = {
+                let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+                session.fork(entry_id)?;
+                session.reconstruct_context()
+            };
+            self.deferred_registry.clear_seen_schemas();
+            self.agent.set_system_prompt(&reconstructed.system_prompt)?;
+            self.agent.replace_messages(reconstructed.messages)?;
+            Ok(())
+        })
     }
 
     /// Run manual compaction immediately while idle.
     pub async fn compact(&self) -> Result<Option<CompactionResult>, KitError> {
-        if self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
+        let _activity_guard = self.try_begin_activity(KitActivity::Compacting)?;
         self.run_compaction_internal(false, None).await
     }
 
@@ -710,9 +853,7 @@ impl KitSession {
         &self,
         user_msg: AgentMessage,
     ) -> Result<Vec<AgentMessage>, KitError> {
-        if self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
+        let _activity_guard = self.try_begin_activity(KitActivity::RunningPrompt)?;
 
         let (prompt_messages, flushed_count) = self.prepare_turn_prompt_messages(user_msg)?;
         let new_messages = self.agent.prompt_messages(prompt_messages).await?;
@@ -732,20 +873,22 @@ impl KitSession {
 
     /// Run a text prompt as a [`KitEventStream`] yielding `AgentEvent` and `SessionEvent` items.
     pub fn prompt_stream(&self, text: impl Into<String>) -> Result<KitEventStream<'_>, KitError> {
-        if self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
+        let activity_guard = self.try_begin_activity(KitActivity::RunningPrompt)?;
         let user_msg = AgentMessage::Llm(Message::User(UserMessage::text(text, now_ms())));
-        let (prompt_messages, flushed_count, flushed_events) =
-            self.prepare_turn_prompt_messages_with_events(user_msg)?;
-
-        let mut agent_stream = self.agent.prompt_messages_stream(prompt_messages)?;
         let (tx, rx) = mpsc::unbounded();
-        for ev in flushed_events {
-            let _ = tx.unbounded_send(KitEvent::Session(ev));
-        }
 
+        // Defer flushing pending context and starting the agent run until the stream is actually
+        // polled for the first time, so dropping an unpolled `KitEventStream` never writes context
+        // blocks to `SessionManager` without delivering them to `Agent`.
         let driver: BoxFuture<'_, Result<(), KitError>> = Box::pin(async move {
+            let _activity_guard = activity_guard;
+            let (prompt_messages, flushed_count, flushed_events) =
+                self.prepare_turn_prompt_messages_with_events(user_msg)?;
+            for ev in flushed_events {
+                let _ = tx.unbounded_send(KitEvent::Session(ev));
+            }
+
+            let mut agent_stream = self.agent.prompt_messages_stream(prompt_messages)?;
             let mut seen_ends = 0usize;
             while let Some(ev) = agent_stream.next().await {
                 if let AgentEvent::MessageEnd { message } = &ev {

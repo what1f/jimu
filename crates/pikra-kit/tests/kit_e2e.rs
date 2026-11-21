@@ -608,3 +608,532 @@ for raw in sys.stdin:
         transport.close().await;
     });
 }
+
+#[test]
+fn codemode_exec_serializes_sequential_tools_and_breaks_arc_cycle() {
+    use pikra_agent::ToolExecutionMode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ModeAwareTool {
+        def: ToolDefinition,
+        mode: ToolExecutionMode,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        parallel_gate: Option<Arc<std::sync::Mutex<Option<futures_channel::oneshot::Sender<()>>>>>,
+        parallel_wait:
+            Option<Arc<std::sync::Mutex<Option<futures_channel::oneshot::Receiver<()>>>>>,
+    }
+
+    impl AgentTool for ModeAwareTool {
+        fn definition(&self) -> ToolDefinition {
+            self.def.clone()
+        }
+
+        fn execution_mode(&self) -> ToolExecutionMode {
+            self.mode
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: String,
+            args: Value,
+            _cancel: CancelToken,
+            _on_update: pikra_agent::ToolProgressCallback,
+        ) -> pikra_ai::BoxFuture<'_, Result<AgentToolResult, String>> {
+            let in_flight = Arc::clone(&self.in_flight);
+            let max_in_flight = Arc::clone(&self.max_in_flight);
+            let gate = self.parallel_gate.clone();
+            let wait = self.parallel_wait.clone();
+            let mode = self.mode;
+            Box::pin(async move {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, Ordering::SeqCst);
+
+                if mode == ToolExecutionMode::Parallel {
+                    // Two-party deterministic rendezvous: only resolves if BOTH calls overlap!
+                    if current >= 2 {
+                        if let Some(tx) = gate.and_then(|g| g.lock().unwrap().take()) {
+                            let _ = tx.send(());
+                        }
+                    } else if let Some(rx) = wait.and_then(|w| w.lock().unwrap().take()) {
+                        let _ = rx.await;
+                    }
+                } else {
+                    // Yield several polls so a concurrent Sequential call would definitely overlap if unguarded.
+                    for _ in 0..4 {
+                        let mut yielded = false;
+                        futures_util::future::poll_fn(|cx| {
+                            if yielded {
+                                std::task::Poll::Ready(())
+                            } else {
+                                yielded = true;
+                                cx.waker().wake_by_ref();
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                }
+
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(AgentToolResult::text(
+                    args.get("n")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .to_string(),
+                ))
+            })
+        }
+    }
+
+    block_on(async {
+        let seq_in_flight = Arc::new(AtomicUsize::new(0));
+        let seq_max = Arc::new(AtomicUsize::new(0));
+        let seq_tool: Arc<dyn AgentTool> = Arc::new(ModeAwareTool {
+            def: ToolDefinition {
+                name: "seq_edit".into(),
+                description: "Sequential mutating tool".into(),
+                parameters: obj_schema([("n", int_schema(), true)]),
+            },
+            mode: ToolExecutionMode::Sequential,
+            in_flight: Arc::clone(&seq_in_flight),
+            max_in_flight: Arc::clone(&seq_max),
+            parallel_gate: None,
+            parallel_wait: None,
+        });
+
+        let (par_tx, par_rx) = futures_channel::oneshot::channel();
+        let par_in_flight = Arc::new(AtomicUsize::new(0));
+        let par_max = Arc::new(AtomicUsize::new(0));
+        let par_tool: Arc<dyn AgentTool> = Arc::new(ModeAwareTool {
+            def: ToolDefinition {
+                name: "par_read".into(),
+                description: "Parallel read tool".into(),
+                parameters: obj_schema([("n", int_schema(), true)]),
+            },
+            mode: ToolExecutionMode::Parallel,
+            in_flight: Arc::clone(&par_in_flight),
+            max_in_flight: Arc::clone(&par_max),
+            parallel_gate: Some(Arc::new(std::sync::Mutex::new(Some(par_tx)))),
+            parallel_wait: Some(Arc::new(std::sync::Mutex::new(Some(par_rx)))),
+        });
+
+        let transport = Arc::new(FauxTransport::new());
+        let provider = Arc::new(Client::new(transport.clone()));
+        let session = KitSession::new(
+            provider,
+            KitSessionConfig::new(test_model())
+                .with_resident_tool(Arc::clone(&seq_tool))
+                .with_deferred_tool(Arc::clone(&par_tool))
+                .with_codemode(true),
+        )
+        .unwrap();
+
+        let script = r#"
+            const seqRes = await Promise.all([
+                tools.seq_edit({ n: 1 }),
+                tools.seq_edit({ n: 2 }),
+                tools.seq_edit({ n: 3 }),
+            ]);
+            const parRes = await Promise.all([
+                tools.par_read({ n: 10 }),
+                tools.par_read({ n: 20 }),
+            ]);
+            return { seqRes, parRes };
+        "#;
+        transport.enqueue_sse(openai_sse_tool_call(
+            "sq1",
+            "call_exec_seq",
+            CODEMODE_EXEC_TOOL_NAME,
+            &json!({ "code": script }),
+        ));
+        transport.enqueue_sse(openai_sse_text("sq2", "Done."));
+
+        session.prompt("run seq and par").await.unwrap();
+        assert_eq!(
+            seq_max.load(Ordering::SeqCst),
+            1,
+            "Sequential tools inside codemode Promise.all must never overlap"
+        );
+        assert_eq!(
+            par_max.load(Ordering::SeqCst),
+            2,
+            "Parallel tools inside codemode Promise.all must still run concurrently"
+        );
+
+        // (#23) Dropping KitSession must release all user tools (no Arc cycle via CodemodeExecTool).
+        assert!(Arc::strong_count(&seq_tool) > 1);
+        drop(session);
+        assert_eq!(
+            Arc::strong_count(&seq_tool),
+            1,
+            "dropping KitSession with codemode enabled must not leak resident tools"
+        );
+        assert_eq!(Arc::strong_count(&par_tool), 1);
+    });
+}
+
+#[test]
+fn review_regressions_baseline_sync_compaction_guard_unpolled_stream_mcp_and_skills_clear() {
+    use pikra_session::{
+        CompactionInput, CompactionOutput, CompactionStrategy, JsonlSessionStore, SessionError,
+    };
+
+    // 1. (#8 + #38) set_system_prompt, resident MCP attach, reopen, and deleting last skill.
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let session_path = dir.path().join("kit.jsonl");
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let skill_file = skills_dir.join("only-skill.md");
+        std::fs::write(&skill_file, "# Only Skill\nDoes one thing.\n").unwrap();
+
+        let llm_http = Arc::new(FauxTransport::new());
+        let llm_provider = Arc::new(Client::new(llm_http.clone()));
+        let store = Arc::new(JsonlSessionStore::new(&session_path));
+
+        let session = KitSession::new(
+            llm_provider.clone(),
+            KitSessionConfig::new(test_model())
+                .with_system_prompt("Prompt A")
+                .with_skill_root(&skills_dir)
+                .with_store(store)
+                .with_codemode(true),
+        )
+        .unwrap();
+
+        llm_http.enqueue_sse(openai_sse_text("b1", "Reply A"));
+        session.prompt("Turn 1").await.unwrap();
+        assert_eq!(llm_http.requests()[0].body_json["instructions"], "Prompt A");
+        assert!(
+            llm_http.requests()[0]
+                .body_json
+                .to_string()
+                .contains("only-skill")
+        );
+
+        // Update system prompt & attach resident MCP tool.
+        session.set_system_prompt("Prompt B").unwrap();
+
+        let mcp_http = Arc::new(FauxTransport::new());
+        mcp_http.enqueue(json_http_response(
+            200,
+            vec![("Mcp-Session-Id".into(), "sess_res".into())],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "res-mcp", "version": "1.0.0" }
+                }
+            }),
+        ));
+        mcp_http.enqueue(ScriptedHttpResponse::stream(
+            202,
+            vec![],
+            Box::pin(futures_util::stream::empty()),
+        ));
+        mcp_http.enqueue(json_http_response(
+            200,
+            vec![],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [{
+                        "name": "ping_res",
+                        "description": "Resident MCP ping",
+                        "inputSchema": { "type": "object", "properties": {} }
+                    }]
+                }
+            }),
+        ));
+        let mcp_client = Arc::new(McpClient::with_http(
+            mcp_http,
+            "https://mcp.example.invalid/mcp",
+            vec![],
+        ));
+        mcp_client
+            .initialize("pikra-test", "0.1.0", CancelToken::new())
+            .await
+            .unwrap();
+        session
+            .attach_mcp_client(
+                mcp_client,
+                McpToolRegistrationMode::Resident,
+                Some("mcp"),
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // (#38) Delete the last skill and reload_skills().
+        std::fs::remove_file(&skill_file).unwrap();
+        assert!(
+            session.reload_skills(),
+            "deleting last skill must enqueue an empty <available_skills> update"
+        );
+
+        llm_http.enqueue_sse(openai_sse_text("b2", "Reply B"));
+        session.prompt("Turn 2").await.unwrap();
+
+        let reqs = llm_http.requests();
+        assert_eq!(reqs[1].body_json["instructions"], "Prompt B");
+        let turn2_tools: Vec<&str> = reqs[1].body_json["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(turn2_tools.contains(&"mcp_ping_res"));
+        assert!(turn2_tools.contains(&CODEMODE_EXEC_TOOL_NAME));
+        assert!(
+            reqs[1]
+                .body_json
+                .to_string()
+                .contains("<available_skills>\\n</available_skills>")
+        );
+        // Conversation history from Turn 1 preserved.
+        assert!(reqs[1].body_json.to_string().contains("Reply A"));
+        // Subsequent reload with still 0 skills is a NO-OP.
+        assert!(!session.reload_skills());
+
+        // Reopen persisted session and verify Prompt B + resident MCP tool persisted.
+        let reopened = KitSession::new(
+            llm_provider,
+            KitSessionConfig::new(test_model())
+                .with_system_prompt("IGNORED")
+                .with_store(Arc::new(JsonlSessionStore::new(&session_path))),
+        )
+        .unwrap();
+        assert_eq!(reopened.system_prompt(), "Prompt B");
+    });
+
+    // 2. (#18) Dropping an unpolled prompt_stream does not drop queued set_context blocks.
+    block_on(async {
+        let llm_http = Arc::new(FauxTransport::new());
+        let session = KitSession::new(
+            Arc::new(Client::new(llm_http.clone())),
+            KitSessionConfig::new(test_model()),
+        )
+        .unwrap();
+
+        assert!(session.set_context("env", "staging-unpolled"));
+        {
+            let unpolled = session.prompt_stream("never polled").unwrap();
+            assert!(session.is_running());
+            drop(unpolled);
+        }
+        assert!(!session.is_running());
+
+        llm_http.enqueue_sse(openai_sse_text("u1", "Got staging context."));
+        session.prompt("actual prompt").await.unwrap();
+        let reqs = llm_http.requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].body_json.to_string().contains("staging-unpolled"),
+            "context block must still be delivered after dropping an unpolled prompt_stream"
+        );
+    });
+
+    // 3. (#17) Manual compact() guards against concurrent prompt/stream/mutations until committed.
+    block_on(async {
+        struct GatedCompaction {
+            started: std::sync::Mutex<Option<futures_channel::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<Option<futures_channel::oneshot::Receiver<()>>>,
+        }
+        impl CompactionStrategy for GatedCompaction {
+            fn compact<'a>(
+                &'a self,
+                _provider: &'a dyn pikra_ai::StreamProvider,
+                input: CompactionInput,
+            ) -> pikra_ai::BoxFuture<'a, Result<CompactionOutput, SessionError>> {
+                Box::pin(async move {
+                    let started_tx = self.started.lock().unwrap().take();
+                    if let Some(tx) = started_tx {
+                        let _ = tx.send(());
+                    }
+                    let release_rx = self.release.lock().unwrap().take();
+                    if let Some(rx) = release_rx {
+                        let _ = rx.await;
+                    }
+                    Ok(CompactionOutput {
+                        summary: "Compacted summary".into(),
+                        first_kept_entry_id: input.first_kept_entry_id,
+                        usage: None,
+                    })
+                })
+            }
+        }
+
+        let (started_tx, started_rx) = futures_channel::oneshot::channel();
+        let (release_tx, release_rx) = futures_channel::oneshot::channel();
+        let strategy = Arc::new(GatedCompaction {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        });
+
+        let llm_http = Arc::new(FauxTransport::new());
+        let session = KitSession::new(
+            Arc::new(Client::new(llm_http.clone())),
+            KitSessionConfig::new(test_model()).with_compaction_strategy(strategy),
+        )
+        .unwrap();
+
+        llm_http.enqueue_sse(openai_sse_text("c1", "Turn 1 reply"));
+        session.prompt("Turn 1").await.unwrap();
+        let leaf = session.leaf_id().unwrap();
+
+        let compact_fut = session.compact();
+        let probe_fut = async {
+            started_rx.await.unwrap();
+            assert!(session.is_running());
+            assert!(matches!(
+                session.prompt("concurrent").await,
+                Err(pikra_kit::KitError::Busy)
+            ));
+            assert!(matches!(
+                session.prompt_stream("concurrent"),
+                Err(pikra_kit::KitError::Busy)
+            ));
+            assert!(matches!(
+                session.fork(&leaf),
+                Err(pikra_kit::KitError::Busy)
+            ));
+            assert!(matches!(
+                session.set_model(test_model()),
+                Err(pikra_kit::KitError::Busy)
+            ));
+            assert!(matches!(
+                session.upsert_tools(vec![]),
+                Err(pikra_kit::KitError::Busy)
+            ));
+            assert!(matches!(
+                session.remove_tools(&["x"]),
+                Err(pikra_kit::KitError::Busy)
+            ));
+            release_tx.send(()).unwrap();
+        };
+
+        let (compact_res, ()) = futures_util::future::join(compact_fut, probe_fut).await;
+        assert!(compact_res.unwrap().is_some());
+        assert!(!session.is_running());
+
+        llm_http.enqueue_sse(openai_sse_text("c2", "After compaction"));
+        session.prompt("Turn 2").await.unwrap();
+    });
+
+    // 4. (#29 & #30) MCP HTTP clears stale session_id on 404/initialize & replies to SSE ping.
+    block_on(async {
+        let mcp_http = Arc::new(FauxTransport::new());
+        // 1. First initialize -> sess_old
+        mcp_http.enqueue(json_http_response(
+            200,
+            vec![("Mcp-Session-Id".into(), "sess_old".into())],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "faux-mcp", "version": "1.0.0" }
+                }
+            }),
+        ));
+        // 2. notifications/initialized -> 202
+        mcp_http.enqueue(ScriptedHttpResponse::stream(
+            202,
+            vec![],
+            Box::pin(futures_util::stream::empty()),
+        ));
+        // 3. tools/list with stale sess_old -> 404 Not Found
+        mcp_http.enqueue(json_http_response(
+            404,
+            vec![],
+            json!({ "error": "session expired" }),
+        ));
+        // 4. Re-initialize -> must NOT send Mcp-Session-Id; server issues sess_new
+        mcp_http.enqueue(json_http_response(
+            200,
+            vec![("Mcp-Session-Id".into(), "sess_new".into())],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "faux-mcp", "version": "1.0.0" }
+                }
+            }),
+        ));
+        // 5. notifications/initialized -> 202
+        mcp_http.enqueue(ScriptedHttpResponse::stream(
+            202,
+            vec![],
+            Box::pin(futures_util::stream::empty()),
+        ));
+        // 6. tools/call SSE stream: server sends `ping` request BEFORE returning tool result!
+        mcp_http.enqueue_sse([
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-ping-1\",\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"pong-ok\"}],\"isError\":false}}\n\n",
+        ]);
+        // 7. HTTP 202 response for client's POST reply to server's `ping`
+        mcp_http.enqueue(ScriptedHttpResponse::stream(
+            202,
+            vec![],
+            Box::pin(futures_util::stream::empty()),
+        ));
+
+        let transport = Arc::new(pikra_kit::StreamableHttpMcpTransport::new(
+            mcp_http.clone(),
+            "https://mcp.example.invalid/mcp",
+            vec![],
+        ));
+        let client = McpClient::new(transport.clone());
+
+        client
+            .initialize("pikra-test", "0.1.0", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(transport.session_id().as_deref(), Some("sess_old"));
+
+        // 404 must clear stored session_id.
+        assert!(client.list_tools(CancelToken::new()).await.is_err());
+        assert_eq!(transport.session_id(), None);
+
+        // Re-initialize sends NO stale Mcp-Session-Id and captures sess_new.
+        client
+            .initialize("pikra-test", "0.1.0", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(transport.session_id().as_deref(), Some("sess_new"));
+
+        // tools/call over SSE must reply to server `ping` and return tool result.
+        let call_res = client
+            .call_tool("echo", json!({}), CancelToken::new())
+            .await
+            .unwrap();
+        assert!(!call_res.is_error);
+        match &call_res.content[0] {
+            ContentPart::Text(t) => assert_eq!(t.text, "pong-ok"),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        let reqs = mcp_http.requests();
+        assert_eq!(reqs.len(), 7);
+        assert_eq!(reqs[2].header("mcp-session-id"), Some("sess_old"));
+        assert_eq!(
+            reqs[3].header("mcp-session-id"),
+            None,
+            "re-initialize must not send expired Mcp-Session-Id"
+        );
+        assert_eq!(reqs[4].header("mcp-session-id"), Some("sess_new"));
+        // Request 6 is the client's JSON-RPC reply to the server's SSE ping.
+        assert_eq!(
+            reqs[6].body_json,
+            json!({ "jsonrpc": "2.0", "id": "srv-ping-1", "result": {} })
+        );
+        assert_eq!(reqs[6].header("mcp-session-id"), Some("sess_new"));
+    });
+}

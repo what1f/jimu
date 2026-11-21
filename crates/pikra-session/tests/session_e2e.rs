@@ -433,3 +433,227 @@ fn auto_compaction_preserves_prompt_prefix_folds_repeated_and_restores_context()
         assert_eq!(custom_res.summary, "custom-injected(prev=true)");
     });
 }
+
+#[test]
+fn review_regressions_baseline_update_flush_retry_output_tokens_and_oversized_turn() {
+    use pikra_session::{MemorySessionStore, SessionEntry, SessionHeader, SessionStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. (#8) Latest SystemBaseline wins on reconstruct_context & reopen while keeping history.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("baseline.jsonl");
+    let mut mgr = SessionManager::open(
+        Arc::new(JsonlSessionStore::new(&path)),
+        SessionConfig::new("System Prompt A", resident_tools()),
+    )
+    .unwrap();
+    mgr.append_message(AgentMessage::Llm(Message::User(UserMessage::text(
+        "Hello before update",
+        10,
+    ))))
+    .unwrap();
+    let mut updated_tools = resident_tools();
+    updated_tools.push(ToolDefinition {
+        name: "extra_tool".into(),
+        description: "Extra tool".into(),
+        parameters: obj_schema(Vec::<(&str, pikra_schema::Schema, bool)>::new()),
+    });
+    mgr.append_system_baseline("System Prompt B", updated_tools.clone())
+        .unwrap();
+
+    let recon = mgr.reconstruct_context();
+    assert_eq!(recon.system_prompt, "System Prompt B");
+    assert_eq!(recon.tools, updated_tools);
+    assert_eq!(recon.messages.len(), 2);
+    match &recon.messages[0] {
+        AgentMessage::Llm(Message::System(sys)) => {
+            assert_eq!(sys.content, "System Prompt B");
+            assert_eq!(sys.tools_added, updated_tools);
+        }
+        other => panic!("expected System message at index 0, got {other:?}"),
+    }
+
+    let reopened = SessionManager::open(
+        Arc::new(JsonlSessionStore::new(&path)),
+        SessionConfig::new("IGNORED", vec![]),
+    )
+    .unwrap();
+    let reopened_recon = reopened.reconstruct_context();
+    assert_eq!(reopened_recon.system_prompt, "System Prompt B");
+    assert_eq!(reopened_recon.tools, updated_tools);
+
+    // 2. (#19) Transient store error during flush_pending_context preserves unwritten items for retry.
+    struct FlakyAppendStore {
+        inner: MemorySessionStore,
+        fail_on_call: AtomicUsize,
+        append_calls: AtomicUsize,
+    }
+    impl SessionStore for FlakyAppendStore {
+        fn load(&self) -> Result<(Option<SessionHeader>, Vec<SessionEntry>), SessionError> {
+            self.inner.load()
+        }
+        fn write_header(&self, header: &SessionHeader) -> Result<(), SessionError> {
+            self.inner.write_header(header)
+        }
+        fn append_entry(&self, entry: &SessionEntry) -> Result<(), SessionError> {
+            let n = self.append_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.fail_on_call.load(Ordering::SeqCst) {
+                return Err(SessionError::Io(std::io::Error::other(
+                    "simulated transient disk failure",
+                )));
+            }
+            self.inner.append_entry(entry)
+        }
+    }
+
+    // Call 1 = SystemBaseline, Call 2 = named "k1" (succeeds), Call 3 = named "k2" (fails once).
+    let flaky_store = Arc::new(FlakyAppendStore {
+        inner: MemorySessionStore::new(),
+        fail_on_call: AtomicUsize::new(3),
+        append_calls: AtomicUsize::new(0),
+    });
+    let mut flaky_mgr =
+        SessionManager::open(flaky_store, SessionConfig::new("Base", vec![])).unwrap();
+    assert!(flaky_mgr.set_context("k1", "v1"));
+    assert!(flaky_mgr.set_context("k2", "v2"));
+    flaky_mgr.append_context("ephemeral-1");
+    assert!(flaky_mgr.flush_pending_context().is_err());
+    assert!(
+        flaky_mgr.has_pending_context(),
+        "unwritten named and ephemeral context blocks must stay pending after error"
+    );
+
+    let retry_appended = flaky_mgr.flush_pending_context().unwrap();
+    assert_eq!(
+        retry_appended.len(),
+        2,
+        "only k2 and ephemeral-1 should flush on retry"
+    );
+    assert!(!flaky_mgr.has_pending_context());
+    let ctx_names: Vec<String> = flaky_mgr
+        .entries()
+        .iter()
+        .filter_map(|e| match &e.payload {
+            SessionEntryPayload::ContextBlock { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ctx_names, vec!["k1", "k2", "context"]);
+
+    // 3. (#20) estimate_context_tokens includes the latest assistant message's output tokens.
+    let large_assistant_with_usage = AgentMessage::Llm(Message::Assistant(AssistantMessage {
+        content: vec![AssistantBlock::Text(TextContent::plain("short"))],
+        api: ApiKind::OpenaiResponses,
+        provider: "openai".into(),
+        model: "gpt-5.4".into(),
+        response_id: None,
+        thinking_level: None,
+        usage: Usage {
+            input: 7_000,
+            output: 10_000,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 17_000,
+            ..Usage::default()
+        },
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        diagnostics: Vec::new(),
+        timestamp: 1,
+        duration_ms: None,
+    }));
+    let est = estimate_context_tokens(&[large_assistant_with_usage]);
+    assert_eq!(est.reported_tokens, 7_000);
+    assert_eq!(est.trailing_tokens, 10_000);
+    assert_eq!(est.total_tokens, 17_000);
+
+    // Fallback to local char estimate when usage.output == 0.
+    let large_assistant_no_out = AgentMessage::Llm(Message::Assistant(AssistantMessage {
+        content: vec![AssistantBlock::Text(TextContent::plain("a".repeat(40_000)))],
+        api: ApiKind::OpenaiResponses,
+        provider: "openai".into(),
+        model: "gpt-5.4".into(),
+        response_id: None,
+        thinking_level: None,
+        usage: Usage {
+            input: 7_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 7_000,
+            ..Usage::default()
+        },
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        diagnostics: Vec::new(),
+        timestamp: 2,
+        duration_ms: None,
+    }));
+    let est_fallback = estimate_context_tokens(&[large_assistant_no_out]);
+    assert_eq!(est_fallback.total_tokens, 17_000);
+
+    // 4. (#21) Oversized latest turn exceeding keep_recent_tokens must NOT be kept verbatim.
+    let mut oversized_mgr = SessionManager::in_memory(
+        SessionConfig::new("Base", vec![]).with_compaction(CompactionConfig {
+            enabled: true,
+            compaction_reserve_tokens: Some(200),
+            keep_recent_tokens: 20,
+            max_summary_chars: 1_000,
+            custom_instructions: None,
+        }),
+    )
+    .unwrap();
+    oversized_mgr
+        .append_message(AgentMessage::Llm(Message::User(UserMessage::text(
+            "Turn 1", 1,
+        ))))
+        .unwrap();
+    oversized_mgr
+        .append_message(AgentMessage::Llm(Message::Assistant(AssistantMessage {
+            content: vec![AssistantBlock::Text(TextContent::plain("Ok 1"))],
+            api: ApiKind::OpenaiResponses,
+            provider: "openai".into(),
+            model: "gpt-5.4".into(),
+            response_id: None,
+            thinking_level: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            diagnostics: Vec::new(),
+            timestamp: 2,
+            duration_ms: None,
+        })))
+        .unwrap();
+    oversized_mgr
+        .append_message(AgentMessage::Llm(Message::User(UserMessage::text(
+            "x".repeat(40_000),
+            3,
+        ))))
+        .unwrap();
+    oversized_mgr
+        .append_message(AgentMessage::Llm(Message::Assistant(AssistantMessage {
+            content: vec![AssistantBlock::Text(TextContent::plain("y".repeat(40_000)))],
+            api: ApiKind::OpenaiResponses,
+            provider: "openai".into(),
+            model: "gpt-5.4".into(),
+            response_id: None,
+            thinking_level: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            diagnostics: Vec::new(),
+            timestamp: 4,
+            duration_ms: None,
+        })))
+        .unwrap();
+
+    let model = test_model(100_000, 4_096);
+    let prepared = oversized_mgr
+        .prepare_compaction(&model, SimpleStreamOptions::default())
+        .expect("compaction should be prepared");
+    assert!(
+        prepared.input.first_kept_entry_id.is_empty(),
+        "oversized last turn exceeding keep_recent_tokens must be compacted, got kept id: {}",
+        prepared.input.first_kept_entry_id
+    );
+}

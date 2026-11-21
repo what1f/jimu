@@ -23,6 +23,7 @@ struct AgentToolCodemodeBridge {
     tool: Arc<dyn AgentTool>,
     middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
     outer_cancel: CancelToken,
+    sequential_lock: Arc<futures_util::lock::Mutex<()>>,
 }
 
 impl AgentToolCodemodeBridge {
@@ -30,12 +31,14 @@ impl AgentToolCodemodeBridge {
         tool: Arc<dyn AgentTool>,
         middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
         outer_cancel: CancelToken,
+        sequential_lock: Arc<futures_util::lock::Mutex<()>>,
     ) -> Self {
         Self {
             definition: tool.definition(),
             tool,
             middlewares,
             outer_cancel,
+            sequential_lock,
         }
     }
 }
@@ -59,6 +62,21 @@ impl CodemodeTool for AgentToolCodemodeBridge {
         ctx: CodemodeToolContext,
     ) -> pikra_codemode::BoxFuture<'_, Result<Value, String>> {
         Box::pin(async move {
+            if ctx.is_aborted() || self.outer_cancel.is_cancelled() {
+                return Err("Execution aborted".to_string());
+            }
+
+            let _seq_guard = if self.tool.execution_mode() == ToolExecutionMode::Sequential {
+                let mut lock_fut = Box::pin(self.sequential_lock.lock());
+                let cancel_fut = Box::pin(self.outer_cancel.cancelled());
+                match select(lock_fut.as_mut(), cancel_fut).await {
+                    Either::Left((guard, _)) => Some(guard),
+                    Either::Right(((), _)) => return Err("Execution aborted".to_string()),
+                }
+            } else {
+                None
+            };
+
             if ctx.is_aborted() || self.outer_cancel.is_cancelled() {
                 return Err("Execution aborted".to_string());
             }
@@ -196,6 +214,12 @@ impl CodemodeExecTool {
         deferred_registry: Arc<DeferredToolRegistry>,
         sandbox_options: CodemodeSandboxOptions,
     ) -> Self {
+        {
+            // Defense-in-depth: never self-retain `exec` inside the shared resident tool list
+            // (prevents an Arc reference cycle leaking user tools when sessions drop).
+            let mut guard = resident_tools.lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|t| t.definition().name != CODEMODE_EXEC_TOOL_NAME);
+        }
         Self {
             resident_tools,
             deferred_registry,
@@ -259,6 +283,9 @@ impl AgentTool for CodemodeExecTool {
             let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64);
 
             // Snapshot resident + deferred tools, strictly excluding `exec` itself.
+            // Share one async mutex across all bridged tools so `ToolExecutionMode::Sequential`
+            // tools never overlap under `Promise.all`, while `Parallel` tools run concurrently.
+            let sequential_lock = Arc::new(futures_util::lock::Mutex::new(()));
             let mut bridged: Vec<Arc<dyn CodemodeTool>> = Vec::new();
             let mut seen_names: HashSet<String> = HashSet::new();
             seen_names.insert(CODEMODE_EXEC_TOOL_NAME.to_string());
@@ -275,6 +302,7 @@ impl AgentTool for CodemodeExecTool {
                         tool,
                         self.middlewares.clone(),
                         cancel.clone(),
+                        Arc::clone(&sequential_lock),
                     )));
                 }
             }
@@ -285,6 +313,7 @@ impl AgentTool for CodemodeExecTool {
                         tool,
                         self.middlewares.clone(),
                         cancel.clone(),
+                        Arc::clone(&sequential_lock),
                     )));
                 }
             }

@@ -152,6 +152,9 @@ pub trait McpTransport: Send + Sync {
     /// Optional hook to inform the transport of the negotiated MCP protocol version.
     fn set_protocol_version(&self, _version: String) {}
 
+    /// Optional hook to clear transport-level session state before a fresh `initialize` handshake.
+    fn reset_session(&self) {}
+
     /// Close the transport cleanly.
     fn close(&self) -> BoxFuture<'_, Result<(), McpError>> {
         Box::pin(async { Ok(()) })
@@ -226,6 +229,13 @@ impl StreamableHttpMcpTransport {
         out
     }
 
+    fn clear_session_id(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_id = None;
+    }
+
     fn capture_response_headers(&self, headers: &[(String, String)]) {
         if let Some((_, sid)) = headers
             .iter()
@@ -235,6 +245,63 @@ impl StreamableHttpMcpTransport {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.session_id = Some(sid.trim().to_string());
         }
+    }
+
+    async fn respond_to_inbound_sse_requests(&self, value: &Value, cancel: &CancelToken) {
+        let mut replies = Vec::new();
+        collect_inbound_request_replies(value, &mut replies);
+        for reply in replies {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let Ok(body_bytes) = serde_json::to_vec(&reply) else {
+                continue;
+            };
+            let req = HttpRequest {
+                method: "POST".into(),
+                url: self.url.clone(),
+                headers: self.build_headers(),
+                body: Bytes::from(body_bytes),
+                timeout_ms: None,
+            };
+            if let Ok(resp) = self.http.send(req, cancel.clone()).await {
+                let _ = read_all_bytes(resp.body, cancel).await;
+            }
+        }
+    }
+}
+
+fn collect_inbound_request_replies(value: &Value, out: &mut Vec<Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_inbound_request_replies(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(method) = map.get("method").and_then(Value::as_str)
+                && let Some(req_id) = map.get("id").filter(|v| !v.is_null())
+            {
+                let reply = if method == "ping" {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {},
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("Method not found: {method}"),
+                        },
+                    })
+                };
+                out.push(reply);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -311,6 +378,10 @@ impl McpTransport for StreamableHttpMcpTransport {
                 return Err(McpError::Cancelled);
             }
 
+            if method == "initialize" {
+                self.clear_session_id();
+            }
+
             let mut body_obj = serde_json::Map::new();
             body_obj.insert("jsonrpc".into(), json!("2.0"));
             body_obj.insert("id".into(), json!(id));
@@ -320,18 +391,25 @@ impl McpTransport for StreamableHttpMcpTransport {
             }
             let body_bytes = Bytes::from(serde_json::to_vec(&Value::Object(body_obj))?);
 
+            let headers = self.build_headers();
+            let sent_session_id = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"));
+
             let req = HttpRequest {
                 method: "POST".into(),
                 url: self.url.clone(),
-                headers: self.build_headers(),
+                headers,
                 body: body_bytes,
                 timeout_ms: None,
             };
 
             let resp = self.http.send(req, cancel.clone()).await?;
-            self.capture_response_headers(&resp.headers);
 
             if resp.status >= 400 {
+                if resp.status == 404 && sent_session_id {
+                    self.clear_session_id();
+                }
                 let raw = read_all_bytes(resp.body, &cancel).await.unwrap_or_default();
                 let body_text = String::from_utf8_lossy(&raw).into_owned();
                 return Err(McpError::Transport(TransportError::HttpStatus {
@@ -340,6 +418,7 @@ impl McpTransport for StreamableHttpMcpTransport {
                     body: body_text,
                 }));
             }
+            self.capture_response_headers(&resp.headers);
 
             let content_type = header_value(&resp.headers, "content-type")
                 .and_then(|ct| ct.split(';').next())
@@ -347,7 +426,7 @@ impl McpTransport for StreamableHttpMcpTransport {
                 .unwrap_or_else(|| "application/json".into());
 
             if content_type == "text/event-stream" {
-                let mut sse = SseStream::new(resp.body, cancel);
+                let mut sse = SseStream::new(resp.body, cancel.clone());
                 while let Some(ev_res) = sse.next().await {
                     let ev = ev_res?;
                     let data = ev.data.trim();
@@ -358,6 +437,7 @@ impl McpTransport for StreamableHttpMcpTransport {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    self.respond_to_inbound_sse_requests(&parsed, &cancel).await;
                     if let Some(matched) = extract_matching_response(parsed, id)? {
                         return Ok(matched);
                     }
@@ -396,18 +476,25 @@ impl McpTransport for StreamableHttpMcpTransport {
             }
             let body_bytes = Bytes::from(serde_json::to_vec(&Value::Object(body_obj))?);
 
+            let headers = self.build_headers();
+            let sent_session_id = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"));
+
             let req = HttpRequest {
                 method: "POST".into(),
                 url: self.url.clone(),
-                headers: self.build_headers(),
+                headers,
                 body: body_bytes,
                 timeout_ms: None,
             };
 
             let resp = self.http.send(req, cancel.clone()).await?;
-            self.capture_response_headers(&resp.headers);
 
             if resp.status >= 400 {
+                if resp.status == 404 && sent_session_id {
+                    self.clear_session_id();
+                }
                 let raw = read_all_bytes(resp.body, &cancel).await.unwrap_or_default();
                 let body_text = String::from_utf8_lossy(&raw).into_owned();
                 return Err(McpError::Transport(TransportError::HttpStatus {
@@ -416,6 +503,7 @@ impl McpTransport for StreamableHttpMcpTransport {
                     body: body_text,
                 }));
             }
+            self.capture_response_headers(&resp.headers);
             Ok(())
         })
     }
@@ -425,6 +513,12 @@ impl McpTransport for StreamableHttpMcpTransport {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .protocol_version = Some(version);
+    }
+
+    fn reset_session(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.session_id = None;
+        guard.protocol_version = None;
     }
 
     fn close(&self) -> BoxFuture<'_, Result<(), McpError>> {
@@ -1032,6 +1126,7 @@ impl McpClient {
         client_version: &str,
         cancel: CancelToken,
     ) -> Result<McpInitializeResult, McpError> {
+        self.transport.reset_session();
         let params = json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {},

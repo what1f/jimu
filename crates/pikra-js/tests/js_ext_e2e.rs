@@ -569,3 +569,125 @@ pikra.registerTool({
     });
     assert_eq!(last_text.as_deref(), Some("Recovered after hook timeout"));
 }
+
+#[test]
+fn js_extension_top_level_await_and_concurrent_reload_generation() {
+    // 1. (#31) ESM extension using top-level `await` before `export default`.
+    let tla_ext = r#"
+const greeting = await Promise.resolve("top-level-ready");
+
+export default function (pikra) {
+  pikra.registerTool({
+    name: "tla_tool",
+    description: "Returns top-level awaited greeting",
+    parameters: {
+      type: "object",
+      properties: { who: { type: "string" } },
+      required: ["who"],
+    },
+    execute(_id, params) {
+      return `${greeting}:${params.who}`;
+    },
+  });
+}
+"#;
+    let runtime = JsExtensionRuntime::new(JsExtensionConfig::new().with_inline("tla.mjs", tla_ext))
+        .expect("top-level await ESM extension must load cleanly");
+    let tools = runtime.tools();
+    assert_eq!(tools.len(), 1);
+    let out = block_on(tools[0].execute(
+        "tc_tla".into(),
+        json!({ "who": "world" }),
+        pikra_ai::CancelToken::new(),
+        Arc::new(|_| {}),
+    ))
+    .expect("tla_tool executes");
+    match &out.content[0] {
+        ContentPart::Text(t) => assert_eq!(t.text, "top-level-ready:world"),
+        other => panic!("expected text, got {other:?}"),
+    }
+
+    // Rejected top-level await fails initialization cleanly.
+    let tla_reject = r#"
+await Promise.reject(new Error("init boom"));
+export default function () {}
+"#;
+    assert!(
+        JsExtensionRuntime::new(JsExtensionConfig::new().with_inline("tla-err.mjs", tla_reject))
+            .is_err()
+    );
+
+    // 2. (#32) Concurrent reloads publish monotonic generation consistent with the active VM.
+    let dir = tempdir().expect("create tempdir");
+    let ext_path = dir.path().join("concurrent.js");
+    let write_version = |ver: u32, with_hook: bool| {
+        let hook_code = if with_hook {
+            format!(r#"pikra.on("prepare_request", () => ({{ systemPrompt: "v{ver}" }}));"#)
+        } else {
+            String::new()
+        };
+        let code = format!(
+            r#"
+export default function (pikra) {{
+  pikra.registerTool({{
+    name: "ver_tool",
+    description: "version {ver}",
+    parameters: {{ type: "object", properties: {{}} }},
+    execute() {{ return "v{ver}"; }},
+  }});
+  {hook_code}
+}}
+"#
+        );
+        fs::write(&ext_path, code).expect("write version");
+    };
+
+    write_version(1, false);
+    let shared_rt = Arc::new(
+        JsExtensionRuntime::new(JsExtensionConfig::new().with_file(&ext_path)).expect("load v1"),
+    );
+
+    // Trigger concurrent reloads across threads while updating file versions, then settle on final version.
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let rt = Arc::clone(&shared_rt);
+        let b = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            rt.reload()
+        }));
+    }
+    write_version(2, true);
+    barrier.wait();
+    for h in handles {
+        h.join()
+            .expect("thread join")
+            .expect("concurrent reload ok");
+    }
+
+    // Final published metadata and hook_mask must match what the active VM executes.
+    let tool = shared_rt.tools().into_iter().next().expect("ver_tool");
+    let exec_res = block_on(tool.execute(
+        "tc_ver".into(),
+        json!({}),
+        pikra_ai::CancelToken::new(),
+        Arc::new(|_| {}),
+    ))
+    .expect("ver_tool executes");
+    let active_ver = match &exec_res.content[0] {
+        ContentPart::Text(t) => t.text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    let desc = shared_rt.tool_definitions()[0].description.clone();
+    assert_eq!(
+        desc,
+        format!("version {}", active_ver.trim_start_matches('v')),
+        "published registry tool definition must match active VM version"
+    );
+    assert_eq!(
+        shared_rt.has_hook(HookKind::PrepareRequest),
+        active_ver == "v2",
+        "published hook_mask must match active VM version"
+    );
+}

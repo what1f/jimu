@@ -306,7 +306,7 @@ impl VmInstance {
             Done,
             PendingModule {
                 eval_promise: Persistent<Promise<'static>>,
-                default_fn: Option<Persistent<Function<'static>>>,
+                namespace: Persistent<Object<'static>>,
             },
             DefaultFn(Persistent<Function<'static>>),
         }
@@ -319,15 +319,26 @@ impl VmInstance {
                         let (evaluated, eval_promise) = declared
                             .eval()
                             .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-                        let default_fn = extract_default_fn(&ctx, &evaluated, &self.interrupt)?;
 
                         match eval_promise.state() {
-                            PromiseState::Pending => Ok(EvalOutcome::PendingModule {
-                                eval_promise: Persistent::save(&ctx, eval_promise),
-                                default_fn: default_fn.map(|f| Persistent::save(&ctx, f)),
-                            }),
+                            PromiseState::Pending => {
+                                // Do NOT read `default` yet: top-level `await` leaves exports in
+                                // TDZ until `eval_promise` settles. Save the live namespace object.
+                                let ns = evaluated
+                                    .namespace()
+                                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                                Ok(EvalOutcome::PendingModule {
+                                    eval_promise: Persistent::save(&ctx, eval_promise),
+                                    namespace: Persistent::save(&ctx, ns),
+                                })
+                            }
                             PromiseState::Resolved => {
                                 let _ = eval_promise.result::<Value<'_>>();
+                                let ns = evaluated
+                                    .namespace()
+                                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                                let default_fn =
+                                    extract_default_fn_from_ns(&ctx, &ns, &self.interrupt)?;
                                 Ok(match default_fn {
                                     Some(f) => EvalOutcome::DefaultFn(Persistent::save(&ctx, f)),
                                     None => EvalOutcome::Done,
@@ -368,10 +379,19 @@ impl VmInstance {
             EvalOutcome::DefaultFn(f) => Some(f),
             EvalOutcome::PendingModule {
                 eval_promise,
-                default_fn,
+                namespace,
             } => {
-                self.settle_promise_void(eval_promise)?;
-                default_fn
+                if let Err(err) = self.settle_promise_void(eval_promise) {
+                    drop(namespace);
+                    return Err(err);
+                }
+                self.context.with(|ctx| {
+                    let ns = namespace
+                        .restore(&ctx)
+                        .map_err(|err| JsExtensionError::Script(err.to_string()))?;
+                    let func = extract_default_fn_from_ns(&ctx, &ns, &self.interrupt)?;
+                    Ok(func.map(|f| Persistent::save(&ctx, f)))
+                })?
             }
         };
 
@@ -637,14 +657,11 @@ fn extract_opt_string<'js>(
     Ok(Some(s))
 }
 
-fn extract_default_fn<'js>(
+fn extract_default_fn_from_ns<'js>(
     ctx: &Ctx<'js>,
-    evaluated: &Module<'js, rquickjs::module::Evaluated>,
+    ns: &Object<'js>,
     interrupt: &InterruptState,
 ) -> Result<Option<Function<'js>>, JsExtensionError> {
-    let ns = evaluated
-        .namespace()
-        .map_err(|err| classify_js_error(ctx, err, interrupt))?;
     let default_val: Value<'_> = ns
         .get("default")
         .map_err(|err| classify_js_error(ctx, err, interrupt))?;
@@ -758,8 +775,10 @@ fn run_worker_loop(
     init_tx: mpsc::Sender<Result<RegistrySnapshot, JsExtensionError>>,
     rx: mpsc::Receiver<WorkerCmd>,
 ) {
+    let mut generation: u64 = 1;
     let mut active_vm = match VmInstance::build(&limits, &initial_sources) {
-        Ok((vm, snapshot)) => {
+        Ok((vm, mut snapshot)) => {
+            snapshot.generation = generation;
             let _ = init_tx.send(Ok(snapshot));
             vm
         }
@@ -775,7 +794,9 @@ fn run_worker_loop(
                 // Build the new VM completely BEFORE dropping the active VM so failed reloads
                 // leave the previous active VM intact (atomic swap).
                 match VmInstance::build(&limits, &sources) {
-                    Ok((new_vm, snapshot)) => {
+                    Ok((new_vm, mut snapshot)) => {
+                        generation = generation.saturating_add(1);
+                        snapshot.generation = generation;
                         active_vm = new_vm;
                         let _ = reply.send(Ok(snapshot));
                     }

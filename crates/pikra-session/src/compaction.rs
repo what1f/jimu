@@ -194,34 +194,41 @@ pub fn estimate_agent_message_tokens(msg: &AgentMessage) -> u64 {
     }
 }
 
-fn reported_prompt_tokens(usage: &Usage) -> u64 {
-    let prompt_sum = usage
-        .input
-        .saturating_add(usage.cache_read)
-        .saturating_add(usage.cache_write);
-    if prompt_sum > 0 {
-        prompt_sum
-    } else {
-        usage.total_tokens
-    }
-}
-
 /// Estimate context tokens for a reconstructed message list.
 ///
 /// Prefers the last valid assistant turn's reported `usage.input + usage.cache_read + usage.cache_write`
-/// plus locally estimated tokens of messages appended after that assistant turn.
+/// plus that assistant message's output tokens and locally estimated tokens of messages appended
+/// after that assistant turn.
 pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextTokenEstimate {
     for (idx, msg) in messages.iter().enumerate().rev() {
         if let AgentMessage::Llm(Message::Assistant(assistant)) = msg
             && assistant.stop_reason != StopReason::Aborted
             && assistant.stop_reason != StopReason::Error
         {
-            let reported = reported_prompt_tokens(&assistant.usage);
+            let prompt_sum = assistant
+                .usage
+                .input
+                .saturating_add(assistant.usage.cache_read)
+                .saturating_add(assistant.usage.cache_write);
+            let (reported, assistant_output) = if prompt_sum > 0 {
+                let out = if assistant.usage.output > 0 {
+                    assistant.usage.output
+                } else {
+                    estimate_agent_message_tokens(msg)
+                };
+                (prompt_sum, out)
+            } else if assistant.usage.total_tokens > 0 {
+                // `total_tokens` already encompasses both prompt and output tokens when prompt
+                // fields were not broken out separately.
+                (assistant.usage.total_tokens, 0)
+            } else {
+                (0, 0)
+            };
             if reported > 0 {
                 let trailing: u64 = messages[idx + 1..]
                     .iter()
                     .map(estimate_agent_message_tokens)
-                    .fold(0u64, u64::saturating_add);
+                    .fold(assistant_output, u64::saturating_add);
                 return ContextTokenEstimate {
                     total_tokens: reported.saturating_add(trailing),
                     reported_tokens: reported,
@@ -346,6 +353,7 @@ pub(crate) fn select_first_kept_entry_id(
     // Walk backwards accumulating tokens until `keep_recent_tokens` is reached.
     let mut accumulated: u64 = 0;
     let mut chosen_rel: Option<usize> = None;
+    let mut exceeded = false;
     for rel_idx in (0..slice.len()).rev() {
         let entry_tokens = match &slice[rel_idx].payload {
             SessionEntryPayload::Message { message } => estimate_agent_message_tokens(message),
@@ -355,16 +363,31 @@ pub(crate) fn select_first_kept_entry_id(
             _ => 0,
         };
         accumulated = accumulated.saturating_add(entry_tokens);
-        if accumulated >= keep_recent_tokens {
-            // Pick the earliest valid cut candidate at or after `rel_idx`.
+        if accumulated > keep_recent_tokens {
+            exceeded = true;
+            // Including `rel_idx` exceeds `keep_recent_tokens`, so pick the earliest valid
+            // turn-start cut candidate strictly after `rel_idx`.
+            chosen_rel = cut_candidates.iter().copied().find(|&cand| cand > rel_idx);
+            break;
+        }
+        if accumulated == keep_recent_tokens {
+            exceeded = true;
+            // Including `rel_idx` fits exactly within `keep_recent_tokens`.
             chosen_rel = cut_candidates.iter().copied().find(|&cand| cand >= rel_idx);
             break;
         }
     }
 
+    if exceeded {
+        return match chosen_rel {
+            Some(rel) => slice[rel].id.clone(),
+            None => String::new(),
+        };
+    }
+
     // If the whole slice fit inside `keep_recent_tokens`, still compact at least up to the last
     // turn boundary if available, otherwise keep nothing so compaction always makes progress.
-    let rel = chosen_rel.unwrap_or_else(|| *cut_candidates.last().unwrap());
+    let rel = *cut_candidates.last().unwrap();
     slice[rel].id.clone()
 }
 
