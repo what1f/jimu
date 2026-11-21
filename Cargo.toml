@@ -7,6 +7,7 @@ members = [
     "crates/pikra-agent",
     "crates/pikra-codemode",
     "crates/pikra-session",
+    "crates/pikra-durable",
     "crates/pikra-js",
     "crates/pikra-tools",
     "crates/pikra-kit",
@@ -45,6 +46,7 @@ pikra-http = { path = "crates/pikra-http" }
 pikra-agent = { path = "crates/pikra-agent" }
 pikra-codemode = { path = "crates/pikra-codemode" }
 pikra-session = { path = "crates/pikra-session" }
+pikra-durable = { path = "crates/pikra-durable" }
 pikra-js = { path = "crates/pikra-js" }
 pikra-tools = { path = "crates/pikra-tools" }
 pikra-kit = { path = "crates/pikra-kit" }
@@ -65,4 +67,5 @@ uuid = { version = "1.18", features = ["v4", "v7"] }
 rquickjs = { version = "0.14.0", features = ["futures", "loader", "parallel"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "sync", "time", "net", "signal", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3.27"
