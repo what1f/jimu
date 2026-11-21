@@ -1,6 +1,8 @@
 use crate::WorkspaceToolsConfig;
+use crate::seek_sequence::seek_sequence;
 use crate::util::{
-    atomic_write_file_resolved, display_path, lock_path, resolve_path, resolve_write_target,
+    atomic_write_file_resolved, check_cancelled, display_path, path_lock, read_editable_text,
+    resolve_path, resolve_write_target, uses_crlf,
 };
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
@@ -20,126 +22,112 @@ impl EditTool {
     }
 }
 
-struct EditHunk {
-    old_text: String,
-    new_text: String,
+fn parse_hunks(args: &Value) -> Result<Vec<(&str, &str)>, String> {
+    let parse = |item| {
+        let old = edit_arg(item, "oldText", "old_text")?;
+        let new = edit_arg(item, "newText", "new_text")?;
+        if old.is_empty() {
+            return Err("oldText must not be empty".to_owned());
+        }
+        Ok((old, new))
+    };
+    let Some(edits) = args.get("edits") else {
+        return Ok(vec![parse(args)?]);
+    };
+    if ["oldText", "old_text", "newText", "new_text"]
+        .iter()
+        .any(|key| args.get(key).is_some())
+    {
+        return Err("Use one replacement or an edits list".into());
+    }
+    let items = edits
+        .as_array()
+        .filter(|items| !items.is_empty())
+        .ok_or("edits must contain at least one edit")?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| parse(item).map_err(|err| format!("Edit #{}: {err}", i + 1)))
+        .collect()
 }
 
-fn parse_hunks(args: &Value) -> Result<Vec<EditHunk>, String> {
-    let old_text = args.get("oldText").and_then(Value::as_str);
-    let new_text = args.get("newText").and_then(Value::as_str);
-    let edits_arr = args.get("edits").and_then(Value::as_array);
-
-    let has_single = old_text.is_some() || new_text.is_some();
-    let has_multi = edits_arr.is_some();
-
-    if has_single && has_multi {
-        return Err("provide either oldText/newText or edits, not both".to_string());
-    }
-
-    if let Some(items) = edits_arr {
-        if items.is_empty() {
-            return Err("edits must contain at least one edit".to_string());
-        }
-        let mut hunks = Vec::with_capacity(items.len());
-        for (idx, item) in items.iter().enumerate() {
-            let old = item
-                .get("oldText")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("edits[{idx}].oldText must be a string"))?;
-            let new = item
-                .get("newText")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("edits[{idx}].newText must be a string"))?;
-            if old.is_empty() {
-                return Err(format!("edits[{idx}].oldText must not be empty"));
-            }
-            hunks.push(EditHunk {
-                old_text: old.to_string(),
-                new_text: new.to_string(),
-            });
-        }
-        return Ok(hunks);
-    }
-
-    match (old_text, new_text) {
-        (Some(old), Some(new)) => {
-            if old.is_empty() {
-                return Err("oldText must not be empty".to_string());
-            }
-            Ok(vec![EditHunk {
-                old_text: old.to_string(),
-                new_text: new.to_string(),
-            }])
-        }
-        (Some(_), None) => Err("missing required string argument: newText".to_string()),
-        (None, Some(_)) => Err("missing required string argument: oldText".to_string()),
-        (None, None) => Err("provide either oldText and newText, or edits".to_string()),
+fn edit_arg<'a>(item: &'a Value, name: &str, alias: &str) -> Result<&'a str, String> {
+    match (item.get(name), item.get(alias)) {
+        (Some(_), Some(_)) => Err(format!("Supply only one of {name} and {alias}")),
+        (value, alias_value) => value
+            .or(alias_value)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Missing string argument '{name}'")),
     }
 }
 
-fn has_bare_lf(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
-            return true;
+fn replacement_range(text: &str, old: &str) -> Result<std::ops::Range<usize>, String> {
+    if let Some(start) = text.find(old) {
+        if text[start + old.ceil_char_boundary(1)..].contains(old) {
+            return Err(
+                "oldText matches multiple locations. Include more surrounding text.".into(),
+            );
         }
+        return Ok(start..start + old.len());
     }
-    false
+
+    let lines: Vec<_> = text.lines().collect();
+    let pattern: Vec<_> = old.lines().collect();
+    let index = seek_sequence(&lines, &pattern, true)
+        .map_err(|()| "oldText matches multiple locations. Include more surrounding text.")?
+        .ok_or("oldText not found")?;
+    let first = lines[index].as_ptr() as usize - text.as_ptr() as usize;
+    let last = lines[index + pattern.len() - 1];
+    let mut end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+    if old.ends_with('\n') {
+        let suffix = &text[end..];
+        end += if suffix.starts_with("\r\n") {
+            2
+        } else {
+            usize::from(suffix.starts_with('\n'))
+        };
+    }
+    Ok(first..end)
 }
 
 impl AgentTool for EditTool {
     fn definition(&self) -> ToolDefinition {
-        let edit_item_schema = obj_schema([
+        let fields = [
             (
                 "oldText",
-                with_description(str_schema(), "Exact text to find and replace."),
-                true,
+                with_description(str_schema(), "Text to find and replace."),
+                false,
             ),
             (
                 "newText",
                 with_description(str_schema(), "Replacement text."),
-                true,
+                false,
             ),
+            ("old_text", str_schema(), false),
+            ("new_text", str_schema(), false),
+        ];
+        let mut edit_item_schema = obj_schema(fields.clone());
+        edit_item_schema["allOf"] = json!([
+            { "oneOf": [{ "required": ["oldText"] }, { "required": ["old_text"] }] },
+            { "oneOf": [{ "required": ["newText"] }, { "required": ["new_text"] }] }
         ]);
 
         ToolDefinition {
             name: "edit".into(),
-            description: "Apply exact text replacement(s) to an existing UTF-8 file atomically while preserving line endings.".into(),
-            parameters: obj_schema([
-                (
-                    "path",
-                    with_description(
-                        str_schema(),
-                        "Path to the file to edit (relative to workspace cwd or absolute).",
-                    ),
-                    true,
-                ),
-                (
-                    "oldText",
-                    with_description(
-                        str_schema(),
-                        "Exact text to find and replace (for single-hunk edit).",
-                    ),
-                    false,
-                ),
-                (
-                    "newText",
-                    with_description(
-                        str_schema(),
-                        "Replacement text (for single-hunk edit).",
-                    ),
-                    false,
-                ),
-                (
-                    "edits",
-                    with_description(
-                        with_items_bounds(arr_schema(edit_item_schema), Some(1), None),
-                        "Ordered list of atomic exact-match edits to apply to the file.",
-                    ),
-                    false,
-                ),
-            ]),
+            description: "Replace text in a UTF-8 file. Include enough surrounding text to identify each edit.".into(),
+            parameters: obj_schema(
+                [("path", with_description(str_schema(), "Path to the file to edit."), true)]
+                    .into_iter()
+                    .chain(fields)
+                    .chain([(
+                        "edits",
+                        with_description(
+                            with_items_bounds(arr_schema(edit_item_schema), Some(1), None),
+                            "Apply all of these replacements as one edit.",
+                        ),
+                        false,
+                    )]),
+            ),
         }
     }
 
@@ -168,81 +156,34 @@ impl AgentTool for EditTool {
 
             let resolved = resolve_path(&config.cwd, raw_path)?;
             let shown = display_path(&config.cwd, &resolved);
-            let target = resolve_write_target(&resolved).await?;
-            let _path_guard = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err("Operation aborted".into()),
-                guard = lock_path(&target) => guard,
-            };
-            if cancel.is_cancelled() {
-                return Err("Operation aborted".into());
-            }
-
-            let meta = tokio::fs::metadata(&target)
-                .await
-                .map_err(|e| format!("failed to stat '{shown}': {e}"))?;
-            if meta.is_dir() {
-                return Err(format!("cannot edit '{shown}': path is a directory"));
-            }
-            if !meta.is_file() {
-                return Err(format!("cannot edit '{shown}': path is not a regular file"));
-            }
-            if meta.len() > 16 * 1024 * 1024 {
+            let target = resolve_write_target(&resolved)?;
+            let lock = path_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            check_cancelled(&cancel)?;
+            if resolve_write_target(&resolved)? != target {
                 return Err(format!(
-                    "cannot edit '{shown}': file size ({} bytes) exceeds 16 MiB limit",
-                    meta.len()
+                    "'{shown}' changed during the operation. Try again."
                 ));
             }
 
-            let bytes = tokio::fs::read(&target)
-                .await
-                .map_err(|e| format!("failed to read '{shown}': {e}"))?;
-            if bytes.iter().take(8192).any(|&b| b == 0) {
-                return Err(format!("cannot edit binary file '{shown}'"));
-            }
-            let original = String::from_utf8(bytes)
-                .map_err(|_| format!("cannot edit non-UTF-8 file '{shown}'"))?;
-
-            let is_crlf = original.contains("\r\n") && !has_bare_lf(&original);
-            let mut working = if is_crlf {
-                original.replace("\r\n", "\n")
-            } else {
-                original.clone()
-            };
-
-            for (idx, hunk) in hunks.iter().enumerate() {
-                let edit_num = idx + 1;
-                let (old_norm, new_norm) = if is_crlf {
+            let (mut working, _) = read_editable_text(&target, &shown)?;
+            let is_crlf = uses_crlf(&working);
+            for (idx, (old, new)) in hunks.iter().enumerate() {
+                check_cancelled(&cancel)?;
+                let (old, new) = if is_crlf {
                     (
-                        hunk.old_text.replace("\r\n", "\n"),
-                        hunk.new_text.replace("\r\n", "\n"),
+                        old.replace("\r\n", "\n").replace('\n', "\r\n"),
+                        new.replace("\r\n", "\n").replace('\n', "\r\n"),
                     )
                 } else {
-                    (hunk.old_text.clone(), hunk.new_text.clone())
+                    (old.to_string(), new.replace("\r\n", "\n"))
                 };
-
-                let matches = working.matches(&old_norm).count();
-                if matches == 0 {
-                    return Err(format!(
-                        "edit #{edit_num} failed: oldText not found in '{shown}'. Ensure oldText matches the file exactly, including whitespace."
-                    ));
-                }
-                if matches > 1 {
-                    return Err(format!(
-                        "edit #{edit_num} failed: oldText matched {matches} times in '{shown}'. Include more surrounding context to make the match unique."
-                    ));
-                }
-
-                working = working.replacen(&old_norm, &new_norm, 1);
+                let range = replacement_range(&working, &old)
+                    .map_err(|err| format!("Edit #{} in '{shown}': {err}", idx + 1))?;
+                working.replace_range(range, &new);
             }
-
-            let final_content = if is_crlf {
-                working.replace('\n', "\r\n")
-            } else {
-                working
-            };
-
-            atomic_write_file_resolved(&target, final_content.as_bytes()).await?;
+            check_cancelled(&cancel)?;
+            atomic_write_file_resolved(&target, working.as_bytes())?;
 
             let count = hunks.len();
             let mut res = AgentToolResult::text(format!(

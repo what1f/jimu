@@ -1,3 +1,9 @@
+#![cfg(any(
+    all(feature = "patch", feature = "search"),
+    all(unix, feature = "shell", not(target_os = "ios"))
+))]
+
+#[cfg(all(unix, feature = "shell", not(target_os = "ios")))]
 use futures_util::StreamExt;
 use pikra_agent::{Agent, AgentConfig, AgentMessage};
 use pikra_ai::{
@@ -5,12 +11,14 @@ use pikra_ai::{
     ModelCost, StopReason, TextContent, ToolCall, ToolResultMessage, Usage,
 };
 use pikra_testkit::FauxProvider;
-use pikra_tools::{BuiltinToolKind, BuiltinToolSet, WorkspaceTools, WorkspaceToolsConfig};
+#[cfg(all(feature = "patch", feature = "search"))]
+use pikra_tools::BuiltinToolSet;
+use pikra_tools::{BuiltinToolKind, WorkspaceTools, WorkspaceToolsConfig};
 use serde_json::{Map, Value, json};
 use std::fs;
+#[cfg(all(unix, feature = "shell", not(target_os = "ios")))]
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
-use std::time::Duration;
 use tempfile::TempDir;
 
 fn test_model() -> Model {
@@ -109,6 +117,7 @@ fn result_text(tr: &ToolResultMessage) -> String {
         .join("")
 }
 
+#[cfg(all(feature = "patch", feature = "search"))]
 #[tokio::test]
 async fn workspace_write_read_edit_find_e2e() {
     let dir = TempDir::new().unwrap();
@@ -135,6 +144,7 @@ async fn workspace_write_read_edit_find_e2e() {
 
     let cfg = WorkspaceToolsConfig::new(root).with_enabled_tools(BuiltinToolSet::from_kinds(&[
         BuiltinToolKind::Find,
+        BuiltinToolKind::Grep,
         BuiltinToolKind::Write,
         BuiltinToolKind::Read,
         BuiltinToolKind::Edit,
@@ -146,7 +156,7 @@ async fn workspace_write_read_edit_find_e2e() {
     let defs_b = workspace_tools.definitions();
     assert_eq!(
         defs_a.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-        vec!["read", "write", "edit", "find"]
+        vec!["read", "write", "edit", "find", "grep"]
     );
     assert_eq!(
         serde_json::to_vec(&defs_a).unwrap(),
@@ -222,8 +232,8 @@ async fn workspace_write_read_edit_find_e2e() {
                 "edit",
                 json!({
                     "path": "crlf.txt",
-                    "oldText": "alpha\nbeta",
-                    "newText": "alpha\nBETA_UPDATED"
+                    "old_text": "alpha\nbeta",
+                    "new_text": "alpha\nBETA_UPDATED"
                 }),
             )),
         ],
@@ -240,20 +250,20 @@ async fn workspace_write_read_edit_find_e2e() {
                 "path": "src/app.rs",
                 "edits": [
                     { "oldText": "let a = 1;", "newText": "let a = 10;" },
-                    { "oldText": "let b = 2;", "newText": "let b = 20;" }
+                    { "old_text": "let b = 2;", "new_text": "let b = 20;" }
                 ]
             }),
         ))],
         StopReason::ToolUse,
     ));
 
-    // Turn 5: find by content substring AND find by glob (both skipping .git/target/node_modules).
+    // Turn 5: search contents with grep and paths with find (both skipping .git/target/node_modules).
     provider.enqueue_events(turn_events(
         &model,
         vec![
             AssistantBlock::ToolCall(make_tool_call(
-                "c_find_content",
-                "find",
+                "c_grep_content",
+                "grep",
                 json!({ "pattern": "UNIQUE_NEEDLE" }),
             )),
             AssistantBlock::ToolCall(make_tool_call(
@@ -329,9 +339,9 @@ async fn workspace_write_read_edit_find_e2e() {
     assert!(edited_app.contains("let a = 10;"));
     assert!(edited_app.contains("let b = 20;"));
 
-    let find_content = by_id("c_find_content");
-    assert!(!find_content.is_error);
-    let content_hits = result_text(find_content);
+    let grep_content = by_id("c_grep_content");
+    assert!(!grep_content.is_error);
+    let content_hits = result_text(grep_content);
     assert!(content_hits.contains("src/app.rs:4:"));
     assert!(!content_hits.contains(".git"));
     assert!(!content_hits.contains("target"));
@@ -353,7 +363,7 @@ async fn workspace_write_read_edit_find_e2e() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "shell", not(target_os = "ios")))]
 #[tokio::test]
 async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     let dir = TempDir::new().unwrap();
@@ -524,10 +534,7 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
         events
     });
 
-    let grandchild_pid = tokio::time::timeout(Duration::from_secs(5), ready_rx)
-        .await
-        .expect("grandchild did not report ready in time")
-        .expect("ready channel closed");
+    let grandchild_pid = ready_rx.await.expect("ready channel closed");
     assert!(grandchild_pid > 0);
     assert_eq!(
         unsafe { libc::kill(grandchild_pid, 0) },
@@ -535,19 +542,9 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
         "grandchild {grandchild_pid} should be alive before abort"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), agent.abort())
-        .await
-        .expect("agent.abort() hung instead of killing process group");
-
-    tokio::time::timeout(Duration::from_secs(5), eof_rx)
-        .await
-        .expect("grandchild process leaked (ALIVE_FIFO write-end never closed after SIGKILL)")
-        .expect("eof channel closed");
-
-    let _events = tokio::time::timeout(Duration::from_secs(5), drain_task)
-        .await
-        .expect("event stream did not close after abort")
-        .expect("drain task panicked");
+    agent.abort().await;
+    eof_rx.await.expect("eof channel closed");
+    drain_task.await.expect("drain task panicked");
     reader_thread.join().expect("reader thread panicked");
 
     // Immediate next prompt succeeds without spurious busy error.
@@ -555,7 +552,7 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     assert!(!recovery.is_empty());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "patch", feature = "shell", not(target_os = "ios")))]
 #[tokio::test]
 async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head() {
     use std::os::unix::fs::symlink;

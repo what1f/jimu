@@ -1,22 +1,47 @@
-//! Optional local workspace tools (`read`, `write`, `edit`, `bash`, `find`) implementing [`pikra_agent::AgentTool`].
+//! Optional local workspace tools implementing [`pikra_agent::AgentTool`].
 
+#[cfg(feature = "patch")]
+mod apply_patch;
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 mod bash;
+#[cfg(feature = "patch")]
 mod edit;
+#[cfg(feature = "search")]
 mod find;
+#[cfg(feature = "search")]
+mod grep;
+mod override_spec;
+#[cfg(feature = "fs")]
 mod read;
+#[cfg(feature = "patch")]
+mod seek_sequence;
 mod util;
+#[cfg(feature = "fs")]
 mod write;
 
+#[cfg(feature = "patch")]
+pub use apply_patch::ApplyPatchTool;
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 pub use bash::BashTool;
+#[cfg(feature = "patch")]
 pub use edit::EditTool;
+#[cfg(feature = "search")]
 pub use find::FindTool;
+#[cfg(feature = "search")]
+pub use grep::GrepTool;
+pub use override_spec::{
+    DescriptionOverride, OverriddenTool, ToolDefinitionOverride, wrap_tool_with_override,
+};
+#[cfg(feature = "fs")]
 pub use read::ReadTool;
 pub use util::{TruncatedOutput, truncate_output};
+#[cfg(feature = "fs")]
 pub use write::WriteTool;
 
 use pikra_agent::AgentTool;
 use pikra_ai::{BoxFuture, ToolDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,24 +56,38 @@ pub type EnvProvider = Arc<dyn Fn() -> BoxFuture<'static, Vec<(String, String)>>
 
 /// Canonical built-in local workspace tool kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum BuiltinToolKind {
     Read,
     Write,
     Edit,
     Bash,
     Find,
+    Grep,
+    ApplyPatch,
 }
 
 impl BuiltinToolKind {
     /// Fixed canonical ordering so tool lists and prompt-cache prefixes never drift.
-    pub const ALL: [BuiltinToolKind; 5] = [
+    pub const ALL: [BuiltinToolKind; 7] = [
         BuiltinToolKind::Read,
         BuiltinToolKind::Write,
         BuiltinToolKind::Edit,
         BuiltinToolKind::Bash,
         BuiltinToolKind::Find,
+        BuiltinToolKind::Grep,
+        BuiltinToolKind::ApplyPatch,
     ];
+
+    /// Whether this build includes the tool.
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::Read | Self::Write => cfg!(feature = "fs"),
+            Self::Edit | Self::ApplyPatch => cfg!(feature = "patch"),
+            Self::Find | Self::Grep => cfg!(feature = "search"),
+            Self::Bash => cfg!(all(feature = "shell", not(target_os = "ios"))),
+        }
+    }
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -57,6 +96,8 @@ impl BuiltinToolKind {
             Self::Edit => "edit",
             Self::Bash => "bash",
             Self::Find => "find",
+            Self::Grep => "grep",
+            Self::ApplyPatch => "apply_patch",
         }
     }
 }
@@ -64,17 +105,19 @@ impl BuiltinToolKind {
 /// Deterministic selectable subset of built-in workspace tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltinToolSet {
-    mask: u8,
+    mask: u16,
 }
 
 impl BuiltinToolSet {
-    const fn bit(kind: BuiltinToolKind) -> u8 {
+    const fn bit(kind: BuiltinToolKind) -> u16 {
         match kind {
             BuiltinToolKind::Read => 1 << 0,
             BuiltinToolKind::Write => 1 << 1,
             BuiltinToolKind::Edit => 1 << 2,
             BuiltinToolKind::Bash => 1 << 3,
             BuiltinToolKind::Find => 1 << 4,
+            BuiltinToolKind::Grep => 1 << 5,
+            BuiltinToolKind::ApplyPatch => 1 << 6,
         }
     }
 
@@ -83,13 +126,22 @@ impl BuiltinToolSet {
     }
 
     pub const fn all() -> Self {
-        Self { mask: 0b1_1111 }
+        Self::coding().with(BuiltinToolKind::ApplyPatch)
+    }
+
+    /// Default workspace tool selection. Hosts can opt in to `apply_patch`.
+    pub const fn coding() -> Self {
+        Self::read_only()
+            .with(BuiltinToolKind::Write)
+            .with(BuiltinToolKind::Edit)
+            .with(BuiltinToolKind::Bash)
     }
 
     pub const fn read_only() -> Self {
-        Self {
-            mask: Self::bit(BuiltinToolKind::Read) | Self::bit(BuiltinToolKind::Find),
-        }
+        Self::empty()
+            .with(BuiltinToolKind::Read)
+            .with(BuiltinToolKind::Find)
+            .with(BuiltinToolKind::Grep)
     }
 
     pub fn from_kinds(kinds: &[BuiltinToolKind]) -> Self {
@@ -124,7 +176,7 @@ impl BuiltinToolSet {
 
 impl Default for BuiltinToolSet {
     fn default() -> Self {
-        Self::all()
+        Self::coding()
     }
 }
 
@@ -163,15 +215,17 @@ pub struct WorkspaceToolsConfig {
     pub cwd: PathBuf,
     /// Enabled subset of built-in tools.
     pub enabled_tools: BuiltinToolSet,
+    /// Definition and argument overrides for individual built-in tools.
+    pub tool_overrides: HashMap<BuiltinToolKind, ToolDefinitionOverride>,
     /// Optional dynamic environment provider for `bash` (e.g. login-shell PATH injection).
     pub env_provider: Option<EnvProvider>,
-    /// Maximum UTF-8 output bytes returned by `read`, `find`, and `bash` (default 1 MiB).
+    /// Maximum UTF-8 output bytes for tools with variable-length output (default 1 MiB).
     pub max_output_bytes: usize,
     /// Optional explicit shell executable for `bash` (defaults to `/bin/sh` on Unix, `cmd` on Windows).
     pub shell: Option<String>,
     /// Optional default timeout in milliseconds for `bash` when the tool call omits `timeout_ms`.
     pub default_bash_timeout_ms: Option<u64>,
-    /// Directory names skipped during recursive `find` traversal.
+    /// Directory names skipped during recursive searches.
     pub ignore_dirs: Vec<String>,
 }
 
@@ -193,7 +247,8 @@ impl WorkspaceToolsConfig {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
-            enabled_tools: BuiltinToolSet::all(),
+            enabled_tools: BuiltinToolSet::default(),
+            tool_overrides: HashMap::new(),
             env_provider: None,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             shell: None,
@@ -207,6 +262,15 @@ impl WorkspaceToolsConfig {
 
     pub fn with_enabled_tools(mut self, enabled_tools: impl Into<BuiltinToolSet>) -> Self {
         self.enabled_tools = enabled_tools.into();
+        self
+    }
+
+    pub fn with_tool_override(
+        mut self,
+        kind: BuiltinToolKind,
+        spec: ToolDefinitionOverride,
+    ) -> Self {
+        self.tool_overrides.insert(kind, spec);
         self
     }
 
@@ -253,29 +317,68 @@ impl WorkspaceTools {
         Self::new(config).tools()
     }
 
+    pub fn try_build(config: WorkspaceToolsConfig) -> Result<Vec<Arc<dyn AgentTool>>, String> {
+        Self::new(config).try_tools()
+    }
+
     pub fn config(&self) -> &WorkspaceToolsConfig {
         &self.config
     }
 
-    /// Construct all enabled tools in canonical order (`read`, `write`, `edit`, `bash`, `find`).
+    /// Construct available, enabled tools in canonical order.
+    ///
+    /// Panics for invalid host overrides. Use [`Self::try_tools`] for fallible configuration.
     pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.try_tools().expect("invalid workspace tool overrides")
+    }
+
+    pub fn try_tools(&self) -> Result<Vec<Arc<dyn AgentTool>>, String> {
         self.config
             .enabled_tools
             .kinds()
             .into_iter()
-            .map(|kind| self.tool(kind))
+            .filter(|kind| kind.is_available())
+            .map(|kind| self.try_tool(kind))
             .collect()
     }
 
     /// Construct a single built-in tool sharing this configuration.
+    ///
+    /// Panics if the tool is unavailable or its override is invalid.
     pub fn tool(&self, kind: BuiltinToolKind) -> Arc<dyn AgentTool> {
+        self.try_tool(kind)
+            .expect("could not construct workspace tool")
+    }
+
+    pub fn try_tool(&self, kind: BuiltinToolKind) -> Result<Arc<dyn AgentTool>, String> {
+        #[cfg(any(
+            feature = "fs",
+            feature = "search",
+            all(feature = "shell", not(target_os = "ios"))
+        ))]
         let cfg = Arc::clone(&self.config);
-        match kind {
-            BuiltinToolKind::Read => Arc::new(ReadTool::new(cfg)),
-            BuiltinToolKind::Write => Arc::new(WriteTool::new(cfg)),
-            BuiltinToolKind::Edit => Arc::new(EditTool::new(cfg)),
-            BuiltinToolKind::Bash => Arc::new(BashTool::new(cfg)),
-            BuiltinToolKind::Find => Arc::new(FindTool::new(cfg)),
+        let tool: Option<Arc<dyn AgentTool>> = match kind {
+            #[cfg(feature = "fs")]
+            BuiltinToolKind::Read => Some(Arc::new(ReadTool::new(cfg))),
+            #[cfg(feature = "fs")]
+            BuiltinToolKind::Write => Some(Arc::new(WriteTool::new(cfg))),
+            #[cfg(feature = "patch")]
+            BuiltinToolKind::Edit => Some(Arc::new(EditTool::new(cfg))),
+            #[cfg(feature = "patch")]
+            BuiltinToolKind::ApplyPatch => Some(Arc::new(ApplyPatchTool::new(cfg))),
+            #[cfg(all(feature = "shell", not(target_os = "ios")))]
+            BuiltinToolKind::Bash => Some(Arc::new(BashTool::new(cfg))),
+            #[cfg(feature = "search")]
+            BuiltinToolKind::Find => Some(Arc::new(FindTool::new(cfg))),
+            #[cfg(feature = "search")]
+            BuiltinToolKind::Grep => Some(Arc::new(GrepTool::new(cfg))),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        };
+        let tool = tool.ok_or_else(|| format!("Tool '{}' is unavailable", kind.name()))?;
+        match self.config.tool_overrides.get(&kind) {
+            Some(spec) => wrap_tool_with_override(tool, spec.clone()),
+            None => Ok(tool),
         }
     }
 

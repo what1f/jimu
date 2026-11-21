@@ -96,8 +96,7 @@ impl AgentTool for ReadTool {
             let resolved = resolve_path(&config.cwd, raw_path)?;
             let shown = display_path(&config.cwd, &resolved);
 
-            let meta = tokio::fs::metadata(&resolved)
-                .await
+            let meta = std::fs::metadata(&resolved)
                 .map_err(|e| format!("failed to stat '{shown}': {e}"))?;
             if meta.is_dir() {
                 return Err(format!("cannot read '{shown}': path is a directory"));
@@ -112,9 +111,8 @@ impl AgentTool for ReadTool {
                 ));
             }
 
-            let bytes = tokio::fs::read(&resolved)
-                .await
-                .map_err(|e| format!("failed to read '{shown}': {e}"))?;
+            let bytes =
+                std::fs::read(&resolved).map_err(|e| format!("failed to read '{shown}': {e}"))?;
 
             if cancel.is_cancelled() {
                 return Err("Operation aborted".into());

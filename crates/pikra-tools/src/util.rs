@@ -1,16 +1,34 @@
-use std::collections::{HashMap, VecDeque};
-use std::io::ErrorKind;
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
+use std::collections::VecDeque;
+#[cfg(any(
+    feature = "fs",
+    feature = "search",
+    all(feature = "shell", not(target_os = "ios"))
+))]
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+#[cfg(feature = "fs")]
+use std::{
+    collections::HashMap,
+    fs::{self, Permissions},
+    io::{ErrorKind, Write},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
-static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-static PATH_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
+#[cfg(feature = "fs")]
+static PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+#[cfg(feature = "fs")]
 const MAX_SYMLINK_HOPS: usize = 40;
 
+#[cfg(any(
+    feature = "fs",
+    feature = "search",
+    all(feature = "shell", not(target_os = "ios"))
+))]
 /// Resolve a tool path relative to `base_cwd` (preserving absolute paths as-is).
 pub(crate) fn resolve_path(base_cwd: &Path, raw: &str) -> Result<PathBuf, String> {
+    if raw.contains('\0') {
+        return Err("path contains a null character".into());
+    }
     if raw.is_empty() {
         return Err("path must not be empty".to_string());
     }
@@ -22,19 +40,25 @@ pub(crate) fn resolve_path(base_cwd: &Path, raw: &str) -> Result<PathBuf, String
     }
 }
 
+#[cfg(any(
+    feature = "fs",
+    feature = "search",
+    all(feature = "shell", not(target_os = "ios"))
+))]
 /// Format a path relative to `base_cwd` when possible, using forward slashes.
 pub(crate) fn display_path(base_cwd: &Path, path: &Path) -> String {
     let shown = path.strip_prefix(base_cwd).unwrap_or(path);
     shown.to_string_lossy().replace('\\', "/")
 }
 
+#[cfg(feature = "fs")]
 /// Canonicalize the nearest existing ancestor of `path` and re-attach remaining components
 /// so per-path write locks serialize equivalent paths consistently.
-async fn normalize_nonexistent_path(path: &Path) -> PathBuf {
+fn normalize_nonexistent_path(path: &Path) -> PathBuf {
     let mut missing = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(canon) = tokio::fs::canonicalize(cur).await {
+        if let Ok(canon) = fs::canonicalize(cur) {
             let mut out = canon;
             for part in missing.into_iter().rev() {
                 out.push(part);
@@ -51,23 +75,24 @@ async fn normalize_nonexistent_path(path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(feature = "fs")]
 /// Resolve the real target file path before acquiring a write lock or renaming a temp file.
 ///
 /// If `target` is an existing symlink, resolves it to the real target path so atomic
 /// temp-file + `rename` writes into the resolved target's parent directory and preserves
 /// the symlink intact.
-pub(crate) async fn resolve_write_target(target: &Path) -> Result<PathBuf, String> {
-    match tokio::fs::symlink_metadata(target).await {
-        Ok(meta) if meta.file_type().is_symlink() => match tokio::fs::canonicalize(target).await {
+pub(crate) fn resolve_write_target(target: &Path) -> Result<PathBuf, String> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => match fs::canonicalize(target) {
             Ok(real) => Ok(real),
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 // Dangling symlink: walk symlink hops so `write` creates the linked target
                 // while preserving the symlink (and `edit` still reports missing target).
                 let mut cur = target.to_path_buf();
                 for _ in 0..MAX_SYMLINK_HOPS {
-                    match tokio::fs::symlink_metadata(&cur).await {
+                    match fs::symlink_metadata(&cur) {
                         Ok(m) if m.file_type().is_symlink() => {
-                            let link = tokio::fs::read_link(&cur).await.map_err(|e| {
+                            let link = fs::read_link(&cur).map_err(|e| {
                                 format!("failed to read symlink '{}': {e}", cur.display())
                             })?;
                             cur = if link.is_absolute() {
@@ -80,12 +105,12 @@ pub(crate) async fn resolve_write_target(target: &Path) -> Result<PathBuf, Strin
                             };
                         }
                         Ok(_) => {
-                            return tokio::fs::canonicalize(&cur).await.map_err(|e| {
+                            return fs::canonicalize(&cur).map_err(|e| {
                                 format!("failed to resolve symlink '{}': {e}", target.display())
                             });
                         }
                         Err(e) if e.kind() == ErrorKind::NotFound => {
-                            return Ok(normalize_nonexistent_path(&cur).await);
+                            return Ok(normalize_nonexistent_path(&cur));
                         }
                         Err(e) => {
                             return Err(format!(
@@ -105,122 +130,110 @@ pub(crate) async fn resolve_write_target(target: &Path) -> Result<PathBuf, Strin
                 target.display()
             )),
         },
-        Ok(_) => Ok(tokio::fs::canonicalize(target)
-            .await
-            .unwrap_or_else(|_| target.to_path_buf())),
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            Ok(normalize_nonexistent_path(target).await)
-        }
-        Err(_) => Ok(target.to_path_buf()),
+        Ok(_) => fs::canonicalize(target)
+            .map_err(|err| format!("Could not resolve '{}': {err}", target.display())),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(normalize_nonexistent_path(target)),
+        Err(err) => Err(format!("Could not resolve '{}': {err}", target.display())),
     }
 }
 
-/// Acquire an exclusive async lock scoped to the resolved file path.
-pub(crate) async fn lock_path(path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
-    let lock = {
-        let map = PATH_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, weak| weak.strong_count() > 0);
-        if let Some(existing) = guard.get(path).and_then(Weak::upgrade) {
-            existing
-        } else {
-            let created = Arc::new(tokio::sync::Mutex::new(()));
-            guard.insert(path.to_path_buf(), Arc::downgrade(&created));
-            created
+/// Return the shared lock for a resolved file path. Writers hold it through the final rename.
+#[cfg(feature = "fs")]
+pub(crate) fn path_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = PATH_LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = locks.get(path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Atomically write to an already-resolved and locked target.
+#[cfg(feature = "fs")]
+pub(crate) fn atomic_write_file_resolved(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let permissions = match fs::metadata(target) {
+        Ok(meta) if meta.is_file() => Some(meta.permissions()),
+        Ok(_) => {
+            return Err(format!(
+                "Cannot write to '{}': expected a regular file",
+                target.display()
+            ));
         }
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => return Err(format!("Could not access '{}': {err}", target.display())),
     };
-    lock.lock_owned().await
+    stage_write(target, bytes, permissions)?
+        .persist(target)
+        .map(|_| ())
+        .map_err(|err| format!("Could not write '{}': {}", target.display(), err.error))
 }
 
-/// Atomically write `bytes` to an already-resolved and locked `target`, creating parent
-/// directories automatically.
-pub(crate) async fn atomic_write_file_resolved(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Ok(meta) = tokio::fs::metadata(target).await
-        && meta.is_dir()
-    {
-        return Err(format!(
-            "cannot write to '{}': path is a directory",
-            target.display()
-        ));
-    }
-
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-        format!(
-            "failed to create parent directories for '{}': {e}",
-            target.display()
-        )
-    })?;
-
-    let existing_perms = tokio::fs::metadata(target)
-        .await
-        .ok()
-        .map(|m| m.permissions());
-
-    let seq = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| std::borrow::Cow::Borrowed("file"));
-    let tmp_path = parent.join(format!(".pikra-tmp-{pid}-{seq}-{file_name}"));
-
-    if let Err(err) = write_and_rename(&tmp_path, target, bytes, existing_perms).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(err);
-    }
-
-    Ok(())
-}
-
-async fn write_and_rename(
-    tmp_path: &Path,
+#[cfg(feature = "fs")]
+pub(crate) fn stage_write(
     target: &Path,
     bytes: &[u8],
-    existing_perms: Option<std::fs::Permissions>,
-) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
+    permissions: Option<Permissions>,
+) -> Result<tempfile::NamedTempFile, String> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let stage = || -> std::io::Result<_> {
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".pikra-tmp-")
+            .tempfile_in(parent)?;
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.as_file().set_permissions(permissions)?;
+        }
+        Ok(file)
+    };
+    stage().map_err(|err| format!("Could not prepare '{}': {err}", target.display()))
+}
 
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        opts.mode(0o600);
+#[cfg(any(feature = "fs", feature = "search"))]
+pub(crate) fn check_cancelled(cancel: &pikra_ai::CancelToken) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        Err("Operation aborted".into())
+    } else {
+        Ok(())
     }
+}
 
-    let mut file = opts.open(tmp_path).await.map_err(|e| {
-        format!(
-            "failed to create temporary file for '{}': {e}",
-            target.display()
-        )
-    })?;
+/// Detect a file that uses CRLF consistently.
+#[cfg(feature = "patch")]
+pub(crate) fn uses_crlf(text: &str) -> bool {
+    text.contains("\r\n")
+        && text
+            .match_indices('\n')
+            .all(|(i, _)| i > 0 && text.as_bytes()[i - 1] == b'\r')
+}
 
-    file.write_all(bytes)
-        .await
-        .map_err(|e| format!("failed to write '{}': {e}", target.display()))?;
-    file.flush()
-        .await
-        .map_err(|e| format!("failed to flush '{}': {e}", target.display()))?;
-    drop(file);
-
-    if let Some(perms) = existing_perms {
-        tokio::fs::set_permissions(tmp_path, perms)
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to preserve permissions on '{}': {e}",
-                    target.display()
-                )
-            })?;
+#[cfg(feature = "patch")]
+pub(crate) fn read_editable_text(
+    path: &Path,
+    shown: &str,
+) -> Result<(String, Permissions), String> {
+    let meta = fs::metadata(path).map_err(|err| format!("Could not access '{shown}': {err}"))?;
+    if !meta.is_file() {
+        return Err(format!("Cannot edit '{shown}': expected a regular file"));
     }
-
-    tokio::fs::rename(tmp_path, target)
-        .await
-        .map_err(|e| format!("failed to commit '{}': {e}", target.display()))
+    if meta.len() > 16 * 1024 * 1024 {
+        return Err(format!("Cannot edit '{shown}': file exceeds 16 MiB"));
+    }
+    let bytes = fs::read(path).map_err(|err| format!("Could not read '{shown}': {err}"))?;
+    if bytes.contains(&0) {
+        return Err(format!("Cannot edit binary file '{shown}'"));
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| format!("Cannot edit non-UTF-8 file '{shown}'"))?;
+    Ok((text, meta.permissions()))
 }
 
 /// Result of UTF-8-safe head+tail truncation.
@@ -322,6 +335,7 @@ pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
 }
 
 /// Memory-bounded streaming output collector preserving head + tail bytes up to `max_bytes`.
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 pub(crate) struct BoundedOutputBuffer {
     max_bytes: usize,
     head_cap: usize,
@@ -332,6 +346,7 @@ pub(crate) struct BoundedOutputBuffer {
     total_bytes: usize,
 }
 
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 impl BoundedOutputBuffer {
     pub(crate) fn new(max_bytes: usize) -> Self {
         let head_cap = max_bytes / 2;
@@ -471,6 +486,7 @@ impl BoundedOutputBuffer {
 }
 
 /// Strip an incomplete UTF-8 multi-byte sequence from the end of a byte slice (up to 3 bytes).
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
     if bytes.is_empty() {
         return bytes;
@@ -488,6 +504,7 @@ fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
 }
 
 /// Strip leading UTF-8 continuation bytes (`0b10xx_xxxx`) from the start of a byte slice.
+#[cfg(all(feature = "shell", not(target_os = "ios")))]
 fn trim_incomplete_utf8_head(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     while start < bytes.len() && start < 4 && (bytes[start] & 0b1100_0000) == 0b1000_0000 {

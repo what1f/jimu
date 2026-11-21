@@ -1,6 +1,7 @@
 use crate::WorkspaceToolsConfig;
 use crate::util::{
-    atomic_write_file_resolved, display_path, lock_path, resolve_path, resolve_write_target,
+    atomic_write_file_resolved, check_cancelled, display_path, path_lock, resolve_path,
+    resolve_write_target,
 };
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
@@ -73,17 +74,16 @@ impl AgentTool for WriteTool {
 
             let resolved = resolve_path(&config.cwd, raw_path)?;
             let shown = display_path(&config.cwd, &resolved);
-            let target = resolve_write_target(&resolved).await?;
-            let _path_guard = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err("Operation aborted".into()),
-                guard = lock_path(&target) => guard,
-            };
-            if cancel.is_cancelled() {
-                return Err("Operation aborted".into());
+            let target = resolve_write_target(&resolved)?;
+            let lock = path_lock(&target);
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            check_cancelled(&cancel)?;
+            if resolve_write_target(&resolved)? != target {
+                return Err(format!(
+                    "'{shown}' changed during the operation. Try again."
+                ));
             }
-
-            atomic_write_file_resolved(&target, content.as_bytes()).await?;
+            atomic_write_file_resolved(&target, content.as_bytes())?;
 
             let mut res =
                 AgentToolResult::text(format!("Wrote {} bytes to {shown}", content.len()));
