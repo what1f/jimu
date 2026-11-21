@@ -28,6 +28,7 @@ public enum PikraError: Error, Sendable, Equatable, LocalizedError {
 /// Supported wire protocol adapters in `pikra-ai`.
 public enum PikraApiKind: Sendable, Equatable, Hashable, Codable {
     case openaiResponses
+    case openaiCodexResponses
     case openaiCompletions
     case anthropicMessages
     case googleGenerativeAi
@@ -36,6 +37,7 @@ public enum PikraApiKind: Sendable, Equatable, Hashable, Codable {
     public var rawValue: String {
         switch self {
         case .openaiResponses: return "openai-responses"
+        case .openaiCodexResponses: return "openai-codex-responses"
         case .openaiCompletions: return "openai-completions"
         case .anthropicMessages: return "anthropic-messages"
         case .googleGenerativeAi: return "google-generative-ai"
@@ -46,6 +48,7 @@ public enum PikraApiKind: Sendable, Equatable, Hashable, Codable {
     public init(rawValue: String) {
         switch rawValue {
         case "openai-responses": self = .openaiResponses
+        case "openai-codex-responses": self = .openaiCodexResponses
         case "openai-completions": self = .openaiCompletions
         case "anthropic-messages": self = .anthropicMessages
         case "google-generative-ai": self = .googleGenerativeAi
@@ -68,6 +71,7 @@ public enum PikraApiKind: Sendable, Equatable, Hashable, Codable {
 /// Reasoning / thinking effort level.
 public enum PikraThinkingLevel: String, Codable, Sendable, Equatable, Hashable {
     case off
+    case none
     case minimal
     case low
     case medium
@@ -615,6 +619,9 @@ public struct PikraSessionEntry: Sendable, Equatable {
     }
 }
 
+/// Dynamic per-request authorization hook invoked before every outbound LLM HTTP request.
+public typealias PikraRequestAuthorizer = @Sendable (inout URLRequest) async throws -> Void
+
 /// Full configuration for opening a `PikraAgent`.
 public struct PikraConfiguration: Sendable {
     public var model: PikraModel
@@ -641,6 +648,8 @@ public struct PikraConfiguration: Sendable {
     public var rollbackFirstTurnOnFailure: Bool
     public var jsExtensions: PikraJsExtensionConfig?
     public var httpClient: (any PikraHTTPClient)?
+    /// Optional dynamic per-request auth hook invoked right before `beforeRequest` and `httpClient.send`.
+    public var authorizeRequest: PikraRequestAuthorizer?
     /// Optional hook invoked right before every LLM HTTP request with the exact JSON request body bytes.
     public var beforeRequest: (@Sendable (Data) async throws -> Void)?
 
@@ -669,6 +678,7 @@ public struct PikraConfiguration: Sendable {
         rollbackFirstTurnOnFailure: Bool = false,
         jsExtensions: PikraJsExtensionConfig? = nil,
         httpClient: (any PikraHTTPClient)? = nil,
+        authorizeRequest: PikraRequestAuthorizer? = nil,
         beforeRequest: (@Sendable (Data) async throws -> Void)? = nil
     ) {
         self.model = model
@@ -695,6 +705,7 @@ public struct PikraConfiguration: Sendable {
         self.rollbackFirstTurnOnFailure = rollbackFirstTurnOnFailure
         self.jsExtensions = jsExtensions
         self.httpClient = httpClient
+        self.authorizeRequest = authorizeRequest
         self.beforeRequest = beforeRequest
     }
 }

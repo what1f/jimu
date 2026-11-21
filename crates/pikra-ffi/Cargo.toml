@@ -24,3 +24,6 @@ futures-core.workspace = true
 futures-util.workspace = true
 futures-channel.workspace = true
 futures-executor.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+rquickjs = { workspace = true, features = ["bindgen"] }

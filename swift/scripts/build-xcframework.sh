@@ -10,11 +10,16 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 universal=0
+all_platforms=0
+make_zip=0
+
 for arg in "$@"; do
   case "$arg" in
     --universal) universal=1 ;;
+    --all-platforms) all_platforms=1 ;;
+    --zip) make_zip=1 ;;
     -h|--help)
-      echo "Usage: $0 [--universal]"
+      echo "Usage: $0 [--universal] [--all-platforms] [--zip]"
       exit 0
       ;;
     *)
@@ -31,8 +36,8 @@ else
   default_target="x86_64-apple-darwin"
 fi
 
-# Match Package.swift `.macOS(.v15)` deployment target so C objects (e.g. QuickJS) link with 0 warnings.
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+macos_deployment_target="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+ios_deployment_target="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -40,7 +45,21 @@ trap 'rm -rf "$tmp_dir"' EXIT
 build_target() {
   local target="$1"
   echo "==> Building pikra-ffi (release) for ${target}..."
-  cargo build --release -p pikra-ffi --target "$target"
+  case "$target" in
+    *-apple-darwin)
+      env -u IPHONEOS_DEPLOYMENT_TARGET -u SDKROOT \
+        MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
+        cargo build --release -p pikra-ffi --target "$target"
+      ;;
+    *-apple-ios*)
+      env -u MACOSX_DEPLOYMENT_TARGET -u SDKROOT \
+        IPHONEOS_DEPLOYMENT_TARGET="$ios_deployment_target" \
+        cargo build --release -p pikra-ffi --target "$target"
+      ;;
+    *)
+      cargo build --release -p pikra-ffi --target "$target"
+      ;;
+  esac
   local lib_path="$repo_root/target/${target}/release/libpikra_ffi.a"
   local out_path="$tmp_dir/libpikra_ffi_${target}.a"
   cp "$lib_path" "$out_path"
@@ -48,43 +67,116 @@ build_target() {
   echo "    Built ${target}: $(ls -lh "$out_path" | awk '{print $5}') ($(stat -f%z "$out_path") bytes)"
 }
 
-if [[ "$universal" -eq 1 ]]; then
-  installed_targets="$(rustup target list --installed 2>/dev/null || true)"
-  if echo "$installed_targets" | grep -q "aarch64-apple-darwin" && \
-     echo "$installed_targets" | grep -q "x86_64-apple-darwin"; then
-    build_target "aarch64-apple-darwin"
-    build_target "x86_64-apple-darwin"
-    xcrun lipo -create \
-      "$tmp_dir/libpikra_ffi_aarch64-apple-darwin.a" \
-      "$tmp_dir/libpikra_ffi_x86_64-apple-darwin.a" \
-      -output "$tmp_dir/libpikra_ffi.a"
-  else
-    echo "Warning: both aarch64-apple-darwin and x86_64-apple-darwin targets not installed; falling back to ${default_target}" >&2
-    build_target "$default_target"
-    cp "$tmp_dir/libpikra_ffi_${default_target}.a" "$tmp_dir/libpikra_ffi.a"
-  fi
-else
-  build_target "$default_target"
-  cp "$tmp_dir/libpikra_ffi_${default_target}.a" "$tmp_dir/libpikra_ffi.a"
-fi
+stage_headers() {
+  local header_dir="$1"
+  mkdir -p "$header_dir/CPikra"
+  cp "$repo_root/crates/pikra-ffi/include/pikra.h" "$header_dir/CPikra/pikra.h"
+  cp "$repo_root/crates/pikra-ffi/include/module.modulemap" "$header_dir/CPikra/module.modulemap"
+}
 
-mkdir -p "$tmp_dir/Headers/CPikra"
-cp "$repo_root/crates/pikra-ffi/include/pikra.h" "$tmp_dir/Headers/CPikra/pikra.h"
-cp "$repo_root/crates/pikra-ffi/include/module.modulemap" "$tmp_dir/Headers/CPikra/module.modulemap"
+report_slice_size() {
+  local label="$1"
+  local path="$2"
+  local bytes
+  bytes="$(stat -f%z "$path")"
+  local mb
+  mb="$(awk -v b="$bytes" 'BEGIN { printf "%.2f MiB", b / (1024 * 1024) }')"
+  echo "==> ${label}: ${bytes} bytes (${mb})"
+}
 
 out_xcframework="$repo_root/swift/Artifacts/PikraCore.xcframework"
+out_zip="$repo_root/swift/Artifacts/PikraCore.xcframework.zip"
 mkdir -p "$repo_root/swift/Artifacts"
 rm -rf "$out_xcframework"
 
-xcodebuild -create-xcframework \
-  -library "$tmp_dir/libpikra_ffi.a" \
-  -headers "$tmp_dir/Headers" \
-  -output "$out_xcframework" >/dev/null
+if [[ "$all_platforms" -eq 1 ]]; then
+  required_targets=(
+    "aarch64-apple-darwin"
+    "x86_64-apple-darwin"
+    "aarch64-apple-ios"
+    "aarch64-apple-ios-sim"
+    "x86_64-apple-ios"
+  )
+  installed_targets="$(rustup target list --installed 2>/dev/null || true)"
+  for t in "${required_targets[@]}"; do
+    if ! echo "$installed_targets" | grep -qx "$t"; then
+      echo "Missing required Rust target: ${t} (install with: rustup target add ${t})" >&2
+      exit 1
+    fi
+  done
 
-lib_bytes="$(stat -f%z "$tmp_dir/libpikra_ffi.a")"
-lib_mb="$(awk -v b="$lib_bytes" 'BEGIN { printf "%.2f MiB", b / (1024 * 1024) }')"
-echo "==> Packaged $out_xcframework"
-echo "==> libpikra_ffi.a release size: ${lib_bytes} bytes (${lib_mb})"
+  build_target "aarch64-apple-darwin"
+  build_target "x86_64-apple-darwin"
+  mkdir -p "$tmp_dir/macos"
+  xcrun lipo -create \
+    "$tmp_dir/libpikra_ffi_aarch64-apple-darwin.a" \
+    "$tmp_dir/libpikra_ffi_x86_64-apple-darwin.a" \
+    -output "$tmp_dir/macos/libpikra_ffi.a"
+  stage_headers "$tmp_dir/macos/Headers"
+
+  build_target "aarch64-apple-ios"
+  mkdir -p "$tmp_dir/ios"
+  cp "$tmp_dir/libpikra_ffi_aarch64-apple-ios.a" "$tmp_dir/ios/libpikra_ffi.a"
+  stage_headers "$tmp_dir/ios/Headers"
+
+  build_target "aarch64-apple-ios-sim"
+  build_target "x86_64-apple-ios"
+  mkdir -p "$tmp_dir/ios-sim"
+  xcrun lipo -create \
+    "$tmp_dir/libpikra_ffi_aarch64-apple-ios-sim.a" \
+    "$tmp_dir/libpikra_ffi_x86_64-apple-ios.a" \
+    -output "$tmp_dir/ios-sim/libpikra_ffi.a"
+  stage_headers "$tmp_dir/ios-sim/Headers"
+
+  xcodebuild -create-xcframework \
+    -library "$tmp_dir/macos/libpikra_ffi.a" -headers "$tmp_dir/macos/Headers" \
+    -library "$tmp_dir/ios/libpikra_ffi.a" -headers "$tmp_dir/ios/Headers" \
+    -library "$tmp_dir/ios-sim/libpikra_ffi.a" -headers "$tmp_dir/ios-sim/Headers" \
+    -output "$out_xcframework" >/dev/null
+
+  echo "==> Packaged $out_xcframework (3 slices: macOS universal, iOS arm64, iOS Simulator universal)"
+  report_slice_size "macOS universal (arm64+x86_64)" "$tmp_dir/macos/libpikra_ffi.a"
+  report_slice_size "iOS device (arm64)" "$tmp_dir/ios/libpikra_ffi.a"
+  report_slice_size "iOS Simulator (arm64+x86_64)" "$tmp_dir/ios-sim/libpikra_ffi.a"
+else
+  if [[ "$universal" -eq 1 ]]; then
+    installed_targets="$(rustup target list --installed 2>/dev/null || true)"
+    if echo "$installed_targets" | grep -qx "aarch64-apple-darwin" && \
+       echo "$installed_targets" | grep -qx "x86_64-apple-darwin"; then
+      build_target "aarch64-apple-darwin"
+      build_target "x86_64-apple-darwin"
+      xcrun lipo -create \
+        "$tmp_dir/libpikra_ffi_aarch64-apple-darwin.a" \
+        "$tmp_dir/libpikra_ffi_x86_64-apple-darwin.a" \
+        -output "$tmp_dir/libpikra_ffi.a"
+    else
+      echo "Warning: both aarch64-apple-darwin and x86_64-apple-darwin targets not installed; falling back to ${default_target}" >&2
+      build_target "$default_target"
+      cp "$tmp_dir/libpikra_ffi_${default_target}.a" "$tmp_dir/libpikra_ffi.a"
+    fi
+  else
+    build_target "$default_target"
+    cp "$tmp_dir/libpikra_ffi_${default_target}.a" "$tmp_dir/libpikra_ffi.a"
+  fi
+
+  stage_headers "$tmp_dir/Headers"
+
+  xcodebuild -create-xcframework \
+    -library "$tmp_dir/libpikra_ffi.a" \
+    -headers "$tmp_dir/Headers" \
+    -output "$out_xcframework" >/dev/null
+
+  echo "==> Packaged $out_xcframework"
+  report_slice_size "libpikra_ffi.a release size" "$tmp_dir/libpikra_ffi.a"
+fi
+
+if [[ "$make_zip" -eq 1 ]]; then
+  rm -f "$out_zip"
+  ditto -c -k --sequesterRsrc --keepParent "$out_xcframework" "$out_zip"
+  checksum="$(swift package compute-checksum "$out_zip")"
+  report_slice_size "PikraCore.xcframework.zip" "$out_zip"
+  echo "==> Checksum: ${checksum}"
+fi
 
 # Report linked test binary code size if already built by SwiftPM.
 test_bin="$(find "$repo_root/swift/.build" -type f \( -name "PikraKitPackageTests" -o -name "PikraKitTests-product" -o -name "PikraKitTests" \) ! -name "*.swiftmodule" ! -name "*.d" ! -name "*.o" 2>/dev/null | head -n 1 || true)"

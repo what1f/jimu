@@ -49,6 +49,37 @@ public struct PikraHTTPRequest: Sendable, Equatable {
         }
         return req
     }
+
+    public init?(urlRequest: URLRequest) {
+        guard let url = urlRequest.url else { return nil }
+        let sortedHeaders = (urlRequest.allHTTPHeaderFields ?? [:])
+            .sorted { $0.key.lowercased() < $1.key.lowercased() }
+            .map { ($0.key, $0.value) }
+        self.init(
+            method: urlRequest.httpMethod ?? "GET",
+            url: url,
+            headers: sortedHeaders,
+            body: urlRequest.httpBody ?? Data(),
+            timeoutInterval: urlRequest.timeoutInterval
+        )
+    }
+
+    init(applying urlRequest: URLRequest, fallback: PikraHTTPRequest, originalTimeout: TimeInterval) {
+        let sortedHeaders = (urlRequest.allHTTPHeaderFields ?? [:])
+            .sorted { $0.key.lowercased() < $1.key.lowercased() }
+            .map { ($0.key, $0.value) }
+        let effectiveTimeout: TimeInterval? =
+            urlRequest.timeoutInterval == originalTimeout
+            ? fallback.timeoutInterval
+            : urlRequest.timeoutInterval
+        self.init(
+            method: urlRequest.httpMethod ?? fallback.method,
+            url: urlRequest.url ?? fallback.url,
+            headers: sortedHeaders,
+            body: urlRequest.httpBody ?? Data(),
+            timeoutInterval: effectiveTimeout
+        )
+    }
 }
 
 /// Streaming HTTP response returned by a `PikraHTTPClient`.
@@ -242,6 +273,7 @@ private final class CredentialRedirectPolicy: NSObject, URLSessionTaskDelegate {
               original.value(forHTTPHeaderField: "Authorization") == nil,
               original.value(forHTTPHeaderField: "x-api-key") == nil,
               original.value(forHTTPHeaderField: "x-goog-api-key") == nil,
+              original.value(forHTTPHeaderField: "chatgpt-account-id") == nil,
               ["GET", "HEAD"].contains(original.httpMethod ?? "GET")
         else {
             return nil

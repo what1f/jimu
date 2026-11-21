@@ -1,3 +1,5 @@
+import CryptoKit
+import Darwin
 import Foundation
 import Testing
 @testable import PikraKit
@@ -700,6 +702,420 @@ struct PikraKitE2ETests {
         #expect(sawUsage)
         #expect(streamedText.contains("42"))
         #expect(events.last == .turnEnded(stopReason: .stop, userMessageKept: true, errorMessage: nil))
+
+        await agent.close()
+    }
+
+    @Test("5. Codex OAuth PKCE, JWT claims, coalesced PikraCodexSubscription refresh & PikraAgent authorizeRequest")
+    func codexOAuthAndAuthorizeRequestE2E() async throws {
+        // Verify PikraThinkingLevel.none & PikraApiKind.openaiCodexResponses wire encoding.
+        #expect(PikraThinkingLevel.off.rawValue == "off")
+        #expect(PikraThinkingLevel.none.rawValue == "none")
+        #expect(PikraApiKind.openaiCodexResponses.rawValue == "openai-codex-responses")
+        #expect(PikraApiKind(rawValue: "openai-codex-responses") == .openaiCodexResponses)
+
+        func makeJWT(claims: [String: Any]) throws -> String {
+            func b64url(_ data: Data) -> String {
+                data.base64EncodedString()
+                    .replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: "=", with: "")
+            }
+            let header = try JSONSerialization.data(withJSONObject: ["alg": "none", "typ": "JWT"])
+            let payload = try JSONSerialization.data(withJSONObject: claims)
+            return "\(b64url(header)).\(b64url(payload)).sig"
+        }
+
+        let initialExp = Date().addingTimeInterval(60).timeIntervalSince1970 // within 300s leeway -> triggers refresh
+        let refreshedExp = Date().addingTimeInterval(3600).timeIntervalSince1970
+        let initialJWT = try makeJWT(claims: [
+            "exp": initialExp,
+            "https://api.openai.com/auth": ["chatgpt_account_id": "acct_initial_123"],
+            "https://api.openai.com/profile": ["email": "alice@example.com"],
+        ])
+        let refreshedJWT = try makeJWT(claims: [
+            "exp": refreshedExp,
+            "email": "alice@example.com",
+        ]) // intentionally omits chatgpt_account_id to test preservation on refresh
+
+        let refreshStarted = Signal()
+        let allowRefreshFinish = Signal()
+
+        let oauthMockClient = MockSSEClient(handlers: [
+            // Req 0: exchange authorization code (full URL callback)
+            { req, _ in
+                let bodyStr = String(data: req.body, encoding: .utf8) ?? ""
+                #expect(bodyStr.contains("grant_type=authorization_code"))
+                #expect(bodyStr.contains("code=auth_code_url"))
+                let json = "{\"access_token\":\"\(initialJWT)\",\"refresh_token\":\"rt_initial\"}"
+                return MockSSEClient.sseResponse(chunks: [json])
+            },
+            // Req 1: exchange authorization code (code#state format)
+            { req, _ in
+                let bodyStr = String(data: req.body, encoding: .utf8) ?? ""
+                #expect(bodyStr.contains("code=auth_code_hash"))
+                let json = "{\"access_token\":\"\(initialJWT)\",\"refresh_token\":\"rt_initial\"}"
+                return MockSSEClient.sseResponse(chunks: [json])
+            },
+            // Req 2: coalesced token refresh (omits refresh_token & chatgpt_account_id)
+            { req, _ in
+                let bodyStr = String(data: req.body, encoding: .utf8) ?? ""
+                #expect(bodyStr.contains("grant_type=refresh_token"))
+                #expect(bodyStr.contains("refresh_token=rt_initial"))
+                await refreshStarted.fire()
+                await allowRefreshFinish.wait()
+                let json = "{\"access_token\":\"\(refreshedJWT)\"}"
+                return MockSSEClient.sseResponse(chunks: [json])
+            },
+        ])
+
+        let oauth = PikraCodexOAuth(httpClient: oauthMockClient)
+        let auth = try oauth.startAuthorization()
+        let components = try #require(URLComponents(url: auth.url, resolvingAgainstBaseURL: false))
+        let queryMap = Dictionary(
+            uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item -> (String, String)? in
+                guard let v = item.value else { return nil }
+                return (item.name, v)
+            }
+        )
+        #expect(queryMap["client_id"] == PikraCodexOAuth.clientID)
+        #expect(queryMap["response_type"] == "code")
+        #expect(queryMap["code_challenge_method"] == "S256")
+        #expect(queryMap["state"] == auth.state)
+        #expect(queryMap["originator"] == "pikra")
+        #expect(queryMap["codex_cli_simplified_flow"] == "true")
+
+        // Verify S256 PKCE challenge matches verifier
+        let expectedChallenge = Data(SHA256.hash(data: Data(auth.codeVerifier.utf8)))
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        #expect(queryMap["code_challenge"] == expectedChallenge)
+
+        // State mismatch must throw
+        await #expect(throws: PikraCodexOAuthError.stateMismatch) {
+            _ = try await oauth.completeAuthorization(auth, callback: "http://localhost:1455/auth/callback?code=abc&state=wrong")
+        }
+
+        // Complete via full callback URL
+        let exchanged = try await oauth.completeAuthorization(
+            auth,
+            callback: "http://localhost:1455/auth/callback?code=auth_code_url&state=\(auth.state)"
+        )
+        #expect(exchanged.accessToken == initialJWT)
+        #expect(exchanged.refreshToken == "rt_initial")
+        #expect(exchanged.accountID == "acct_initial_123")
+        #expect(exchanged.email == "alice@example.com")
+        #expect(exchanged.expiresAt != nil)
+
+        // Complete via code#state format
+        let exchangedHash = try await oauth.completeAuthorization(auth, callback: "auth_code_hash#\(auth.state)")
+        #expect(exchangedHash.accountID == "acct_initial_123")
+
+        // Coalesce concurrent refreshes through PikraCodexSubscription
+        actor SavedCreds {
+            var list: [PikraCodexCredentials] = []
+            func append(_ c: PikraCodexCredentials) { list.append(c) }
+            func all() -> [PikraCodexCredentials] { list }
+        }
+        let savedCreds = SavedCreds()
+        let subscription = PikraCodexSubscription(
+            credentials: { exchanged },
+            onRefresh: { updated in await savedCreds.append(updated) },
+            httpClient: oauthMockClient
+        )
+
+        let task1 = Task { try await subscription.currentCredentials() }
+        await refreshStarted.wait()
+        let task2 = Task { try await subscription.currentCredentials() }
+        await allowRefreshFinish.fire()
+
+        let c1 = try await task1.value
+        let c2 = try await task2.value
+        #expect(c1 == c2)
+        #expect(c1.accessToken == refreshedJWT)
+        #expect(c1.refreshToken == "rt_initial")
+        #expect(c1.accountID == "acct_initial_123")
+        #expect(await savedCreds.all().count == 1)
+        #expect(await oauthMockClient.recordedRequests().count == 3)
+
+        // Wire subscription.requestAuthorizer into PikraAgent and verify dynamic headers on outbound LLM request
+        let llmClient = MockSSEClient(handlers: [
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Authorized ok")) },
+        ])
+        let agent = try await PikraAgent.open(
+            configuration: PikraConfiguration(
+                model: testModel(),
+                systemPrompt: "Auth test",
+                httpClient: llmClient,
+                authorizeRequest: subscription.requestAuthorizer
+            )
+        )
+        let events = try await collectEvents(try await agent.prompt("Ping"))
+        #expect(events.last == .turnEnded(stopReason: .stop, userMessageKept: true, errorMessage: nil))
+
+        let llmReqs = await llmClient.recordedRequests()
+        #expect(llmReqs.count == 1)
+        let headerMap = Dictionary(
+            llmReqs[0].headers.map { ($0.0.lowercased(), $0.1) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        #expect(headerMap["authorization"] == "Bearer \(refreshedJWT)")
+        #expect(headerMap["chatgpt-account-id"] == "acct_initial_123")
+        #expect(headerMap["openai-beta"] == "responses=experimental")
+        #expect(headerMap["originator"] == "pikra")
+
+        await agent.close()
+    }
+
+    @Test("6. Skill discovery via pikra_discover_skills & live PikraSkillCatalog directory watcher (zero Task.sleep)")
+    func skillDiscoveryAndWatcherE2E() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pikra-skills-e2e-\(UUID().uuidString)", isDirectory: true)
+        let alphaDir = tmpDir.appendingPathComponent("alpha", isDirectory: true)
+        let hiddenDir = tmpDir.appendingPathComponent("hidden", isDirectory: true)
+        try FileManager.default.createDirectory(at: alphaDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: hiddenDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let alphaSkill = alphaDir.appendingPathComponent("SKILL.md")
+        let hiddenSkill = hiddenDir.appendingPathComponent("SKILL.md")
+        try """
+        ---
+        name: alpha
+        description: Alpha skill v1
+        ---
+        # Alpha
+        Instructions v1.
+        """.write(to: alphaSkill, atomically: true, encoding: .utf8)
+        try """
+        ---
+        name: hidden
+        description: Manual only skill
+        disable-model-invocation: true
+        ---
+        # Hidden
+        """.write(to: hiddenSkill, atomically: true, encoding: .utf8)
+
+        let discovered = try PikraSkillDiscovery.discover(roots: [tmpDir])
+        #expect(discovered.skills.count == 2)
+        let alphaEntry = try #require(discovered.skills.first { $0.name == "alpha" })
+        let hiddenEntry = try #require(discovered.skills.first { $0.name == "hidden" })
+        #expect(alphaEntry.description == "Alpha skill v1")
+        #expect(alphaEntry.disableModelInvocation == false)
+        #expect(alphaEntry.revision.count == 16)
+        #expect(hiddenEntry.disableModelInvocation == true)
+        #expect(discovered.prompt.hasPrefix("Available skills. Use read to load a skill's SKILL.md"))
+        #expect(discovered.prompt.contains("<available_skills>"))
+        #expect(discovered.prompt.contains("<name>alpha</name>"))
+        #expect(discovered.prompt.contains("<revision>\(alphaEntry.revision)</revision>"))
+        #expect(!discovered.prompt.contains("<name>hidden</name>"))
+
+        // Empty root produces empty prompt
+        let emptyDir = tmpDir.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyDir, withIntermediateDirectories: true)
+        let emptyCatalog = try PikraSkillDiscovery.discover(roots: [emptyDir])
+        #expect(emptyCatalog.skills.isEmpty)
+        #expect(emptyCatalog.prompt.isEmpty)
+
+        // Live event-driven watcher (zero Task.sleep)
+        let catalog = PikraSkillCatalog(roots: [tmpDir])
+        let updateTask = Task { () -> Bool in
+            var iter = catalog.updates.makeAsyncIterator()
+            return await iter.next() != nil
+        }
+
+        // Modify SKILL.md and add a new skill directory to trigger kqueue watcher immediately
+        try """
+        ---
+        name: alpha
+        description: Alpha skill v2
+        ---
+        # Alpha
+        Instructions v2.
+        """.write(to: alphaSkill, atomically: true, encoding: .utf8)
+
+        let sawUpdate = await updateTask.value
+        #expect(sawUpdate == true)
+
+        let refreshed = try await catalog.discover()
+        let updatedAlpha = try #require(refreshed.skills.first { $0.name == "alpha" })
+        #expect(updatedAlpha.description == "Alpha skill v2")
+        #expect(updatedAlpha.revision != alphaEntry.revision)
+
+        await catalog.close()
+    }
+
+    @Test("7. PikraWorkspaceTools (read, write, edit, find, bash) with PikraToolApproval E2E")
+    func workspaceToolsE2E() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pikra-ws-e2e-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        // Seed an ignored .git file and a minimal valid 1x1 PNG
+        let gitDir = workspace.appendingPathComponent(".git", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
+        try "ignored".write(to: gitDir.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+        let pngBytes = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+            0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ])
+        let pngURL = workspace.appendingPathComponent("pixel.png")
+        try pngBytes.write(to: pngURL)
+
+        let approvalLog = ApprovalLog(script: [
+            .allowPlugin, // write -> grants plugin write access so edit skips prompting
+            .allowOnce,   // bash #1 (dangerous -> always prompts)
+            .allowOnce,   // bash #2 (dangerous -> always prompts)
+        ])
+        let approval = PikraToolApproval { req in
+            await approvalLog.next(for: req)
+        }
+
+        let wsTools = PikraWorkspaceTools(
+            workspace: workspace,
+            approval: approval,
+            pluginID: "ws-plugin",
+            environment: { ["PIKRA_WS_ENV": "env_ok"] },
+            shellOutputLimit: 32
+        )
+        let tools = wsTools.tools([.readFile, .writeFile, .editFile, .findFiles, .shell])
+
+        let mockClient = MockSSEClient(handlers: [
+            // 1. write nested file
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_1",
+                    name: "write",
+                    argumentsJSON: "{\"path\":\"sub/notes.txt\",\"content\":\"line1\\nline2\\nline3\"}"
+                ))
+            },
+            // 2. edit unique line (uses cached write grant!)
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_2",
+                    name: "edit",
+                    argumentsJSON: "{\"path\":\"sub/notes.txt\",\"old_text\":\"line2\",\"new_text\":\"LINE_TWO\"}"
+                ))
+            },
+            // 3. read with offset & limit (readOnly -> no prompt)
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_3",
+                    name: "read",
+                    argumentsJSON: "{\"path\":\"sub/notes.txt\",\"offset\":2,\"limit\":2}"
+                ))
+            },
+            // 4. read PNG image (readOnly -> returns image content part)
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_4",
+                    name: "read",
+                    argumentsJSON: "{\"path\":\"pixel.png\"}"
+                ))
+            },
+            // 5. find files (skips .git)
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_5",
+                    name: "find",
+                    argumentsJSON: "{\"pattern\":\"*.txt\"}"
+                ))
+            },
+            // 6. bash success with custom env + truncation
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_6",
+                    name: "bash",
+                    argumentsJSON: "{\"command\":\"printf '%s:%s' \\\"$PIKRA_WS_ENV\\\" \\\"0123456789abcdefghijklmnopqrstuvwxyz\\\"\"}"
+                ))
+            },
+            // 7. bash non-zero exit
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "tc_7",
+                    name: "bash",
+                    argumentsJSON: "{\"command\":\"echo boom && exit 7\"}"
+                ))
+            },
+            // 8. final response
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Workspace tools verified"))
+            },
+        ])
+
+        let agent = try await PikraAgent.open(
+            configuration: PikraConfiguration(
+                model: testModel(),
+                systemPrompt: "Workspace tool test",
+                tools: tools,
+                enableDeferredGateway: false,
+                httpClient: mockClient
+            )
+        )
+
+        let events = try await collectEvents(try await agent.prompt("Run workspace tools"))
+        #expect(events.last == .turnEnded(stopReason: .stop, userMessageKept: true, errorMessage: nil))
+
+        let toolResults = events.compactMap { ev -> (String, String, PikraToolOutput, Bool)? in
+            if case .toolFinished(let id, let name, let res, let isErr) = ev {
+                return (id, name, res, isErr)
+            }
+            return nil
+        }
+        #expect(toolResults.count == 7)
+
+        // 1. write created file with 0600 permissions
+        #expect(toolResults[0].1 == "write" && toolResults[0].3 == false)
+        var st = Darwin.stat()
+        #expect(stat(workspace.appendingPathComponent("sub/notes.txt").path, &st) == 0)
+        #expect((st.st_mode & 0o777) == 0o600)
+
+        // 2. edit succeeded without re-prompting
+        #expect(toolResults[1].1 == "edit" && toolResults[1].3 == false)
+
+        // 3. read offset=2, limit=2
+        #expect(toolResults[2].1 == "read" && toolResults[2].3 == false)
+        #expect(toolResults[2].2.textOutput == "LINE_TWO\nline3")
+
+        // 4. read image returns PikraContentPart.image
+        #expect(toolResults[3].1 == "read" && toolResults[3].3 == false)
+        #expect(toolResults[3].2.content == [.image(data: pngBytes.base64EncodedString(), mimeType: "image/png")])
+
+        // 5. find matched sub/notes.txt and skipped .git
+        #expect(toolResults[4].1 == "find" && toolResults[4].3 == false)
+        #expect(toolResults[4].2.textOutput == "sub/notes.txt")
+
+        // 6. bash success with env & output_truncated
+        #expect(toolResults[5].1 == "bash" && toolResults[5].3 == false)
+        let bashOk = try JSONDecoder().decode(JSONValue.self, from: Data(toolResults[5].2.textOutput.utf8))
+        #expect(bashOk["exit_code"]?.intValue == 0)
+        #expect(bashOk["output_truncated"]?.boolValue == true)
+        #expect(bashOk["output"]?.stringValue?.hasPrefix("env_ok:") == true)
+        #expect((bashOk["output"]?.stringValue?.utf8.count ?? 0) <= 32)
+
+        // 7. bash non-zero exit sets isError = true
+        #expect(toolResults[6].1 == "bash" && toolResults[6].3 == true)
+        let bashErr = try JSONDecoder().decode(JSONValue.self, from: Data(toolResults[6].2.textOutput.utf8))
+        #expect(bashErr["exit_code"]?.intValue == 7)
+        #expect(bashErr["output"]?.stringValue?.contains("boom") == true)
+
+        // Approval sequence: write (allowPlugin), bash #1 (allowOnce), bash #2 (allowOnce); read/find/edit skipped
+        let recordedApprovals = await approvalLog.recorded()
+        #expect(recordedApprovals == [
+            "ws-plugin:write:write",
+            "ws-plugin:bash:dangerous",
+            "ws-plugin:bash:dangerous",
+        ])
 
         await agent.close()
     }
