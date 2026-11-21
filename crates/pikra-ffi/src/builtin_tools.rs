@@ -23,23 +23,26 @@ use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
-use std::panic::AssertUnwindSafe;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{Notify, watch};
 
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("pikra-builtins")
-            .enable_all()
-            .build()
-            .expect("could not start workspace tool runtime")
-    })
+fn runtime() -> Result<&'static Runtime, String> {
+    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("pikra-builtins")
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start workspace tool runtime: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub type PikraBuiltinEnvProviderFn =
@@ -77,8 +80,6 @@ struct EnvConfig {
     cwd: PathBuf,
     max_output_bytes: Option<usize>,
     default_bash_timeout_ms: Option<u64>,
-    #[serde(default)]
-    workspace_compatibility: bool,
     #[cfg(not(target_os = "ios"))]
     shell_max_output_bytes: Option<usize>,
 }
@@ -98,7 +99,6 @@ struct RunState {
 
 struct BuiltinEnv {
     config: Arc<WorkspaceToolsConfig>,
-    workspace_compatibility: bool,
     #[cfg(not(target_os = "ios"))]
     shell_max_output_bytes: Option<usize>,
     transport: Option<Arc<dyn HttpTransport>>,
@@ -116,7 +116,7 @@ struct BuiltinEnv {
 
 impl BuiltinEnv {
     fn register(self: &Arc<Self>, cancel: CancelToken) -> Option<ActiveRun> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
             return None;
         }
@@ -129,27 +129,50 @@ impl BuiltinEnv {
         })
     }
 
-    fn begin_shutdown(self: &Arc<Self>) {
+    fn begin_shutdown(self: &Arc<Self>) -> bool {
         let (active, cleanup) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.closed {
-                return;
+                return *self.shutdown_done.borrow();
             }
             state.closed = true;
             let active = state.active.values().cloned().collect::<Vec<_>>();
             (active, std::mem::take(&mut state.cleanup))
         };
+        if active.is_empty() && cleanup.is_empty() {
+            self.shutdown_done.send_replace(true);
+            return true;
+        }
         for cancel in active {
             cancel.cancel();
         }
         let env = self.clone();
-        runtime().spawn(async move {
-            futures_util::future::join_all(cleanup.into_iter().map(|close| close())).await;
-            while !env.state.lock().unwrap().active.is_empty() {
-                env.idle.notified().await;
+        match runtime() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    futures_util::future::join_all(cleanup.into_iter().map(|close| close())).await;
+                    loop {
+                        let notified = env.idle.notified();
+                        if env
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .active
+                            .is_empty()
+                        {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    env.shutdown_done.send_replace(true);
+                });
+                false
             }
-            env.shutdown_done.send_replace(true);
-        });
+            Err(_) => {
+                self.shutdown_done.send_replace(true);
+                true
+            }
+        }
     }
 
     #[cfg(all(unix, not(target_os = "ios")))]
@@ -159,7 +182,7 @@ impl BuiltinEnv {
         create: impl FnOnce(Arc<WorkspaceToolsConfig>, WakeGate, Option<BackgroundEventCallback>) -> T,
         shutdown: impl FnOnce(T) -> BoxFuture<'static, ()> + Send + 'static,
     ) -> Result<T, String> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
             return Err("Workspace tools are closed".into());
         }
@@ -203,7 +226,12 @@ struct ActiveRun {
 
 impl Drop for ActiveRun {
     fn drop(&mut self) {
-        self.env.state.lock().unwrap().active.remove(&self.id);
+        self.env
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .remove(&self.id);
         self.env.idle.notify_one();
     }
 }
@@ -218,6 +246,14 @@ pub struct PikraBuiltinTool {
 
 pub struct PikraBuiltinRun(CancelToken);
 
+fn catch_handle<T>(out_error: *mut *mut c_char, f: impl FnOnce() -> Result<T, String>) -> *mut T {
+    let result = match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(res) => res,
+        Err(_) => Err("panic inside pikra builtin FFI".into()),
+    };
+    into_handle(result, out_error)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_env_create(
     config_json: *const c_char,
@@ -225,7 +261,7 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
     http_callbacks: *const PikraHttpCallbacks,
     out_error: *mut *mut c_char,
 ) -> *mut PikraBuiltinEnv {
-    let create = || -> Result<_, String> {
+    catch_handle(out_error, || {
         let config = unsafe { read_cstr(config_json, "config_json") }?;
         let config: EnvConfig = serde_json::from_str(config).map_err(|e| e.to_string())?;
         if config.cwd.as_os_str().is_empty() {
@@ -248,9 +284,6 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
             workspace.max_output_bytes = max;
         }
         workspace.default_bash_timeout_ms = config.default_bash_timeout_ms;
-        if config.workspace_compatibility {
-            workspace.ignore_dirs.push(".build".into());
-        }
         if let Some(host) = &host
             && let Some(provide) = host.environment
         {
@@ -282,7 +315,6 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
         });
         Ok(PikraBuiltinEnv(Arc::new(BuiltinEnv {
             config: Arc::new(workspace),
-            workspace_compatibility: config.workspace_compatibility,
             #[cfg(not(target_os = "ios"))]
             shell_max_output_bytes: config.shell_max_output_bytes,
             transport,
@@ -297,8 +329,7 @@ pub unsafe extern "C" fn pikra_builtin_env_create(
             idle: Notify::new(),
             shutdown_done: watch::channel(false).0,
         })))
-    };
-    into_handle(create(), out_error)
+    })
 }
 
 fn into_handle<T>(result: Result<T, String>, out_error: *mut *mut c_char) -> *mut T {
@@ -316,15 +347,17 @@ pub unsafe extern "C" fn pikra_builtin_env_complete(
     completion: *mut PikraBuiltinEnvCompletion,
     environment_json: *const c_char,
 ) {
-    if !completion.is_null() {
-        let completion = unsafe { Box::from_raw(completion) };
-        let environment: HashMap<String, String> =
-            unsafe { read_cstr(environment_json, "environment_json") }
-                .ok()
-                .and_then(|json| serde_json::from_str(json).ok())
-                .unwrap_or_default();
-        let _ = completion.0.send(environment.into_iter().collect());
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !completion.is_null() {
+            let completion = unsafe { Box::from_raw(completion) };
+            let environment: HashMap<String, String> =
+                unsafe { read_cstr(environment_json, "environment_json") }
+                    .ok()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+            let _ = completion.0.send(environment.into_iter().collect());
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -333,29 +366,44 @@ pub unsafe extern "C" fn pikra_builtin_env_shutdown(
     ctx: *mut c_void,
     on_done: Option<PikraVoidDoneFn>,
 ) {
-    let Some(env) = (unsafe { env.as_ref() }) else {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(env) = (unsafe { env.as_ref() }) else {
+            if let Some(done) = on_done {
+                done(ctx);
+            }
+            return;
+        };
+        let done_now = env.0.begin_shutdown();
         if let Some(done) = on_done {
-            done(ctx);
+            if done_now || *env.0.shutdown_done.borrow() {
+                done(ctx);
+            } else {
+                let ctx = SendCallbackCtx(ctx);
+                let mut finished = env.0.shutdown_done.subscribe();
+                match runtime() {
+                    Ok(rt) => {
+                        rt.spawn(async move {
+                            let _ = finished.wait_for(|done| *done).await;
+                            done(ctx.as_ptr());
+                        });
+                    }
+                    Err(_) => {
+                        done(ctx.as_ptr());
+                    }
+                }
+            }
         }
-        return;
-    };
-    env.0.begin_shutdown();
-    if let Some(done) = on_done {
-        let ctx = SendCallbackCtx(ctx);
-        let mut finished = env.0.shutdown_done.subscribe();
-        runtime().spawn(async move {
-            let _ = finished.wait_for(|done| *done).await;
-            done(ctx.as_ptr());
-        });
-    }
+    }));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_env_destroy(env: *mut PikraBuiltinEnv) {
-    if !env.is_null() {
-        let env = unsafe { Box::from_raw(env) };
-        env.0.begin_shutdown();
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !env.is_null() {
+            let env = unsafe { Box::from_raw(env) };
+            let _ = env.0.begin_shutdown();
+        }
+    }));
 }
 
 fn factory<T: AgentTool + 'static>(
@@ -364,9 +412,9 @@ fn factory<T: AgentTool + 'static>(
     blocking: bool,
     make: impl FnOnce(&BuiltinEnv) -> Result<T, String>,
 ) -> *mut PikraBuiltinTool {
-    let result = (|| {
+    catch_handle(out_error, || {
         let env = unsafe { env.as_ref() }.ok_or("Specify a workspace environment")?;
-        if env.0.state.lock().unwrap().closed {
+        if env.0.state.lock().unwrap_or_else(|e| e.into_inner()).closed {
             return Err("Workspace tools are closed".into());
         }
         Ok(PikraBuiltinTool {
@@ -374,8 +422,7 @@ fn factory<T: AgentTool + 'static>(
             tool: Arc::new(make(&env.0)?),
             blocking,
         })
-    })();
-    into_handle(result, out_error)
+    })
 }
 
 macro_rules! builtin_factory {
@@ -391,14 +438,9 @@ macro_rules! builtin_factory {
     };
 }
 
-builtin_factory!(pikra_builtin_tool_read, true, |env| {
-    let tool = ReadTool::new(env.config.clone());
-    Ok(if env.workspace_compatibility {
-        tool.with_plain_text()
-    } else {
-        tool
-    })
-});
+builtin_factory!(pikra_builtin_tool_read, true, |env| Ok(ReadTool::new(
+    env.config.clone()
+)));
 builtin_factory!(pikra_builtin_tool_write, true, |env| Ok(WriteTool::new(
     env.config.clone()
 )));
@@ -470,12 +512,13 @@ macro_rules! unavailable_subprocess {
             _env: *mut PikraBuiltinEnv,
             out_error: *mut *mut c_char,
         ) -> *mut PikraBuiltinTool {
-            unsafe { write_out_string(out_error, if cfg!(target_os = "ios") {
-                "subprocess tools are unavailable on iOS"
-            } else {
-                "subprocess tools are unavailable on this platform"
-            }) };
-            null_mut()
+            catch_handle(out_error, || {
+                Err(if cfg!(target_os = "ios") {
+                    "subprocess tools are unavailable on iOS".into()
+                } else {
+                    "subprocess tools are unavailable on this platform".into()
+                })
+            })
         }
     };
 }
@@ -495,7 +538,7 @@ pub unsafe extern "C" fn pikra_builtin_tool_override(
     override_json: *const c_char,
     out_error: *mut *mut c_char,
 ) -> *mut PikraBuiltinTool {
-    let result = (|| {
+    catch_handle(out_error, || {
         let tool = unsafe { tool.as_ref() }.ok_or("Specify a workspace tool")?;
         let spec = unsafe { read_cstr(override_json, "override_json") }?;
         let spec: ToolDefinitionOverride = serde_json::from_str(spec).map_err(|e| e.to_string())?;
@@ -504,24 +547,31 @@ pub unsafe extern "C" fn pikra_builtin_tool_override(
             tool: wrap_tool_with_override(tool.tool.clone(), spec)?,
             blocking: tool.blocking,
         })
-    })();
-    into_handle(result, out_error)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_tool_definition_json(
     tool: *const PikraBuiltinTool,
 ) -> *mut c_char {
-    unsafe { tool.as_ref() }
-        .and_then(|tool| CString::new(serde_json::to_string(&tool.tool.definition()).ok()?).ok())
-        .map_or(null_mut(), CString::into_raw)
+    catch_unwind(AssertUnwindSafe(|| {
+        unsafe { tool.as_ref() }
+            .and_then(|tool| {
+                CString::new(serde_json::to_string(&tool.tool.definition()).ok()?).ok()
+            })
+            .map_or(null_mut(), CString::into_raw)
+    }))
+    .unwrap_or(null_mut())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_tool_is_sequential(tool: *const PikraBuiltinTool) -> bool {
-    unsafe { tool.as_ref() }.is_some_and(|tool| {
-        tool.tool.execution_mode() == pikra_agent::ToolExecutionMode::Sequential
-    })
+    catch_unwind(AssertUnwindSafe(|| {
+        unsafe { tool.as_ref() }.is_some_and(|tool| {
+            tool.tool.execution_mode() == pikra_agent::ToolExecutionMode::Sequential
+        })
+    }))
+    .unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
@@ -534,12 +584,13 @@ pub unsafe extern "C" fn pikra_builtin_tool_execute(
     done: Option<PikraResultDoneFn>,
     out_error: *mut *mut c_char,
 ) -> *mut PikraBuiltinRun {
-    let start = || {
+    catch_handle(out_error, || {
         let tool = unsafe { tool.as_ref() }.ok_or("Specify a workspace tool")?;
         let done = done.ok_or("Specify a tool completion callback")?;
         let call_id = unsafe { read_cstr(call_id, "call_id") }?.to_owned();
         let args = unsafe { read_cstr(arguments_json, "arguments_json") }?;
         let args: Value = serde_json::from_str(args).map_err(|e| e.to_string())?;
+        let rt = runtime()?;
         let cancel = CancelToken::new();
         let active = tool
             .env
@@ -590,13 +641,13 @@ pub unsafe extern "C" fn pikra_builtin_tool_execute(
             drop(active);
         };
         if tool.blocking {
-            runtime().spawn_blocking(|| runtime().handle().block_on(execute));
+            let handle = rt.handle().clone();
+            rt.spawn_blocking(move || handle.block_on(execute));
         } else {
-            runtime().spawn(execute);
+            rt.spawn(execute);
         }
         Ok(PikraBuiltinRun(cancel))
-    };
-    into_handle(start(), out_error)
+    })
 }
 
 fn serialize_result(result: &AgentToolResult) -> Option<CString> {
@@ -605,21 +656,27 @@ fn serialize_result(result: &AgentToolResult) -> Option<CString> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_tool_cancel(run: *const PikraBuiltinRun) {
-    if let Some(run) = unsafe { run.as_ref() } {
-        run.0.cancel();
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(run) = unsafe { run.as_ref() } {
+            run.0.cancel();
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_run_destroy(run: *mut PikraBuiltinRun) {
-    if !run.is_null() {
-        drop(unsafe { Box::from_raw(run) });
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !run.is_null() {
+            drop(unsafe { Box::from_raw(run) });
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_builtin_tool_destroy(tool: *mut PikraBuiltinTool) {
-    if !tool.is_null() {
-        drop(unsafe { Box::from_raw(tool) });
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !tool.is_null() {
+            drop(unsafe { Box::from_raw(tool) });
+        }
+    }));
 }

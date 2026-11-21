@@ -2,7 +2,7 @@ use crate::WorkspaceToolsConfig;
 use crate::util::{BoundedOutputBuffer, display_path, resolve_path};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
-use pikra_schema::{int_schema, num_schema, obj_schema, str_schema, with_bounds, with_description};
+use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_description};
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const CHUNK_READ_BYTES: usize = 8192;
+const MAX_TIMEOUT_MS: u64 = 86_400_000;
 
 /// Built-in `bash` tool executing shell commands in an isolated Unix process group
 /// with dynamic host `env_provider`, bounded UTF-8-safe output capture, and process-group SIGKILL on cancel/timeout.
@@ -95,14 +96,9 @@ impl AgentTool for BashTool {
                     false,
                 ),
                 (
-                    "timeout",
-                    with_description(num_schema(), "Optional timeout in seconds (greater than 0 and at most 86400)."),
-                    false,
-                ),
-                (
                     "timeout_ms",
                     with_description(
-                        with_bounds(int_schema(), Some(1.0), None),
+                        with_bounds(int_schema(), Some(1.0), Some(MAX_TIMEOUT_MS as f64)),
                         "Optional timeout in milliseconds before terminating the process group.",
                     ),
                     false,
@@ -150,20 +146,13 @@ impl AgentTool for BashTool {
             }
 
             let timeout_ms = match args.get("timeout_ms") {
-                None | Some(Value::Null) => match args.get("timeout") {
-                    None | Some(Value::Null) => config.default_bash_timeout_ms,
-                    Some(value) => {
-                        let seconds = value
-                            .as_f64()
-                            .filter(|seconds| *seconds > 0.0 && *seconds <= 86_400.0)
-                            .ok_or("timeout must be greater than 0 and at most 86400 seconds")?;
-                        Some((seconds * 1000.0).ceil() as u64)
-                    }
-                },
+                None | Some(Value::Null) => config.default_bash_timeout_ms,
                 Some(v) => Some(
                     v.as_u64()
-                        .filter(|&n| n >= 1)
-                        .ok_or_else(|| "timeout_ms must be an integer >= 1".to_string())?,
+                        .filter(|&n| (1..=MAX_TIMEOUT_MS).contains(&n))
+                        .ok_or_else(|| {
+                            format!("timeout_ms must be an integer between 1 and {MAX_TIMEOUT_MS}")
+                        })?,
                 ),
             };
 
@@ -191,7 +180,6 @@ impl AgentTool for BashTool {
             for (key, val) in extra_env {
                 cmd.env(key, val);
             }
-            cmd.env("AI_AGENT", "pikra");
 
             #[cfg(unix)]
             {
@@ -211,8 +199,8 @@ impl AgentTool for BashTool {
             let mut err_chunk = [0u8; CHUNK_READ_BYTES];
 
             let mut buffer = BoundedOutputBuffer::new(config.max_output_bytes);
-            let deadline =
-                timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+            let deadline = timeout_ms
+                .and_then(|ms| tokio::time::Instant::now().checked_add(Duration::from_millis(ms)));
             let mut stop_kind = StopReasonKind::Completed;
 
             // Phase 1: stream stdout & stderr concurrently, racing cancellation and timeout.

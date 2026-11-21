@@ -232,8 +232,8 @@ async fn workspace_write_read_edit_find_e2e() {
                 "edit",
                 json!({
                     "path": "crlf.txt",
-                    "old_text": "alpha\nbeta",
-                    "new_text": "alpha\nBETA_UPDATED"
+                    "oldText": "alpha\nbeta",
+                    "newText": "alpha\nBETA_UPDATED"
                 }),
             )),
         ],
@@ -250,7 +250,7 @@ async fn workspace_write_read_edit_find_e2e() {
                 "path": "src/app.rs",
                 "edits": [
                     { "oldText": "let a = 1;", "newText": "let a = 10;" },
-                    { "old_text": "let b = 2;", "new_text": "let b = 20;" }
+                    { "oldText": "let b = 2;", "newText": "let b = 20;" }
                 ]
             }),
         ))],
@@ -450,7 +450,7 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
 
     let env_res = by_id("c_env");
     assert!(!env_res.is_error);
-    assert_eq!(result_text(env_res), "from-login-shell-42|pikra");
+    assert_eq!(result_text(env_res), "from-login-shell-42|");
 
     let trunc_res = by_id("c_utf8_trunc");
     assert!(!trunc_res.is_error);

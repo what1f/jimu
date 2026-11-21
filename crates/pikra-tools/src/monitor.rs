@@ -6,7 +6,7 @@ use crate::exec_session::{
     OUTPUT_CHUNK_BYTES, OutputStream, ProcessChild, ProcessControl, ProcessEnd, ProcessOutput,
     deadline_after_ms, prepare_shell, spawn_managed, spawn_process, wait_deadline,
 };
-use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
+use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{
     int_schema, obj_schema, str_schema, string_enum, with_bounds, with_description,
@@ -134,7 +134,7 @@ impl MonitorManager {
     /// Stop and reap all monitors silently. This manager will reject new monitors.
     pub async fn shutdown(&self) {
         let controls: Vec<_> = {
-            let mut monitors = self.0.monitors.lock().unwrap();
+            let mut monitors = self.0.monitors.lock().unwrap_or_else(|e| e.into_inner());
             monitors.closed = true;
             monitors
                 .entries
@@ -163,7 +163,7 @@ impl MonitorManager {
         self.0
             .monitors
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .check_capacity(self.0.config.max_active)?;
 
         let (_, process) = prepare_shell(
@@ -173,15 +173,28 @@ impl MonitorManager {
             cancel,
         )
         .await?;
-        let log_dir = match &self.0.config.monitor_log_dir {
-            Some(path) => self.0.workspace.cwd.join(path),
-            None => std::env::temp_dir().join("agent-monitors"),
+        let (log_dir, is_default_dir) = match &self.0.config.monitor_log_dir {
+            Some(path) => (self.0.workspace.cwd.join(path), false),
+            None => (
+                // SAFETY: geteuid is always safe to call and returns the caller's effective UID.
+                std::env::temp_dir().join(format!("agent-monitors-{}", unsafe { libc::geteuid() })),
+                true,
+            ),
         };
         let log_dir =
             std::path::absolute(log_dir).map_err(|err| format!("Invalid log directory: {err}"))?;
-        tokio::fs::create_dir_all(&log_dir)
-            .await
-            .map_err(|err| format!("Could not create log directory: {err}"))?;
+        if is_default_dir {
+            let mut builder = tokio::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(&log_dir)
+                .await
+                .map_err(|err| format!("Could not create log directory: {err}"))?;
+        } else {
+            tokio::fs::create_dir_all(&log_dir)
+                .await
+                .map_err(|err| format!("Could not create log directory: {err}"))?;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -205,7 +218,7 @@ impl MonitorManager {
         };
 
         let start = || {
-            let mut monitors = self.0.monitors.lock().unwrap();
+            let mut monitors = self.0.monitors.lock().unwrap_or_else(|e| e.into_inner());
             monitors.check_capacity(self.0.config.max_active)?;
             if cancel.is_cancelled() {
                 return Err("Operation aborted".into());
@@ -238,7 +251,12 @@ impl MonitorManager {
                 ),
                 move || {
                     if let Some(manager) = cleanup_manager.upgrade() {
-                        manager.monitors.lock().unwrap().entries.remove(&id);
+                        manager
+                            .monitors
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entries
+                            .remove(&id);
                     }
                 },
             );
@@ -256,7 +274,7 @@ impl MonitorManager {
             .0
             .monitors
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .get(id)
             .map(|entry| entry.control.clone())
@@ -270,7 +288,7 @@ impl MonitorManager {
         self.0
             .monitors
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .values()
             .filter(|entry| entry.is_active())
@@ -298,7 +316,13 @@ impl Monitors {
 
 impl Drop for MonitorManagerInner {
     fn drop(&mut self) {
-        for entry in self.monitors.get_mut().unwrap().entries.values() {
+        for entry in self
+            .monitors
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .values()
+        {
             entry.control.stop();
         }
     }
@@ -406,6 +430,10 @@ impl AgentTool for MonitorTool {
         }
     }
 
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
     fn execute(
         &self,
         _tool_call_id: String,
@@ -501,7 +529,7 @@ async fn run_monitor(
     drop(log);
     drop(output);
     let events = manager.upgrade().and_then(|manager| {
-        let mut monitors = manager.monitors.lock().unwrap();
+        let mut monitors = manager.monitors.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = monitors.entries.get_mut(&info.id) {
             entry.exiting = true;
         }
@@ -653,7 +681,12 @@ impl MonitorOutput {
             return;
         }
         let events = manager.upgrade().and_then(|manager| {
-            (!manager.monitors.lock().unwrap().closed).then(|| manager.events.clone())
+            (!manager
+                .monitors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .closed)
+                .then(|| manager.events.clone())
         });
         if !control.stopped.is_cancelled()
             && let Some(events) = events

@@ -91,19 +91,28 @@ impl Fetcher {
         cancel: &CancelToken,
     ) -> Result<Download, Web2MdError> {
         for hop in 0..=MAX_REDIRECTS {
-            check_destination(&url, &self.config).await?;
+            let addrs = check_destination(&url, &self.config).await?;
             url.set_fragment(None);
+            let mut headers = vec![
+                ("x-pikra-no-redirect".into(), "1".into()),
+                ("accept".into(), accept.into()),
+                (
+                    "user-agent".into(),
+                    concat!("Pikra/", env!("CARGO_PKG_VERSION")).into(),
+                ),
+            ];
+            if !addrs.is_empty() {
+                let addrs_csv = addrs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                headers.push(("x-pikra-resolve-addrs".into(), addrs_csv));
+            }
             let request = HttpRequest {
                 method: "GET".into(),
                 url: url.to_string(),
-                headers: vec![
-                    ("x-pikra-no-redirect".into(), "1".into()),
-                    ("accept".into(), accept.into()),
-                    (
-                        "user-agent".into(),
-                        concat!("Pikra/", env!("CARGO_PKG_VERSION")).into(),
-                    ),
-                ],
+                headers,
                 body: Default::default(),
                 timeout_ms: Some(TIMEOUT.as_millis() as u64),
             };

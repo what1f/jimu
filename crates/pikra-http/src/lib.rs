@@ -8,6 +8,7 @@ use pikra_ai::{
 };
 use reqwest::header::{HeaderName, HeaderValue};
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -16,6 +17,71 @@ use std::time::Duration;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
 const MANUAL_REDIRECT_HEADER: &str = "x-pikra-no-redirect";
+const RESOLVE_ADDRS_HEADER: &str = "x-pikra-resolve-addrs";
+
+fn has_proxy_env() -> bool {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+fn parse_resolve_addrs(headers: &[(String, String)]) -> Vec<SocketAddr> {
+    let mut addrs = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(RESOLVE_ADDRS_HEADER) {
+            continue;
+        }
+        for raw in value.split(',') {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+                addrs.push(addr);
+            } else {
+                return Vec::new();
+            }
+        }
+    }
+    addrs
+}
+
+fn domain_host_for_pinning(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if unbracketed.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addrs)
+        .build()
+        .or_else(|_| {
+            reqwest::Client::builder()
+                .tls_built_in_native_certs(false)
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(host, addrs)
+                .build()
+        })
+}
 
 fn decode_capped_utf8(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
@@ -149,21 +215,40 @@ impl HttpTransport for ReqwestTransport {
                 .headers
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(MANUAL_REDIRECT_HEADER));
-            let client = match (&self.manual, manual) {
-                (Some(client), true) => client
-                    .get_or_init(|| {
-                        build_client(reqwest::redirect::Policy::none).map_err(|e| e.to_string())
-                    })
-                    .as_ref()
-                    .map_err(|e| TransportError::Network(e.clone()))?,
-                _ => &self.client,
+            let resolve_addrs = parse_resolve_addrs(&request.headers);
+            let pinned_client = if !resolve_addrs.is_empty() && !has_proxy_env() {
+                if let Some(host) = domain_host_for_pinning(&request.url) {
+                    Some(
+                        build_pinned_client(&host, &resolve_addrs)
+                            .map_err(|e| TransportError::Network(e.to_string()))?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let client = if let Some(pinned) = pinned_client.as_ref() {
+                pinned
+            } else {
+                match (&self.manual, manual) {
+                    (Some(client), true) => client
+                        .get_or_init(|| {
+                            build_client(reqwest::redirect::Policy::none).map_err(|e| e.to_string())
+                        })
+                        .as_ref()
+                        .map_err(|e| TransportError::Network(e.clone()))?,
+                    _ => &self.client,
+                }
             };
             let mut builder = client.request(method, &request.url);
             if let Some(timeout_ms) = request.timeout_ms {
                 builder = builder.timeout(Duration::from_millis(timeout_ms));
             }
             for (name, value) in &request.headers {
-                if name.eq_ignore_ascii_case(MANUAL_REDIRECT_HEADER) {
+                if name.eq_ignore_ascii_case(MANUAL_REDIRECT_HEADER)
+                    || name.eq_ignore_ascii_case(RESOLVE_ADDRS_HEADER)
+                {
                     continue;
                 }
                 let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {

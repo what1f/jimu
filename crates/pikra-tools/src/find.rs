@@ -94,7 +94,15 @@ impl AgentTool for FindTool {
             let mut hit_limit = false;
             for entry in walk.build() {
                 check_cancelled(&cancel)?;
-                let entry = entry.map_err(|err| format!("Could not search paths: {err}"))?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        if err.depth() == Some(0) {
+                            return Err(format!("Could not search paths: {err}"));
+                        }
+                        continue;
+                    }
+                };
                 if !entry
                     .file_type()
                     .is_some_and(|kind| kind.is_file() || kind.is_dir())

@@ -176,6 +176,12 @@ struct WirePromptRequest: Encodable {
     let id: String?
     let content: [PikraContentPart]
     let isMeta: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case content
+        case isMeta = "is_meta"
+    }
 }
 
 struct WireHttpRequestHead: Decodable {

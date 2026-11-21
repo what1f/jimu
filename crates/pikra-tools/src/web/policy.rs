@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use url::{Host, Url};
 
@@ -48,37 +48,49 @@ pub(super) fn check_url(url: &Url) -> Result<(), Web2MdError> {
 pub(super) async fn check_destination(
     url: &Url,
     config: &WebFetchConfig,
-) -> Result<(), Web2MdError> {
+) -> Result<Vec<SocketAddr>, Web2MdError> {
     check_url(url)?;
     if config.allow_private_hosts {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let public = match url.host().ok_or(Web2MdError::InvalidUrl)? {
-        Host::Ipv4(ip) => public_ip(ip.into()),
-        Host::Ipv6(ip) => public_ip(ip.into()),
+    match url.host().ok_or(Web2MdError::InvalidUrl)? {
+        Host::Ipv4(ip) => {
+            if !public_ip(ip.into()) {
+                return Err(Web2MdError::PrivateAddress);
+            }
+            Ok(Vec::new())
+        }
+        Host::Ipv6(ip) => {
+            if !public_ip(ip.into()) {
+                return Err(Web2MdError::PrivateAddress);
+            }
+            Ok(Vec::new())
+        }
         Host::Domain(domain) => {
             let domain = domain.trim_end_matches('.');
             if !domain.contains('.') || domain.ends_with(".localhost") || domain.ends_with(".local")
             {
                 return Err(Web2MdError::PrivateAddress);
             }
-            let addresses: Vec<IpAddr> = if let Some(resolve) = &config.host_resolver {
-                resolve(domain).map_err(|_| Web2MdError::Dns)?
+            let port = url.port_or_known_default().ok_or(Web2MdError::InvalidUrl)?;
+            let addresses: Vec<SocketAddr> = if let Some(resolve) = &config.host_resolver {
+                resolve(domain)
+                    .map_err(|_| Web2MdError::Dns)?
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect()
             } else {
-                let port = url.port_or_known_default().ok_or(Web2MdError::InvalidUrl)?;
                 tokio::net::lookup_host((domain, port))
                     .await
                     .map_err(|_| Web2MdError::Dns)?
-                    .map(|address| address.ip())
                     .collect()
             };
-            !addresses.is_empty() && addresses.into_iter().all(public_ip)
+            if addresses.is_empty() || !addresses.iter().all(|addr| public_ip(addr.ip())) {
+                return Err(Web2MdError::PrivateAddress);
+            }
+            Ok(addresses)
         }
-    };
-    if !public {
-        return Err(Web2MdError::PrivateAddress);
     }
-    Ok(())
 }
 
 fn public_ip(ip: IpAddr) -> bool {

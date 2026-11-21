@@ -42,8 +42,8 @@ pub use bash::BashTool;
 pub use edit::EditTool;
 #[cfg(feature = "sleep")]
 pub use events::{
-    BackgroundEventCallback, BackgroundToolEvent, MonitorStopReason, WakeGate, WakeOutcome,
-    format_background_events_xml,
+    BackgroundEventCallback, BackgroundToolEvent, MonitorStopReason, ShellStopReason, WakeGate,
+    WakeOutcome, format_background_events_xml,
 };
 #[cfg(all(feature = "shell", unix, not(target_os = "ios")))]
 pub use exec_session::{ExecCommandTool, ProcessSessionManager, WriteStdinTool};

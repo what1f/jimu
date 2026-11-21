@@ -254,17 +254,20 @@ fn update_text(source: &str, chunks: &[Chunk<'_>], shown: &str) -> Result<String
         };
 
         for line in &raw[cursor..index] {
-            push_source_line(&mut output, line, ending);
+            ensure_line_break(&mut output, ending);
+            output.push_str(line);
         }
         cursor = index;
         for change in &chunk.lines {
             match change {
                 Change::Keep(_) => {
-                    push_source_line(&mut output, raw[cursor], ending);
+                    ensure_line_break(&mut output, ending);
+                    output.push_str(raw[cursor]);
                     cursor += 1;
                 }
                 Change::Remove(_) => cursor += 1,
                 Change::Insert(line) => {
+                    ensure_line_break(&mut output, ending);
                     output.push_str(line);
                     output.push_str(ending);
                 }
@@ -272,14 +275,14 @@ fn update_text(source: &str, chunks: &[Chunk<'_>], shown: &str) -> Result<String
         }
     }
     for line in &raw[cursor..] {
-        push_source_line(&mut output, line, ending);
+        ensure_line_break(&mut output, ending);
+        output.push_str(line);
     }
     Ok(output)
 }
 
-fn push_source_line(output: &mut String, line: &str, ending: &str) {
-    output.push_str(line);
-    if !line.ends_with('\n') {
+fn ensure_line_break(output: &mut String, ending: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
         output.push_str(ending);
     }
 }

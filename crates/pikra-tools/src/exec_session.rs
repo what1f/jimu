@@ -1,8 +1,10 @@
 use crate::WorkspaceToolsConfig;
 use crate::bash::{ProcessGroupGuard, build_shell_command};
-use crate::events::{BackgroundEventCallback, BackgroundEvents, BackgroundToolEvent, WakeGate};
+use crate::events::{
+    BackgroundEventCallback, BackgroundEvents, BackgroundToolEvent, ShellStopReason, WakeGate,
+};
 use crate::util::{BoundedOutputBuffer, resolve_path};
-use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
+use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{
     bool_schema, int_schema, obj_schema, str_schema, with_bounds, with_description,
@@ -57,7 +59,7 @@ impl Sessions {
                 if Some(**id) == exclude {
                     return false;
                 }
-                let state = session.state.lock().unwrap();
+                let state = session.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.backgrounded && state.exit.is_none()
             })
             .count();
@@ -99,7 +101,7 @@ impl ProcessSessionManager {
     /// Stop and reap the managed commands. This manager will reject new commands.
     pub async fn shutdown(&self) {
         let sessions: Vec<_> = {
-            let mut sessions = self.0.sessions.lock().unwrap();
+            let mut sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions.closed = true;
             sessions.finished.clear();
             sessions.active.values().cloned().collect()
@@ -120,7 +122,7 @@ impl ProcessSessionManager {
         args: &ExecArgs,
         progress: mpsc::Sender<Vec<u8>>,
     ) -> Result<Arc<Session>, String> {
-        let mut sessions = self.0.sessions.lock().unwrap();
+        let mut sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.closed {
             return Err("Command sessions are closed.".into());
         }
@@ -168,14 +170,19 @@ impl ProcessSessionManager {
             ),
             move || {
                 if let Some(manager) = cleanup_manager.upgrade() {
-                    manager.sessions.lock().unwrap().active.remove(&id);
+                    manager
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .active
+                        .remove(&id);
                 }
                 // A shutting-down runtime may drop the worker before it publishes
                 // its result. Unblock any caller that already holds this session.
                 cleanup_session
                     .state
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .exit
                     .get_or_insert(ProcessExit {
                         reason: ProcessEnd::Stopped,
@@ -195,8 +202,8 @@ impl ProcessSessionManager {
         let (unread, exit) = {
             // Use the same lock order as process completion so a command can
             // only become a background session while reserving a slot.
-            let sessions = self.0.sessions.lock().unwrap();
-            let mut state = session.state.lock().unwrap();
+            let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = session.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.exit.is_none() && !state.backgrounded {
                 if sessions.closed {
                     return Err("Command sessions are closed.".into());
@@ -216,7 +223,7 @@ impl ProcessSessionManager {
     }
 
     fn session(&self, id: u32) -> Result<Arc<Session>, String> {
-        let sessions = self.0.sessions.lock().unwrap();
+        let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions
             .active
             .get(&id)
@@ -233,7 +240,13 @@ impl ProcessSessionManager {
 
 impl Drop for SessionManagerInner {
     fn drop(&mut self) {
-        for session in self.sessions.get_mut().unwrap().active.values() {
+        for session in self
+            .sessions
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .values()
+        {
             session.control.stop();
         }
     }
@@ -260,7 +273,7 @@ impl Session {
     async fn wait_until(&self, ready: impl Fn(&SessionState) -> bool) {
         loop {
             let changed = self.changed.notified();
-            if ready(&self.state.lock().unwrap()) {
+            if ready(&self.state.lock().unwrap_or_else(|e| e.into_inner())) {
                 return;
             }
             changed.await;
@@ -277,7 +290,17 @@ impl Session {
 
     fn render(&self, unread: BoundedOutputBuffer, exit: Option<ProcessExit>) -> AgentToolResult {
         let output = unread.render(self.max_output_bytes);
-        let mut result = AgentToolResult::text(output.text);
+        let text = if exit.is_none() {
+            let status_line = format!("[session_id: {}, status: running]", self.id);
+            if output.text.is_empty() {
+                status_line
+            } else {
+                format!("{}\n{status_line}", output.text)
+            }
+        } else {
+            output.text
+        };
+        let mut result = AgentToolResult::text(text);
         let mut details = match exit {
             Some(exit) => json!({"status": "exited", "exit_code": exit.code()}),
             None => json!({"status": "running", "session_id": self.id}),
@@ -313,7 +336,7 @@ async fn run_shell(
         let mut buffers = [[0; OUTPUT_CHUNK_BYTES]; 2];
         while let Some((_, chunk)) = output.next(&mut buffers).await {
             {
-                let mut state = session.state.lock().unwrap();
+                let mut state = session.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.unread.push(chunk);
                 state.has_output = true;
             }
@@ -325,8 +348,8 @@ async fn run_shell(
     };
     let (exit, ()) = tokio::join!(child.wait(deadline, None), read);
     let backgrounded = if let Some(manager) = manager.upgrade() {
-        let mut sessions = manager.sessions.lock().unwrap();
-        let mut state = session.state.lock().unwrap();
+        let mut sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = session.state.lock().unwrap_or_else(|e| e.into_inner());
         state.exit = Some(exit);
         if state.backgrounded && !sessions.closed {
             sessions.finished.push_back((session.id, session.clone()));
@@ -336,7 +359,7 @@ async fn run_shell(
         }
         state.backgrounded && !sessions.closed
     } else {
-        session.state.lock().unwrap().exit = Some(exit);
+        session.state.lock().unwrap_or_else(|e| e.into_inner()).exit = Some(exit);
         false
     };
     session.changed.notify_waiters();
@@ -345,14 +368,19 @@ async fn run_shell(
 
     let events = manager.upgrade().map(|manager| manager.events.clone());
     if backgrounded
-        && exit.reason == ProcessEnd::Exited
+        && exit.reason != ProcessEnd::Stopped
         && !session.control.stopped.is_cancelled()
         && let Some(events) = events
     {
+        let reason = match exit.reason {
+            ProcessEnd::Timeout => ShellStopReason::Timeout,
+            _ => ShellStopReason::Exited,
+        };
         events.emit(BackgroundToolEvent::ShellExited {
             session_id: session.id,
             command,
             exit_code: exit.code(),
+            reason,
         });
     }
 }
@@ -370,7 +398,6 @@ impl ExecCommandTool {
 
 #[derive(Deserialize)]
 struct ExecArgs {
-    #[serde(alias = "cmd")]
     command: String,
     cwd: Option<String>,
     yield_time_ms: Option<u64>,
@@ -393,16 +420,11 @@ impl Drop for PendingExec {
 
 impl AgentTool for ExecCommandTool {
     fn definition(&self) -> ToolDefinition {
-        let mut parameters = obj_schema([
+        let parameters = obj_schema([
             (
                 "command",
                 with_description(str_schema(), "Shell command to run."),
-                false,
-            ),
-            (
-                "cmd",
-                with_description(str_schema(), "Alias for command."),
-                false,
+                true,
             ),
             ("cwd", str_schema(), false),
             (
@@ -422,13 +444,16 @@ impl AgentTool for ExecCommandTool {
                 false,
             ),
         ]);
-        parameters["oneOf"] = json!([{"required": ["command"]}, {"required": ["cmd"]}]);
         ToolDefinition {
             name: "exec_command".into(),
             description: "Run a shell command. Use write_stdin to continue a running command."
                 .into(),
             parameters,
         }
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
     }
 
     fn execute(
@@ -528,6 +553,10 @@ impl AgentTool for WriteStdinTool {
         }
     }
 
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+
     fn execute(
         &self,
         _tool_call_id: String,
@@ -546,6 +575,8 @@ impl AgentTool for WriteStdinTool {
                 session.control.stop();
                 session.control.wait_done().await;
             } else {
+                let deadline =
+                    deadline_after_ms(args.yield_time_ms.unwrap_or(DEFAULT_STDIN_YIELD_MS));
                 if !args.chars.is_empty() {
                     let write = async {
                         if let Some(input) = session.input.lock().await.as_mut() {
@@ -567,10 +598,9 @@ impl AgentTool for WriteStdinTool {
                                 return Err(format!("Could not send input: {err}"));
                             }
                         }
+                        _ = wait_deadline(deadline) => {},
                     }
                 }
-                let deadline =
-                    deadline_after_ms(args.yield_time_ms.unwrap_or(DEFAULT_STDIN_YIELD_MS));
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err("Operation aborted".into()),
@@ -579,7 +609,7 @@ impl AgentTool for WriteStdinTool {
                 }
             }
             let (unread, exit) = {
-                let mut state = session.state.lock().unwrap();
+                let mut state = session.state.lock().unwrap_or_else(|e| e.into_inner());
                 (session.take_output(&mut state), state.exit)
             };
             if exit.is_some() {
@@ -587,7 +617,7 @@ impl AgentTool for WriteStdinTool {
                     .0
                     .sessions
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .finished
                     .retain(|(id, _)| *id != args.session_id);
             }
@@ -623,7 +653,6 @@ pub(crate) async fn prepare_shell(
         if let Some(provider) = &workspace.env_provider {
             process.envs(provider().await);
         }
-        process.env("AI_AGENT", "pikra");
         Ok(process)
     };
     let process = tokio::select! {
@@ -659,7 +688,10 @@ impl ProcessControl {
     }
 
     pub(crate) fn kill_group(&self) {
-        self.group.lock().unwrap().kill_now();
+        self.group
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .kill_now();
     }
 
     pub async fn wait_done(&self) {
@@ -771,9 +803,23 @@ impl ProcessInput {
             Self::Pipe(pipe) => pipe.write_all(data).await,
             Self::Terminal(master) => {
                 while !data.is_empty() {
-                    let written = master
-                        .async_io(Interest::WRITABLE, |mut fd| fd.write(data))
-                        .await?;
+                    let written = match master
+                        .async_io(Interest::WRITABLE, |mut fd| {
+                            loop {
+                                match fd.write(data) {
+                                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                                        continue;
+                                    }
+                                    other => break other,
+                                }
+                            }
+                        })
+                        .await
+                    {
+                        Ok(written) => written,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => return Err(err),
+                    };
                     if written == 0 {
                         return Err(io::ErrorKind::WriteZero.into());
                     }
@@ -803,13 +849,25 @@ impl ProcessOutput {
     ) -> Option<(OutputStream, &'a [u8])> {
         let [out, err] = buffers;
         match self {
-            Self::Terminal(master) => {
-                let count = master
-                    .async_io(Interest::READABLE, |mut fd| fd.read(out))
+            Self::Terminal(master) => loop {
+                match master
+                    .async_io(Interest::READABLE, |mut fd| {
+                        loop {
+                            match fd.read(out) {
+                                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                                other => break other,
+                            }
+                        }
+                    })
                     .await
-                    .ok()?;
-                (count > 0).then_some((OutputStream::Stdout, &out[..count]))
-            }
+                {
+                    Ok(count) => {
+                        return (count > 0).then_some((OutputStream::Stdout, &out[..count]));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                }
+            },
             Self::Pipes(stdout, stderr) => loop {
                 tokio::select! {
                     count = read_pipe(stdout, out), if stdout.is_some() => {

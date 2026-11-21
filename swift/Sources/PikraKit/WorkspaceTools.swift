@@ -15,6 +15,11 @@ public struct PikraWorkspaceTools: Sendable {
     @usableFromInline
     let native: Result<PikraWorkspaceEnvironment, any Error>
 
+    /// The underlying workspace environment created for this tool set, if initialization succeeded.
+    public var workspaceEnvironment: PikraWorkspaceEnvironment? {
+        try? native.get()
+    }
+
     public init(
         workspace: URL,
         approval: PikraToolApproval? = nil,
@@ -76,7 +81,7 @@ public struct PikraWorkspaceTools: Sendable {
     #if os(macOS)
     @usableFromInline
     static func shell(_ tool: PikraTool) -> PikraTool {
-        PikraTool(
+        var wrapped = PikraTool(
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
@@ -92,6 +97,8 @@ public struct PikraWorkspaceTools: Sendable {
                 isError: result.isError
             )
         }
+        wrapped.associatedEnvironment = tool.associatedEnvironment
+        return wrapped
     }
     #endif
 }

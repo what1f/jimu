@@ -988,10 +988,9 @@ struct PikraKitE2ETests {
         #expect(alphaEntry.disableModelInvocation == false)
         #expect(alphaEntry.revision.count == 16)
         #expect(hiddenEntry.disableModelInvocation == true)
-        #expect(discovered.prompt.hasPrefix("Available skills. Use read to load a skill's SKILL.md"))
-        #expect(discovered.prompt.contains("<available_skills>"))
+        #expect(discovered.prompt.hasPrefix("<available_skills>"))
         #expect(discovered.prompt.contains("<name>alpha</name>"))
-        #expect(discovered.prompt.contains("<revision>\(alphaEntry.revision)</revision>"))
+        #expect(discovered.prompt.contains("<description>Alpha skill v1</description>"))
         #expect(!discovered.prompt.contains("<name>hidden</name>"))
 
         // Empty root produces empty prompt
@@ -1086,7 +1085,7 @@ struct PikraKitE2ETests {
                 MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
                     id: "tc_2",
                     name: "edit",
-                    argumentsJSON: "{\"path\":\"sub/notes.txt\",\"old_text\":\"line2\",\"new_text\":\"LINE_TWO\"}"
+                    argumentsJSON: "{\"path\":\"sub/notes.txt\",\"oldText\":\"line2\",\"newText\":\"LINE_TWO\"}"
                 ))
             },
             // 3. read with offset & limit (readOnly -> no prompt)
@@ -1118,7 +1117,7 @@ struct PikraKitE2ETests {
                 MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
                     id: "tc_6",
                     name: "bash",
-                    argumentsJSON: "{\"command\":\"printf '%s:%s' \\\"$PIKRA_WS_ENV\\\" \\\"0123456789abcdefghijklmnopqrstuvwxyz\\\"\",\"timeout\":2.5}"
+                    argumentsJSON: "{\"command\":\"printf '%s:%s' \\\"$PIKRA_WS_ENV\\\" \\\"0123456789abcdefghijklmnopqrstuvwxyz\\\"\",\"timeout_ms\":2500}"
                 ))
             },
             // 7. bash non-zero exit
@@ -1167,7 +1166,7 @@ struct PikraKitE2ETests {
 
         // 3. read offset=2, limit=2
         #expect(toolResults[2].1 == "read" && toolResults[2].3 == false)
-        #expect(toolResults[2].2.textOutput == "LINE_TWO\nline3")
+        #expect(toolResults[2].2.textOutput == "2: LINE_TWO\n3: line3")
 
         // 4. read image returns PikraContentPart.image
         #expect(toolResults[3].1 == "read" && toolResults[3].3 == false)
@@ -1361,9 +1360,9 @@ struct PikraKitE2ETests {
         let dummyCtx = PikraToolCallContext(toolCallID: "c1", toolName: "read") { _ in }
 
         let line2 = try await readTool.execute(dummyCtx, ["path": "crlf.txt", "offset": 2, "limit": 1])
-        #expect(line2.textOutput == "beta")
+        #expect(line2.textOutput == "2: beta\n[Showing lines 2-2 of 3. Use offset=3 to read more.]")
         let lines23 = try await readTool.execute(dummyCtx, ["path": "crlf.txt", "offset": 2, "limit": 2])
-        #expect(lines23.textOutput == "beta\ngamma")
+        #expect(lines23.textOutput == "2: beta\n3: gamma")
 
         let cancelledTarget = tmpDir.appendingPathComponent("should_not_exist.txt")
         let cancelledWriteTask = Task {
@@ -1503,5 +1502,143 @@ struct PikraKitE2ETests {
         }
 
         await agent.close()
+    }
+
+    @Test("Tool output redaction, workspace tool background lifecycle, reopen baseline and skill_search")
+    func reviewBatch1SwiftRegressions() async throws {
+        // 1. PikraToolOutput.content.didSet clears structuredContent on plain-text or truncated redaction,
+        // while keeping JSON-preserving object redactions synchronized.
+        var plainBacked = PikraToolOutput(
+            content: [.text("secret=token123")],
+            structuredContent: .object(["exit_code": .integer(0), "output": .string("secret=token123"), "output_truncated": .bool(false)])
+        )
+        plainBacked.content = [.text("secret=[REDACTED]")]
+        #expect(plainBacked.structuredContent == nil)
+
+        var jsonBacked = PikraToolOutput.json(.object(["exit_code": .integer(0), "output": .string("secret=token123"), "output_truncated": .bool(false)]))
+        jsonBacked.content = [.text(jsonBacked.textOutput.replacingOccurrences(of: "token123", with: "[REDACTED]"))]
+        #expect(jsonBacked.structuredContent?["output"]?.stringValue == "secret=[REDACTED]")
+
+        jsonBacked.content = [.text("truncated non-json")]
+        #expect(jsonBacked.structuredContent == nil)
+
+        // 2. PikraWorkspaceTools(workspace:).tools([.execCommand, .monitor]) delivers backgroundEvents
+        // through agent.backgroundEvents and shuts down background processes on agent.close().
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pikra-batch1-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let pidFile = tmpDir.appendingPathComponent("bg.pid")
+        let wsTools = PikraWorkspaceTools(workspace: tmpDir)
+        let builtTools = wsTools.tools([.execCommand, .monitor])
+        let mockClient = MockSSEClient(handlers: [
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "bg_quick",
+                    name: "exec_command",
+                    argumentsJSON: "{\"command\":\"printf done\",\"background\":true}"
+                ))
+            },
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                    id: "bg_hold",
+                    name: "monitor",
+                    argumentsJSON: "{\"action\":\"start\",\"name\":\"hold\",\"command\":\"echo $$ > bg.pid; tail -f /dev/null\",\"notify\":\"exit\"}"
+                ))
+            },
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Background started"))
+            },
+        ])
+        let bgAgent = try await PikraAgent.open(
+            configuration: PikraConfiguration(
+                model: testModel(),
+                systemPrompt: "Background lifecycle test",
+                tools: builtTools,
+                enableDeferredGateway: false,
+                httpClient: mockClient
+            )
+        )
+        let bgEventTask = Task { () -> PikraBackgroundEvent? in
+            for await event in bgAgent.backgroundEvents {
+                if event.type == .shellExited {
+                    return event
+                }
+            }
+            return nil
+        }
+        let bgTurn = try await collectEvents(try await bgAgent.prompt("Start background"))
+        #expect(bgTurn.last == .turnEnded(stopReason: .stop, userMessageKept: true, errorMessage: nil))
+        let shellEvent = await bgEventTask.value
+        #expect(shellEvent?.type == .shellExited)
+        #expect(shellEvent?.reason == "exited")
+        await bgAgent.close()
+        if let pidText = try? String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           let pid = Int32(pidText) {
+            #expect(kill(pid, 0) != 0)
+        }
+
+        // 3. Reopening a persisted session keeps baseline.tools resident in original order despite
+        // a smaller autoDeferThresholdBytes, and skillRoots-only sessions register skill_search.
+        let journalURL = tmpDir.appendingPathComponent("reopen.jsonl")
+        let skillRoot = tmpDir.appendingPathComponent("skills", isDirectory: true)
+        let demoSkillDir = skillRoot.appendingPathComponent("demo", isDirectory: true)
+        try FileManager.default.createDirectory(at: demoSkillDir, withIntermediateDirectories: true)
+        try """
+        ---
+        name: demo
+        description: Demo skill
+        ---
+        # Demo
+        """.write(to: demoSkillDir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+
+        let alphaTool = PikraTool(name: "alpha_tool", description: String(repeating: "a", count: 200)) { _, _ in .text("a") }
+        let betaTool = PikraTool(name: "beta_tool", description: String(repeating: "b", count: 200)) { _, _ in .text("b") }
+
+        let openMock = MockSSEClient(handlers: [
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "ok1")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "ok2")) },
+        ])
+        var firstConfig = PikraConfiguration(
+            model: testModel(),
+            systemPrompt: "Reopen baseline test",
+            tools: [alphaTool, betaTool],
+            skillRoots: [skillRoot],
+            enableDeferredGateway: true,
+            persistenceURL: journalURL,
+            httpClient: openMock
+        )
+        firstConfig.autoDeferThresholdBytes = 100_000
+        let first = try await PikraAgent.open(configuration: firstConfig)
+        _ = try await collectEvents(try await first.prompt("turn 1"))
+        await first.close()
+
+        var reopenedConfig = PikraConfiguration(
+            model: testModel(),
+            systemPrompt: "Reopen baseline test",
+            tools: [betaTool, alphaTool],
+            skillRoots: [skillRoot],
+            enableDeferredGateway: true,
+            persistenceURL: journalURL,
+            httpClient: openMock
+        )
+        reopenedConfig.autoDeferThresholdBytes = 1
+        let reopened = try await PikraAgent.open(configuration: reopenedConfig)
+        _ = try await collectEvents(try await reopened.prompt("turn 2"))
+        await reopened.close()
+
+        let bodies = await openMock.recordedRequests().map(\.body)
+        #expect(bodies.count == 2)
+        let extractToolNames: (Data) throws -> [String] = { body in
+            ((try JSONDecoder().decode(JSONValue.self, from: body))["tools"]?.arrayValue ?? [])
+                .compactMap { $0["function"]?["name"]?.stringValue ?? $0["name"]?.stringValue }
+        }
+        let firstNames = try extractToolNames(bodies[0])
+        let secondNames = try extractToolNames(bodies[1])
+        #expect(firstNames.contains("skill_search"))
+        #expect(firstNames.contains("alpha_tool"))
+        #expect(firstNames.contains("beta_tool"))
+        #expect(firstNames == secondNames)
     }
 }

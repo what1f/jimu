@@ -443,11 +443,13 @@ impl BoundedOutputBuffer {
         tail.extend(bytes);
     }
 
-    pub(crate) fn prefix(&self) -> (&str, bool) {
-        let prefix = std::str::from_utf8(&self.head).unwrap_or_else(|error| {
-            std::str::from_utf8(&self.head[..error.valid_up_to()]).unwrap()
-        });
-        (prefix, self.total_bytes > prefix.len())
+    pub(crate) fn prefix(&self) -> (std::borrow::Cow<'_, str>, bool) {
+        let bytes = if self.overflowed {
+            trim_incomplete_utf8_tail(&self.head)
+        } else {
+            &self.head
+        };
+        (String::from_utf8_lossy(bytes), self.overflowed)
     }
 
     /// Render captured bytes into UTF-8 text bounded by `budget` (at most `self.max_bytes`).

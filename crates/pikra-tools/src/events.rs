@@ -16,6 +16,13 @@ pub enum MonitorStopReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellStopReason {
+    Exited,
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackgroundToolEvent {
     MonitorLines {
@@ -36,6 +43,7 @@ pub enum BackgroundToolEvent {
         session_id: u32,
         command: String,
         exit_code: Option<i32>,
+        reason: ShellStopReason,
     },
 }
 
@@ -100,14 +108,22 @@ pub(crate) fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-#[cfg(all(unix, not(target_os = "ios")))]
+#[cfg(all(
+    unix,
+    not(target_os = "ios"),
+    any(feature = "shell", feature = "monitor")
+))]
 #[derive(Clone)]
 pub(crate) struct BackgroundEvents {
     pub wake_gate: WakeGate,
     pub callback: Option<BackgroundEventCallback>,
 }
 
-#[cfg(all(unix, not(target_os = "ios")))]
+#[cfg(all(
+    unix,
+    not(target_os = "ios"),
+    any(feature = "shell", feature = "monitor")
+))]
 impl BackgroundEvents {
     pub fn emit(&self, event: BackgroundToolEvent) {
         let reason = match &event {
@@ -116,7 +132,10 @@ impl BackgroundEvents {
                 Some(hint) => format!("Monitor {name} ended. {hint}"),
                 None => format!("Monitor {name} ended."),
             },
-            BackgroundToolEvent::ShellExited { .. } => "Background command finished.".into(),
+            BackgroundToolEvent::ShellExited { reason, .. } => match reason {
+                ShellStopReason::Timeout => "Background command timed out.".into(),
+                ShellStopReason::Exited => "Background command finished.".into(),
+            },
         };
         if let Some(callback) = &self.callback {
             // An unwinding host callback must not interrupt process cleanup.
@@ -180,10 +199,15 @@ pub fn format_background_events_xml(events: &[BackgroundToolEvent]) -> String {
                 session_id,
                 command,
                 exit_code,
+                reason,
             } => {
                 let _ = write!(xml, "<shell_event session_id=\"{session_id}\"");
                 exit_attribute(&mut xml, *exit_code);
-                xml.push_str(">\n");
+                let name = match reason {
+                    ShellStopReason::Exited => "exited",
+                    ShellStopReason::Timeout => "timeout",
+                };
+                let _ = writeln!(xml, " reason=\"{name}\">");
                 escape_xml(&mut xml, command, false);
                 xml.push_str("\n</shell_event>");
             }

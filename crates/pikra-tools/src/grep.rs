@@ -175,6 +175,7 @@ impl GrepTool {
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\0'))
             .line_terminator(LineTerminator::crlf())
+            .heap_limit(Some(16 * 1024 * 1024))
             .before_context(context)
             .after_context(context)
             .build();
@@ -185,7 +186,15 @@ impl GrepTool {
         let mut hit_limit = false;
         for entry in walk.build() {
             check_cancelled(cancel)?;
-            let entry = entry.map_err(|err| format!("Could not search files: {err}"))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if err.depth() == Some(0) {
+                        return Err(format!("Could not search files: {err}"));
+                    }
+                    continue;
+                }
+            };
             let path = entry.path();
             if !entry.file_type().is_some_and(|kind| kind.is_file())
                 || (entry.depth() == 0
@@ -197,6 +206,16 @@ impl GrepTool {
             }
 
             let shown = display_path(&self.config.cwd, path);
+            let file = match open_regular_file(path) {
+                Ok(Some(file)) => file,
+                Ok(None) => continue,
+                Err(err) => {
+                    if entry.depth() == 0 {
+                        return Err(format!("Could not search '{shown}': {err}"));
+                    }
+                    continue;
+                }
+            };
             let mut sink = FileMatches {
                 cancel,
                 shown: &shown,
@@ -207,11 +226,14 @@ impl GrepTool {
                 binary: false,
                 hit_limit: false,
             };
-            let read = File::open(path)
-                .map(|file| CancelReader { file, cancel })
-                .and_then(|reader| searcher.search_reader(&matcher, reader, &mut sink));
+            let read = searcher.search_reader(&matcher, CancelReader { file, cancel }, &mut sink);
             check_cancelled(cancel)?;
-            read.map_err(|err| format!("Could not search '{shown}': {err}"))?;
+            if let Err(err) = read {
+                if entry.depth() == 0 {
+                    return Err(format!("Could not search '{shown}': {err}"));
+                }
+                continue;
+            }
             if sink.binary || (sink.matches == 0 && !sink.hit_limit) {
                 continue;
             }
@@ -244,6 +266,42 @@ impl GrepTool {
 struct CancelReader<'a> {
     file: File,
     cancel: &'a CancelToken,
+}
+
+#[cfg(unix)]
+fn open_regular_file(path: &std::path::Path) -> io::Result<Option<File>> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(None);
+    }
+    // SAFETY: `file` owns a valid open descriptor for the duration of the fcntl calls.
+    unsafe {
+        let fd = file.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(unix))]
+fn open_regular_file(path: &std::path::Path) -> io::Result<Option<File>> {
+    let file = File::open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
 }
 
 impl Read for CancelReader<'_> {

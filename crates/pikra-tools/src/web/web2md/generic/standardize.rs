@@ -25,6 +25,7 @@ pub(super) fn clean(dom: &mut Dom, root: NodeId, base: &Url, title: &str) {
         .query("body")
         .into_iter()
         .flat_map(|body| body.select(&FOOTNOTES))
+        .filter(|note| note.id() != root)
         .filter(|note| note.attr("id").is_some_and(|id| fragments.contains(id)))
         .filter(|note| !note.ancestors().any(|parent| parent.id() == root))
         .filter(|note| !article.ancestors().any(|parent| parent.id() == note.id()))
@@ -45,22 +46,34 @@ pub(super) fn clean(dom: &mut Dom, root: NodeId, base: &Url, title: &str) {
         let Some(element) = dom.element(id) else {
             continue;
         };
-        if duplicate_title(element, title)
-            || (element.value().name() == "a"
-                && element
-                    .attr("href")
-                    .is_some_and(|href| href.starts_with('#'))
-                && element
-                    .parent()
-                    .and_then(scraper::ElementRef::wrap)
-                    .is_some_and(|parent| {
-                        matches!(
-                            parent.value().name(),
-                            "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                        )
-                    }))
-        {
+        if duplicate_title(element, title) {
             dom.remove(id);
+            continue;
+        }
+        if element.value().name() == "a"
+            && element
+                .attr("href")
+                .is_some_and(|href| href.starts_with('#'))
+            && element
+                .parent()
+                .and_then(scraper::ElementRef::wrap)
+                .is_some_and(|parent| {
+                    matches!(
+                        parent.value().name(),
+                        "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    )
+                })
+        {
+            let anchor_text = super::super::dom::text(element);
+            if anchor_text.is_empty()
+                || anchor_text
+                    .chars()
+                    .all(|c| matches!(c, '#' | '¶' | '§') || c.is_whitespace())
+            {
+                dom.remove(id);
+            } else {
+                dom.unwrap(id);
+            }
             continue;
         }
 
@@ -125,7 +138,16 @@ pub(super) fn clean(dom: &mut Dom, root: NodeId, base: &Url, title: &str) {
                 attribute.local = name.into();
                 attribute.prefix = None;
                 attribute.ns = "".into();
-                element.attrs.push((attribute, url.as_str().into()));
+                if let Some((_, existing)) = element
+                    .attrs
+                    .iter_mut()
+                    .find(|(existing_name, _)| *existing_name == attribute)
+                {
+                    *existing = url.as_str().into();
+                } else {
+                    element.attrs.push((attribute, url.as_str().into()));
+                }
+                element.attrs.sort_by(|a, b| a.0.cmp(&b.0));
             }
         });
     }

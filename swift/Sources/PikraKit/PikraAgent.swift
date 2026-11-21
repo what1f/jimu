@@ -30,23 +30,51 @@ public actor PikraAgent {
     private let handleBox: HandleBox
     private let bridge: PikraSessionBridge
     private var isClosed = false
-    private let workspaceEnvironment: PikraWorkspaceEnvironment?
-    /// Background events from the workspace environment selected in the configuration.
+    private let workspaceEnvironments: [PikraWorkspaceEnvironment]
+    private let backgroundForwarder: Task<Void, Never>?
+    /// Background events from workspace environments configured directly or attached to built-in tools.
     public nonisolated let backgroundEvents: AsyncStream<PikraBackgroundEvent>
 
     private init(
         session: OpaquePointer,
         bridge: PikraSessionBridge,
-        workspaceEnvironment: PikraWorkspaceEnvironment?
+        workspaceEnvironments: [PikraWorkspaceEnvironment]
     ) {
         self.handleBox = HandleBox(session: session, bridge: bridge)
         self.bridge = bridge
-        self.workspaceEnvironment = workspaceEnvironment
-        backgroundEvents = workspaceEnvironment?.backgroundEvents ?? AsyncStream { $0.finish() }
+        self.workspaceEnvironments = workspaceEnvironments
+        if workspaceEnvironments.isEmpty {
+            self.backgroundEvents = AsyncStream { $0.finish() }
+            self.backgroundForwarder = nil
+        } else if workspaceEnvironments.count == 1 {
+            self.backgroundEvents = workspaceEnvironments[0].backgroundEvents
+            self.backgroundForwarder = nil
+        } else {
+            let (stream, continuation) = AsyncStream<PikraBackgroundEvent>.makeStream(
+                bufferingPolicy: .bufferingNewest(256)
+            )
+            self.backgroundEvents = stream
+            self.backgroundForwarder = Task {
+                await withTaskGroup(of: Void.self) { group in
+                    for environment in workspaceEnvironments {
+                        group.addTask {
+                            for await event in environment.backgroundEvents {
+                                continuation.yield(event)
+                            }
+                        }
+                    }
+                    await group.waitForAll()
+                }
+                continuation.finish()
+            }
+        }
     }
 
     deinit {
-        workspaceEnvironment?.beginShutdown()
+        backgroundForwarder?.cancel()
+        for environment in workspaceEnvironments {
+            environment.beginShutdown()
+        }
     }
 
     /// Opens a new or existing `PikraAgent` session (in-memory or JSONL-persisted).
@@ -92,7 +120,25 @@ public actor PikraAgent {
             throw PikraError.invalidArgument(message)
         }
 
-        return PikraAgent(session: sessionPtr, bridge: bridge, workspaceEnvironment: configuration.workspaceEnvironment)
+        var seenEnvironments: Set<ObjectIdentifier> = []
+        var workspaceEnvironments: [PikraWorkspaceEnvironment] = []
+        let appendEnvironment: (PikraWorkspaceEnvironment?) -> Void = { environment in
+            guard let environment else { return }
+            let id = ObjectIdentifier(environment)
+            if seenEnvironments.insert(id).inserted {
+                workspaceEnvironments.append(environment)
+            }
+        }
+        appendEnvironment(configuration.workspaceEnvironment)
+        for tool in configuration.tools {
+            appendEnvironment(tool.associatedEnvironment)
+        }
+
+        return PikraAgent(
+            session: sessionPtr,
+            bridge: bridge,
+            workspaceEnvironments: workspaceEnvironments
+        )
     }
 
     private func requireSession() throws -> OpaquePointer {
@@ -177,7 +223,7 @@ public actor PikraAgent {
         guard !isClosed, let session = handleBox.session else { return false }
         return id.withCString { idC in
             text.withCString { textC in
-                pikra_session_steer_ex(session, idC, textC, isMeta)
+                pikra_session_steer(session, idC, textC, isMeta)
             }
         }
     }
@@ -188,7 +234,7 @@ public actor PikraAgent {
         var errorPtr: UnsafeMutablePointer<CChar>?
         let status = id.withCString { idC in
             text.withCString { textC in
-                pikra_session_follow_up_ex(session, idC, textC, isMeta, &errorPtr)
+                pikra_session_follow_up(session, idC, textC, isMeta, &errorPtr)
             }
         }
         if status != PIKRA_OK {
@@ -455,7 +501,10 @@ public actor PikraAgent {
                 pikra_session_close(session, boxPtr, pikraVoidDoneTrampoline)
             }
         }
-        await workspaceEnvironment?.shutdown()
+        for environment in workspaceEnvironments {
+            await environment.shutdown()
+        }
+        backgroundForwarder?.cancel()
         handleBox.destroyNow()
     }
 

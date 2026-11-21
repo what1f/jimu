@@ -1,5 +1,5 @@
 use crate::events::{WakeGate, WakeOutcome, elapsed_ms};
-use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
+use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_description};
 use serde::Deserialize;
@@ -44,6 +44,10 @@ impl AgentTool for SleepTool {
                 ),
             ]),
         }
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
     }
 
     fn execute(

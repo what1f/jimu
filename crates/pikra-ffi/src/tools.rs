@@ -1,4 +1,5 @@
 use crate::session::global_pool;
+use crate::transport::SendHttpCallbacks;
 use crate::types::{FfiToolSpec, PikraStatus};
 use futures_channel::oneshot;
 use futures_util::future::select;
@@ -28,19 +29,23 @@ pub struct PikraToolCallbacks {
     pub cancel: Option<PikraToolCancelFn>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct SendToolCallbacks {
     raw: PikraToolCallbacks,
+    _keep_alive: Option<Arc<SendHttpCallbacks>>,
 }
 
 // SAFETY: Host guarantees `ctx` and callback pointers remain valid and thread-safe for the
-// lifetime of `PikraSession`.
+// lifetime of `SendHttpCallbacks` (which owns `bridgePtr` release).
 unsafe impl Send for SendToolCallbacks {}
 unsafe impl Sync for SendToolCallbacks {}
 
 impl SendToolCallbacks {
-    pub(crate) fn new(raw: PikraToolCallbacks) -> Self {
-        Self { raw }
+    pub(crate) fn new(raw: PikraToolCallbacks, keep_alive: Option<Arc<SendHttpCallbacks>>) -> Self {
+        Self {
+            raw,
+            _keep_alive: keep_alive,
+        }
     }
 
     fn fire_execute(
@@ -150,7 +155,7 @@ impl AgentTool for FfiAgentTool {
         on_update: ToolProgressCallback,
     ) -> BoxFuture<'_, Result<AgentToolResult, String>> {
         let name = self.definition.name.clone();
-        let callbacks = self.callbacks;
+        let callbacks = self.callbacks.clone();
         let call_handle_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
 
         Box::pin(async move {
@@ -183,10 +188,11 @@ impl AgentTool for FfiAgentTool {
             {
                 let cancel_watch = cancel.clone();
                 let finished_watch = Arc::clone(&finished);
+                let cancel_callbacks = callbacks.clone();
                 global_pool().spawn_ok(async move {
                     let _ = select(cancel_watch.cancelled(), finish_rx).await;
                     if cancel_watch.is_cancelled() && !finished_watch.load(Ordering::Acquire) {
-                        callbacks.fire_cancel(call_handle_id);
+                        cancel_callbacks.fire_cancel(call_handle_id);
                     }
                 });
             }

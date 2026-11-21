@@ -106,7 +106,7 @@ async fn edit_fuzzes_whole_lines_and_rejects_ambiguous_batches() {
     fs::write(&file, original).unwrap();
 
     let edit = EditTool::new(Arc::new(WorkspaceToolsConfig::new(dir.path())));
-    let change = json!({"old_text": "\"quoted\"-one two", "new_text": "changed"});
+    let change = json!({"oldText": "\"quoted\"-one two", "newText": "changed"});
     let failed = run(
         &edit,
         json!({"path": "text.txt", "edits": [change, {
@@ -265,7 +265,7 @@ async fn host_schema_overrides_hide_and_pin_arguments() {
     let definition = tools[0].definition();
     assert_eq!(definition.name, "save_note");
     assert_eq!(definition.description, "Save the note.");
-    assert_eq!(definition.parameters["required"], json!(["content"]));
+    assert!(definition.parameters.get("required").is_none());
     assert_eq!(
         definition.parameters["properties"],
         json!({"content": {"type": "string", "description": "Note text."}})
@@ -285,4 +285,101 @@ async fn host_schema_overrides_hide_and_pin_arguments() {
     spec.description = Some(DescriptionOverride::Append("Keep it short.".into()));
     let definitions = WorkspaceTools::new(host).definitions();
     assert!(definitions[0].description.ends_with("\nKeep it short."));
+}
+
+#[tokio::test]
+async fn patch_trailing_newline_grep_fifo_unreadable_and_bash_bounds_work() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let config = Arc::new(WorkspaceToolsConfig::new(root));
+
+    // 1. apply_patch preserves missing trailing newline on untouched final line,
+    // and inserts newline before newly appended trailing lines.
+    fs::write(root.join("no_nl.txt"), "alpha\nbeta").unwrap();
+    let patch_tool = ApplyPatchTool::new(config.clone());
+    run(
+        &patch_tool,
+        json!({"patch": "*** Begin Patch\n*** Update File: no_nl.txt\n@@\n-alpha\n+ALPHA\n*** End Patch"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("no_nl.txt")).unwrap(),
+        "ALPHA\nbeta"
+    );
+
+    run(
+        &patch_tool,
+        json!({"patch": "*** Begin Patch\n*** Update File: no_nl.txt\n@@\n beta\n+gamma\n*** End Patch"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("no_nl.txt")).unwrap(),
+        "ALPHA\nbeta\ngamma\n"
+    );
+
+    // 2. grep skips FIFOs without hanging and skips unreadable child files.
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(root.join("good.txt"), "NEEDLE_HERE\n").unwrap();
+        fs::write(root.join("unreadable.txt"), "NEEDLE_HIDDEN\n").unwrap();
+        fs::set_permissions(
+            root.join("unreadable.txt"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let fifo = root.join("trap.fifo");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+        let grep = GrepTool::new(config.clone());
+        let found = run(&grep, json!({"pattern": "NEEDLE_HERE"})).await.unwrap();
+        assert!(
+            text(&found).contains("good.txt:1:NEEDLE_HERE"),
+            "{}",
+            text(&found)
+        );
+
+        let _ = fs::set_permissions(
+            root.join("unreadable.txt"),
+            fs::Permissions::from_mode(0o600),
+        );
+    }
+
+    // 3. BashTool rejects timeout_ms > 86_400_000, omits AI_AGENT=pikra, and handles invalid UTF-8 lossily.
+    #[cfg(not(target_os = "ios"))]
+    {
+        let bash = pikra_tools::BashTool::new(config.clone());
+        let err = run(
+            &bash,
+            json!({"command": "echo hi", "timeout_ms": 86_400_001}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("86400000"), "{err}");
+
+        let env_out = run(
+            &bash,
+            json!({"command": "printf '%s' \"${AI_AGENT:-unset}\""}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text(&env_out), "unset");
+
+        let invalid_utf8 = run(&bash, json!({"command": "printf 'ok\\377tail'"}))
+            .await
+            .unwrap();
+        let structured = invalid_utf8.structured_content.as_ref().unwrap();
+        assert_eq!(structured["output_truncated"], json!(false));
+        assert!(
+            structured["output"].as_str().unwrap().contains("ok")
+                && structured["output"].as_str().unwrap().contains("tail"),
+            "{structured}"
+        );
+    }
 }

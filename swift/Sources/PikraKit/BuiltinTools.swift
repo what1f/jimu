@@ -113,7 +113,6 @@ public final class PikraWorkspaceEnvironment: @unchecked Sendable {
             "max_output_bytes": .integer(Int64(maxOutputBytes)),
         ]
         if let shellOutputLimit {
-            config["workspace_compatibility"] = .bool(true)
             config["default_bash_timeout_ms"] = .integer(120_000)
             config["shell_max_output_bytes"] = .integer(Int64(shellOutputLimit))
         }
@@ -307,7 +306,7 @@ public enum PikraBuiltinTools {
             throw PikraError.internalError("Could not load the tool definition")
         }
         let definition = try JSONDecoder().decode(Definition.self, from: Data(json.utf8))
-        return PikraTool(
+        var tool = PikraTool(
             name: definition.name,
             description: definition.description,
             parameters: definition.parameters,
@@ -315,6 +314,8 @@ public enum PikraBuiltinTools {
         ) { context, args in
             try await handle.execute(context, args)
         }
+        tool.associatedEnvironment = environment
+        return tool
     }
 }
 

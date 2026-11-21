@@ -576,3 +576,163 @@ print(x)
 
 Ends with inline `code`"###
 );
+
+#[tokio::test]
+async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    struct HeaderCapture {
+        headers: Mutex<Vec<Vec<(String, String)>>>,
+        responses: HashMap<String, Reply>,
+    }
+
+    impl HttpTransport for HeaderCapture {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _: CancelToken,
+        ) -> BoxFuture<'_, Result<HttpStreamResponse, TransportError>> {
+            Box::pin(async move {
+                self.headers.lock().unwrap().push(request.headers.clone());
+                match self.responses.get(&request.url) {
+                    Some(Reply::Body(mime, body)) => Ok(HttpStreamResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".into(), (*mime).into())],
+                        body: Box::pin(stream::iter([Ok(body.clone().into())])),
+                    }),
+                    Some(Reply::Redirect(status, location)) => Err(TransportError::HttpStatus {
+                        status: *status,
+                        headers: vec![("Location".into(), (*location).into())],
+                        body: String::new(),
+                    }),
+                    _ => Err(TransportError::HttpStatus {
+                        status: 404,
+                        headers: vec![],
+                        body: String::new(),
+                    }),
+                }
+            })
+        }
+    }
+
+    // 1. Domain requests carry `x-pikra-resolve-addrs`; IP literals do not; redirects route on final URL.
+    let capture = Arc::new(HeaderCapture {
+        headers: Mutex::default(),
+        responses: HashMap::from([
+            (
+                "https://short.example/go".into(),
+                Reply::Redirect(302, "https://docs.example/final"),
+            ),
+            (
+                "https://docs.example/final".into(),
+                Reply::Body(
+                    "text/html",
+                    "<html><body><article><p>Fallback</p></article></body></html>".into(),
+                ),
+            ),
+            (
+                "https://93.184.216.34/ip".into(),
+                Reply::Body("text/plain", "ip-ok".into()),
+            ),
+        ]),
+    });
+    let config = WebFetchConfig {
+        host_resolver: Some(Arc::new(|_| {
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+        })),
+        ..WebFetchConfig::default()
+    };
+
+    struct RedirectRuleParser;
+    impl Web2MdParser for RedirectRuleParser {
+        fn name(&self) -> &str {
+            "redirect-final"
+        }
+        fn parse<'a>(
+            &'a self,
+            context: &'a mut ParseContext,
+        ) -> BoxFuture<'a, Result<Option<Web2MdDocument>, Web2MdError>> {
+            Box::pin(async move {
+                Ok(Some(Web2MdDocument::new(
+                    context.url.clone(),
+                    format!("Matched final URL: {}", context.url),
+                    self.name(),
+                )))
+            })
+        }
+    }
+
+    let mut engine = Web2Md::new(capture.clone(), config.clone());
+    engine.register(ParserRule::for_url(
+        |url| url.as_str() == "https://docs.example/final",
+        RedirectRuleParser,
+    ));
+    let redirected = engine
+        .convert("https://short.example/go", CancelToken::new())
+        .await
+        .unwrap();
+    assert_eq!(redirected.parser, "redirect-final");
+    assert!(redirected.markdown.contains("https://docs.example/final"));
+
+    let ip_tool = WebFetchTool::new(capture.clone(), config);
+    let _ = ip_tool
+        .execute(
+            "ip-call".into(),
+            json!({"url": "https://93.184.216.34/ip"}),
+            CancelToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+
+    {
+        let recorded = capture.headers.lock().unwrap();
+        assert!(
+            recorded[0]
+                .iter()
+                .any(|(k, v)| k == "x-pikra-resolve-addrs" && v == "93.184.216.34:443"),
+            "domain fetch must pin resolved SocketAddr: {:?}",
+            recorded[0]
+        );
+        assert!(
+            !recorded[2]
+                .iter()
+                .any(|(k, _)| k == "x-pikra-resolve-addrs"),
+            "IP literal fetch must not send x-pikra-resolve-addrs: {:?}",
+            recorded[2]
+        );
+    }
+
+    // 2. Offline convert_html never calls XParser over network, handles self-referential footnote,
+    // preserves wrapped heading anchors, removes symbol anchors, and keeps sorted attrs on links/images.
+    let offline_engine = Web2Md::new(Arc::new(Replay::new([])), WebFetchConfig::default());
+    let html = r##"<!doctype html><html><head><title>Doc</title></head><body>
+        <article id="fn-1" class="footnotes">
+            <h2><a href="#intro">Introduction</a></h2>
+            <h3>Details <a href="#details">#</a></h3>
+            <p>See <a id="ref-link" class="ext" href="/guide">the guide</a> and <a href="#fn-1">note</a>.</p>
+            <p><img alt="Logo" title="Brand" data-src="/img/logo.png" /></p>
+        </article>
+    </body></html>"##;
+    let doc = offline_engine
+        .convert_html(
+            html,
+            "https://x.com/user/status/1234567890",
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(doc.markdown.contains("## Introduction"), "{}", doc.markdown);
+    assert!(doc.markdown.contains("### Details"), "{}", doc.markdown);
+    assert!(!doc.markdown.contains("### Details #"), "{}", doc.markdown);
+    assert!(
+        doc.markdown.contains("[the guide](https://x.com/guide)"),
+        "sorted attrs must keep rewritten href: {}",
+        doc.markdown
+    );
+    assert!(
+        doc.markdown.contains("![Logo](https://x.com/img/logo.png)"),
+        "sorted attrs must keep rewritten src: {}",
+        doc.markdown
+    );
+}

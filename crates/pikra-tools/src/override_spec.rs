@@ -47,8 +47,8 @@ impl OverriddenTool {
         }
         if let Some(required) = definition
             .parameters
-            .get_mut("required")
-            .and_then(Value::as_array_mut)
+            .get("required")
+            .and_then(Value::as_array)
         {
             for name in &spec.hidden_parameters {
                 if required.iter().any(|field| field.as_str() == Some(name))
@@ -59,11 +59,13 @@ impl OverriddenTool {
                     ));
                 }
             }
-            required.retain(|field| {
-                !field
-                    .as_str()
-                    .is_some_and(|name| spec.hidden_parameters.iter().any(|hidden| hidden == name))
-            });
+        }
+        let omittable = |name: &str| {
+            spec.hidden_parameters.iter().any(|hidden| hidden == name)
+                || spec.default_arguments.contains_key(name)
+        };
+        if let Some(root) = definition.parameters.as_object_mut() {
+            prune_required_constraints(root, &omittable);
         }
         if let Some(properties) = definition
             .parameters
@@ -85,6 +87,45 @@ impl OverriddenTool {
             definition,
             spec,
         })
+    }
+}
+
+fn prune_required_constraints(obj: &mut Map<String, Value>, omittable: &impl Fn(&str) -> bool) {
+    if let Some(required) = obj.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|field| !field.as_str().is_some_and(omittable));
+        if required.is_empty() {
+            obj.shift_remove("required");
+        }
+    }
+    if let Some(all_of) = obj.get_mut("allOf").and_then(Value::as_array_mut) {
+        all_of.retain_mut(|branch| {
+            let Some(branch_obj) = branch.as_object_mut() else {
+                return true;
+            };
+            prune_required_constraints(branch_obj, omittable);
+            !branch_obj.is_empty()
+        });
+        if all_of.is_empty() {
+            obj.shift_remove("allOf");
+        }
+    }
+    for key in ["oneOf", "anyOf"] {
+        let mut satisfied = false;
+        if let Some(branches) = obj.get_mut(key).and_then(Value::as_array_mut) {
+            for branch in branches.iter_mut() {
+                if let Some(branch_obj) = branch.as_object_mut() {
+                    let had_only_required =
+                        branch_obj.len() == 1 && branch_obj.contains_key("required");
+                    prune_required_constraints(branch_obj, omittable);
+                    if had_only_required && branch_obj.is_empty() {
+                        satisfied = true;
+                    }
+                }
+            }
+        }
+        if satisfied {
+            obj.shift_remove(key);
+        }
     }
 }
 

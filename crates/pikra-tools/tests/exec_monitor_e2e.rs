@@ -53,7 +53,7 @@ mod subprocesses {
     use pikra_ai::ContentPart;
     use pikra_tools::{
         BackgroundEventCallback, BackgroundToolEvent, ExecCommandTool, MonitorConfig,
-        MonitorManager, MonitorStopReason, MonitorTool, ProcessSessionManager,
+        MonitorManager, MonitorStopReason, MonitorTool, ProcessSessionManager, ShellStopReason,
         WorkspaceToolsConfig, WriteStdinTool, format_background_events_xml,
     };
     use std::ffi::CString;
@@ -112,7 +112,7 @@ mod subprocesses {
             .execute(
                 "foreground".into(),
                 json!({
-                    "cmd": "printf '%s %s' \"$AI_AGENT\" \"$PIKRA_TEST_VAR\"; exit 7",
+                    "command": "printf '%s|%s' \"${AI_AGENT:-unset}\" \"$PIKRA_TEST_VAR\"; exit 7",
                     "cwd": "sub",
                 }),
                 CancelToken::new(),
@@ -123,8 +123,8 @@ mod subprocesses {
         assert_eq!(result.details["status"], "exited");
         assert_eq!(result.details["exit_code"], 7);
         assert_eq!(result.details["cwd"], json!(dir.path().join("sub")));
-        assert_eq!(text(&result), "pikra provided");
-        assert_eq!(text(&chunks.recv().await.unwrap()), "pikra provided");
+        assert_eq!(text(&result), "unset|provided");
+        assert_eq!(text(&chunks.recv().await.unwrap()), "unset|provided");
         assert!(events.try_recv().is_err());
 
         let result = call(&exec, json!({"command": "printf done", "background": true}))
@@ -132,17 +132,30 @@ mod subprocesses {
             .unwrap();
         let id = result.details["session_id"].as_u64().unwrap() as u32;
         assert_eq!(result.details["status"], "running");
+        assert!(
+            text(&result).contains(&format!("[session_id: {id}, status: running]")),
+            "running exec_command output must expose session_id to the model: {}",
+            text(&result)
+        );
         assert_eq!(
             events.recv().await.unwrap(),
             BackgroundToolEvent::ShellExited {
                 session_id: id,
                 command: "printf done".into(),
                 exit_code: Some(0),
+                reason: ShellStopReason::Exited,
             },
         );
         let end = call(&stdin, json!({"session_id": id})).await.unwrap();
         assert_eq!(end.details["exit_code"], 0);
-        assert_eq!(format!("{}{}", text(&result), text(&end)), "done");
+        let combined = format!(
+            "{}{}",
+            text(&result)
+                .replace(&format!("\n[session_id: {id}, status: running]"), "")
+                .replace(&format!("[session_id: {id}, status: running]"), ""),
+            text(&end)
+        );
+        assert_eq!(combined, "done");
     }
 
     #[tokio::test]
@@ -396,5 +409,119 @@ mod subprocesses {
                 assert!(format_background_events_xml(&[event]).contains("grep --line-buffered"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sequential_modes_background_timeout_wakeup_nonblocking_stdin_and_secure_log_dir() {
+        use pikra_agent::ToolExecutionMode;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let workspace = Arc::new(WorkspaceToolsConfig::new(dir.path()));
+        let wake_gate = WakeGate::new();
+        let (callback, mut events) = events();
+        let proc_mgr = ProcessSessionManager::new(
+            workspace.clone(),
+            wake_gate.clone(),
+            Some(callback.clone()),
+        );
+        let mon_mgr = MonitorManager::new(workspace, wake_gate.clone(), Some(callback));
+        let exec = ExecCommandTool::new(proc_mgr.clone());
+        let stdin = WriteStdinTool::new(proc_mgr.clone());
+        let monitor = MonitorTool::new(mon_mgr.clone());
+        let sleep_tool = SleepTool::new(wake_gate);
+
+        assert_eq!(exec.execution_mode(), ToolExecutionMode::Sequential);
+        assert_eq!(stdin.execution_mode(), ToolExecutionMode::Sequential);
+        assert_eq!(monitor.execution_mode(), ToolExecutionMode::Sequential);
+        assert_eq!(sleep_tool.execution_mode(), ToolExecutionMode::Sequential);
+
+        // Background command timeout emits ShellExited(Timeout) AND wakes SleepTool.
+        let gate = dir.path().join("hold_timeout");
+        fifo(&gate);
+        let waiter = tokio::spawn({
+            let sleep_tool = sleep_tool.clone();
+            async move {
+                call(&sleep_tool, json!({"duration_ms": 10_000}))
+                    .await
+                    .unwrap()
+            }
+        });
+        let started = call(
+            &exec,
+            json!({
+                "command": "exec cat hold_timeout",
+                "background": true,
+                "timeout_ms": 50,
+            }),
+        )
+        .await
+        .unwrap();
+        let timeout_id = started.details["session_id"].as_u64().unwrap() as u32;
+        assert!(text(&started).contains(&format!("[session_id: {timeout_id}, status: running]")));
+        let timed_out_event = events.recv().await.unwrap();
+        assert_eq!(
+            timed_out_event,
+            BackgroundToolEvent::ShellExited {
+                session_id: timeout_id,
+                command: "exec cat hold_timeout".into(),
+                exit_code: None,
+                reason: ShellStopReason::Timeout,
+            }
+        );
+        let woke = waiter.await.unwrap();
+        assert_eq!(woke.details["woken_early"], true);
+
+        // write_stdin with yield_time_ms: 0 must NOT hang when child never reads stdin and pipe fills.
+        let block_fifo = dir.path().join("block_stdin");
+        fifo(&block_fifo);
+        let blocked = call(
+            &exec,
+            json!({
+                "command": "exec cat block_stdin",
+                "background": true,
+            }),
+        )
+        .await
+        .unwrap();
+        let blocked_id = blocked.details["session_id"].as_u64().unwrap() as u32;
+        let payload = "x".repeat(256 * 1024);
+        let write_res = call(
+            &stdin,
+            json!({
+                "session_id": blocked_id,
+                "chars": payload,
+                "yield_time_ms": 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(write_res.details["status"], "running");
+        assert!(text(&write_res).contains(&format!("[session_id: {blocked_id}, status: running]")));
+        let _ = call(&stdin, json!({"session_id": blocked_id, "kill": true}))
+            .await
+            .unwrap();
+
+        // Default monitor log dir is per-user with 0700 permissions.
+        let mon_started = call(
+            &monitor,
+            json!({"action": "start", "name": "perm-check", "command": "printf hi\\n", "notify": "exit"}),
+        )
+        .await
+        .unwrap();
+        let log_path = Path::new(mon_started.details["log_path"].as_str().unwrap());
+        let parent = log_path.parent().unwrap();
+        let expected_dir_name = format!("agent-monitors-{}", unsafe { libc::geteuid() });
+        assert_eq!(
+            parent.file_name().unwrap().to_str().unwrap(),
+            expected_dir_name
+        );
+        assert_eq!(
+            parent.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        proc_mgr.shutdown().await;
+        mon_mgr.shutdown().await;
     }
 }

@@ -55,7 +55,23 @@ impl Dom {
         }
     }
 
+    pub(super) fn unwrap(&mut self, id: NodeId) {
+        let children: Vec<NodeId> = match self.html.tree.get(id) {
+            Some(node) => node.children().map(|child| child.id()).collect(),
+            None => return,
+        };
+        if let Some(mut node) = self.html.tree.get_mut(id) {
+            for child in children {
+                node.insert_id_before(child);
+            }
+            node.detach();
+        }
+    }
+
     pub(super) fn move_to(&mut self, id: NodeId, parent: NodeId) {
+        if id == parent {
+            return;
+        }
         if let Some(mut parent) = self.html.tree.get_mut(parent) {
             parent.append_id(id);
         }

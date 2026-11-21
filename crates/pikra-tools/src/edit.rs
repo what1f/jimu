@@ -23,18 +23,24 @@ impl EditTool {
 }
 
 fn parse_hunks(args: &Value) -> Result<Vec<(&str, &str)>, String> {
-    let parse = |item| {
-        let old = edit_arg(item, "oldText", "old_text")?;
-        let new = edit_arg(item, "newText", "new_text")?;
+    fn parse(item: &Value) -> Result<(&str, &str), String> {
+        let old = item
+            .get("oldText")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Missing string argument 'oldText'".to_owned())?;
+        let new = item
+            .get("newText")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Missing string argument 'newText'".to_owned())?;
         if old.is_empty() {
             return Err("oldText must not be empty".to_owned());
         }
         Ok((old, new))
-    };
+    }
     let Some(edits) = args.get("edits") else {
         return Ok(vec![parse(args)?]);
     };
-    if ["oldText", "old_text", "newText", "new_text"]
+    if ["oldText", "newText"]
         .iter()
         .any(|key| args.get(key).is_some())
     {
@@ -49,16 +55,6 @@ fn parse_hunks(args: &Value) -> Result<Vec<(&str, &str)>, String> {
         .enumerate()
         .map(|(i, item)| parse(item).map_err(|err| format!("Edit #{}: {err}", i + 1)))
         .collect()
-}
-
-fn edit_arg<'a>(item: &'a Value, name: &str, alias: &str) -> Result<&'a str, String> {
-    match (item.get(name), item.get(alias)) {
-        (Some(_), Some(_)) => Err(format!("Supply only one of {name} and {alias}")),
-        (value, alias_value) => value
-            .or(alias_value)
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("Missing string argument '{name}'")),
-    }
 }
 
 fn replacement_range(text: &str, old: &str) -> Result<std::ops::Range<usize>, String> {
@@ -92,42 +88,43 @@ fn replacement_range(text: &str, old: &str) -> Result<std::ops::Range<usize>, St
 
 impl AgentTool for EditTool {
     fn definition(&self) -> ToolDefinition {
-        let fields = [
+        let edit_item_schema = obj_schema([
             (
                 "oldText",
                 with_description(str_schema(), "Text to find and replace."),
-                false,
+                true,
             ),
             (
                 "newText",
                 with_description(str_schema(), "Replacement text."),
-                false,
+                true,
             ),
-            ("old_text", str_schema(), false),
-            ("new_text", str_schema(), false),
-        ];
-        let mut edit_item_schema = obj_schema(fields.clone());
-        edit_item_schema["allOf"] = json!([
-            { "oneOf": [{ "required": ["oldText"] }, { "required": ["old_text"] }] },
-            { "oneOf": [{ "required": ["newText"] }, { "required": ["new_text"] }] }
         ]);
 
         ToolDefinition {
             name: "edit".into(),
             description: "Replace text in a UTF-8 file. Include enough surrounding text to identify each edit.".into(),
-            parameters: obj_schema(
-                [("path", with_description(str_schema(), "Path to the file to edit."), true)]
-                    .into_iter()
-                    .chain(fields)
-                    .chain([(
-                        "edits",
-                        with_description(
-                            with_items_bounds(arr_schema(edit_item_schema), Some(1), None),
-                            "Apply all of these replacements as one edit.",
-                        ),
-                        false,
-                    )]),
-            ),
+            parameters: obj_schema([
+                ("path", with_description(str_schema(), "Path to the file to edit."), true),
+                (
+                    "oldText",
+                    with_description(str_schema(), "Text to find and replace."),
+                    false,
+                ),
+                (
+                    "newText",
+                    with_description(str_schema(), "Replacement text."),
+                    false,
+                ),
+                (
+                    "edits",
+                    with_description(
+                        with_items_bounds(arr_schema(edit_item_schema), Some(1), None),
+                        "Apply all of these replacements as one edit.",
+                    ),
+                    false,
+                ),
+            ]),
         }
     }
 

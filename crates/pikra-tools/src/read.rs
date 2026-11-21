@@ -14,21 +14,11 @@ const BINARY_SNIFF_BYTES: usize = 8192;
 #[derive(Clone, Debug)]
 pub struct ReadTool {
     config: Arc<WorkspaceToolsConfig>,
-    plain_text: bool,
 }
 
 impl ReadTool {
     pub fn new(config: Arc<WorkspaceToolsConfig>) -> Self {
-        Self {
-            config,
-            plain_text: false,
-        }
-    }
-
-    /// Return file text verbatim, or return the requested line slice without annotations.
-    pub fn with_plain_text(mut self) -> Self {
-        self.plain_text = true;
-        self
+        Self { config }
     }
 }
 
@@ -78,7 +68,6 @@ impl AgentTool for ReadTool {
         _on_update: ToolProgressCallback,
     ) -> BoxFuture<'_, Result<AgentToolResult, String>> {
         let config = Arc::clone(&self.config);
-        let plain_text = self.plain_text;
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err("Operation aborted".into());
@@ -137,26 +126,6 @@ impl AgentTool for ReadTool {
                     bytes.len()
                 )
             })?;
-
-            if plain_text {
-                if args["offset"].is_null() && args["limit"].is_null() {
-                    return Ok(AgentToolResult::text(text));
-                }
-                let limit = if args["limit"].is_null() {
-                    usize::MAX
-                } else {
-                    limit
-                };
-                let lines = text
-                    .split_inclusive('\n')
-                    .map(|line| match line.strip_suffix('\n') {
-                        Some(line) => line.strip_suffix('\r').unwrap_or(line),
-                        None => line,
-                    })
-                    .chain(text.ends_with('\n').then_some(""));
-                let slice = lines.skip(offset - 1).take(limit).collect::<Vec<_>>();
-                return Ok(AgentToolResult::text(slice.join("\n")));
-            }
 
             if text.is_empty() {
                 let mut res = AgentToolResult::text("(empty file)");

@@ -204,6 +204,7 @@ impl Web2Md {
         cancel: CancelToken,
         supplied: Option<Download>,
     ) -> Result<Routed, Web2MdError> {
+        let offline = supplied.is_some();
         let mut context = ParseContext {
             url,
             fetcher: self.fetcher.clone(),
@@ -213,7 +214,7 @@ impl Web2Md {
             api_head: Arc::default(),
         };
         let mut last_error = None;
-        let document = self.extract(&mut context, &mut last_error).await;
+        let document = self.extract(&mut context, offline, &mut last_error).await;
         if context.cancel.is_cancelled() {
             return Err(Web2MdError::Cancelled);
         }
@@ -241,16 +242,35 @@ impl Web2Md {
     async fn extract(
         &self,
         context: &mut ParseContext,
+        offline: bool,
         last_error: &mut Option<Web2MdError>,
     ) -> Result<Option<Web2MdDocument>, Web2MdError> {
-        for rule in self.rules.iter().filter(|rule| rule.page.is_none()) {
-            if rule.url.as_ref().is_some_and(|test| test(&context.url))
-                && let Some(document) = attempt(rule, context, last_error).await?
-            {
-                return Ok(Some(document));
+        if !offline {
+            for rule in self.rules.iter().filter(|rule| rule.page.is_none()) {
+                if rule.url.as_ref().is_some_and(|test| test(&context.url))
+                    && let Some(document) = attempt(rule, context, last_error).await?
+                {
+                    return Ok(Some(document));
+                }
             }
         }
-        if !context.download().await?.is_html() {
+        let (final_url, is_html) = {
+            let download = context.download().await?;
+            (download.url.clone(), download.is_html())
+        };
+        if final_url != context.url {
+            context.url = final_url;
+            if !offline {
+                for rule in self.rules.iter().filter(|rule| rule.page.is_none()) {
+                    if rule.url.as_ref().is_some_and(|test| test(&context.url))
+                        && let Some(document) = attempt(rule, context, last_error).await?
+                    {
+                        return Ok(Some(document));
+                    }
+                }
+            }
+        }
+        if !is_html {
             return Ok(None);
         }
         for rule in &self.rules {

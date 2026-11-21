@@ -78,7 +78,7 @@ public actor PikraToolApproval {
         pluginID: String,
         effect: PikraToolEffect
     ) -> PikraTool {
-        PikraTool(
+        var wrapped = PikraTool(
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
@@ -97,6 +97,8 @@ public actor PikraToolApproval {
             try Task.checkCancellation()
             return try await tool.execute(context, input)
         }
+        wrapped.associatedEnvironment = tool.associatedEnvironment
+        return wrapped
     }
 
     private func authorize(_ request: Request) async throws {

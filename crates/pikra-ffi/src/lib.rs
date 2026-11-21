@@ -334,15 +334,6 @@ pub unsafe extern "C" fn pikra_session_steer(
     session: *mut PikraSession,
     id: *const c_char,
     text: *const c_char,
-) -> bool {
-    unsafe { pikra_session_steer_ex(session, id, text, false) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pikra_session_steer_ex(
-    session: *mut PikraSession,
-    id: *const c_char,
-    text: *const c_char,
     is_meta: bool,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
@@ -365,16 +356,6 @@ pub unsafe extern "C" fn pikra_session_steer_ex(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_session_follow_up(
-    session: *mut PikraSession,
-    id: *const c_char,
-    text: *const c_char,
-    out_error: *mut *mut c_char,
-) -> PikraStatus {
-    unsafe { pikra_session_follow_up_ex(session, id, text, false, out_error) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pikra_session_follow_up_ex(
     session: *mut PikraSession,
     id: *const c_char,
     text: *const c_char,
@@ -479,15 +460,6 @@ pub unsafe extern "C" fn pikra_session_set_context(
         }
     }))
     .unwrap_or(PikraStatus::ErrInternal)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pikra_session_append_context(
-    session: *mut PikraSession,
-    text: *const c_char,
-    out_error: *mut *mut c_char,
-) -> PikraStatus {
-    unsafe { pikra_session_append_named_context(session, c"context".as_ptr(), text, out_error) }
 }
 
 #[unsafe(no_mangle)]
@@ -989,60 +961,6 @@ struct FfiSkillDiscoveryResponse {
     prompt: String,
 }
 
-fn escape_skill_xml(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-fn format_discovered_skills_prompt(skills: &[FfiDiscoveredSkill]) -> String {
-    let visible: Vec<&FfiDiscoveredSkill> = skills
-        .iter()
-        .filter(|s| !s.disable_model_invocation)
-        .collect();
-    if visible.is_empty() {
-        return String::new();
-    }
-
-    let mut lines = Vec::with_capacity(visible.len() * 6 + 3);
-    lines.push(
-        "Available skills. Use read to load a skill's SKILL.md when the task matches its description, before doing the work."
-            .to_string(),
-    );
-    lines.push("<available_skills>".to_string());
-    for skill in visible {
-        lines.push("  <skill>".to_string());
-        lines.push(format!(
-            "    <name>{}</name>",
-            escape_skill_xml(&skill.name)
-        ));
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_skill_xml(&skill.description)
-        ));
-        lines.push(format!(
-            "    <location>{}</location>",
-            escape_skill_xml(&skill.location)
-        ));
-        lines.push(format!(
-            "    <revision>{}</revision>",
-            escape_skill_xml(&skill.revision)
-        ));
-        lines.push("  </skill>".to_string());
-    }
-    lines.push("</available_skills>".to_string());
-    lines.join("\n")
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_discover_skills(
     roots_json: *const c_char,
@@ -1069,7 +987,7 @@ pub unsafe extern "C" fn pikra_discover_skills(
             .map(std::path::PathBuf::from)
             .collect();
         let catalog = pikra_kit::SkillCatalog::discover(&root_paths);
-        encode_skill_catalog(&catalog, true, out_error)
+        encode_skill_catalog(&catalog, out_error)
     }))
     .unwrap_or_else(|_| {
         unsafe { write_out_string(out_error, "panic inside pikra_discover_skills") };
@@ -1089,7 +1007,6 @@ pub unsafe extern "C" fn pikra_discover_skills_with_config(
         match config {
             Ok(config) => encode_skill_catalog(
                 &pikra_kit::SkillCatalog::discover_with_config(&config),
-                false,
                 out_error,
             ),
             Err(error) => {
@@ -1103,7 +1020,6 @@ pub unsafe extern "C" fn pikra_discover_skills_with_config(
 
 fn encode_skill_catalog(
     catalog: &pikra_kit::SkillCatalog,
-    legacy_prompt: bool,
     out_error: *mut *mut c_char,
 ) -> *mut c_char {
     let skills: Vec<_> = catalog
@@ -1117,11 +1033,7 @@ fn encode_skill_catalog(
             revision: skill.revision.clone(),
         })
         .collect();
-    let prompt = if legacy_prompt {
-        format_discovered_skills_prompt(&skills)
-    } else {
-        catalog.format_for_context().unwrap_or_default()
-    };
+    let prompt = catalog.format_for_context().unwrap_or_default();
     let response = FfiSkillDiscoveryResponse { skills, prompt };
     match serde_json::to_vec(&response)
         .map_err(|error| error.to_string())

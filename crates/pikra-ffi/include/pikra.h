@@ -239,24 +239,11 @@ PikraStatus pikra_session_prompt_start(
 bool pikra_session_steer(
     PikraSession *session,
     const char *id,
-    const char *text
-);
-
-bool pikra_session_steer_ex(
-    PikraSession *session,
-    const char *id,
     const char *text,
     bool is_meta
 );
 
 PikraStatus pikra_session_follow_up(
-    PikraSession *session,
-    const char *id,
-    const char *text,
-    char **out_error
-);
-
-PikraStatus pikra_session_follow_up_ex(
     PikraSession *session,
     const char *id,
     const char *text,
@@ -275,12 +262,6 @@ PikraStatus pikra_session_set_context(
     const char *name,
     const char *text,
     bool *out_changed,
-    char **out_error
-);
-
-PikraStatus pikra_session_append_context(
-    PikraSession *session,
-    const char *text,
     char **out_error
 );
 

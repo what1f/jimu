@@ -238,7 +238,7 @@ pub struct FfiPromptRequest {
     #[serde(default)]
     pub id: Option<String>,
     pub content: Vec<ContentPart>,
-    #[serde(default, alias = "isMeta")]
+    #[serde(default)]
     pub is_meta: bool,
 }
 

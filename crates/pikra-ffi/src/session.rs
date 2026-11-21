@@ -21,9 +21,11 @@ use pikra_kit::{
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
-    SessionEntry, SessionEvent, SessionManager, SessionStore, prepare_flushed_prompt,
+    SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
+    prepare_flushed_prompt,
 };
 use serde_json::Map;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -69,6 +71,36 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn persisted_baseline_tool_names(store: &dyn SessionStore) -> Result<Option<Vec<String>>, String> {
+    let (_, entries) = store
+        .load()
+        .map_err(|e| format!("failed to open session: {e}"))?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let by_id: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| (entry.id.as_str(), idx))
+        .collect();
+    let mut cursor = entries.last().map(|entry| entry.id.as_str());
+    let mut visited = 0usize;
+    while let Some(id) = cursor {
+        if visited >= entries.len() {
+            break;
+        }
+        visited += 1;
+        let Some(&idx) = by_id.get(id) else {
+            break;
+        };
+        if let SessionEntryPayload::SystemBaseline { tools, .. } = &entries[idx].payload {
+            return Ok(Some(tools.iter().map(|t| t.name.clone()).collect()));
+        }
+        cursor = entries[idx].parent_id.as_deref();
+    }
+    Ok(None)
+}
+
 struct ActivePromptRun {
     cancel: CancelToken,
     idle_waiters: Vec<oneshot::Sender<()>>,
@@ -111,11 +143,17 @@ impl FfiSession {
         tool_callbacks: PikraToolCallbacks,
     ) -> Result<Arc<Self>, String> {
         let http_cb = SendHttpCallbacks::new(http_callbacks)?;
-        let tool_cb = SendToolCallbacks::new(tool_callbacks);
+        let tool_cb = SendToolCallbacks::new(tool_callbacks, Some(Arc::clone(&http_cb)));
         let next_tool_call_id = Arc::new(AtomicU64::new(1));
 
         let transport = Arc::new(FfiHttpTransport::new(http_cb.clone()));
         let provider = Arc::new(Client::new(transport));
+
+        let store: Arc<dyn SessionStore> = match &config.persistence_path {
+            Some(path) if !path.is_empty() => Arc::new(JsonlSessionStore::new(path)),
+            _ => Arc::new(MemorySessionStore::new()),
+        };
+        let baseline_tool_names = persisted_baseline_tool_names(&*store)?;
 
         let deferred_registry = Arc::new(DeferredToolRegistry::new());
         let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
@@ -133,27 +171,70 @@ impl FfiSession {
             ]
             .contains(&name)
         };
-        let pinned = config
-            .tools
-            .iter()
-            .filter(|spec| !spec.deferred && reserved(&spec.name))
-            .map(FfiToolSpec::definition)
-            .collect::<Vec<_>>();
-        let mut budget = ToolSchemaBudget::new(auto_defer, &pinned);
-        for spec in &config.tools {
-            let tool = FfiAgentTool::from_spec(spec, tool_cb, Arc::clone(&next_tool_call_id));
-            if spec.deferred
-                || (auto_defer.is_some()
-                    && !reserved(&spec.name)
-                    && !budget.admit(&tool.definition()))
-            {
-                deferred.push(tool);
-            } else {
-                resident.push(tool);
+
+        if let Some(baseline_names) = baseline_tool_names {
+            let baseline_set: HashSet<&str> = baseline_names.iter().map(String::as_str).collect();
+            let mut by_name: HashMap<&str, Arc<dyn AgentTool>> = HashMap::new();
+            let mut non_baseline: Vec<(&FfiToolSpec, Arc<dyn AgentTool>)> = Vec::new();
+            for spec in &config.tools {
+                let tool =
+                    FfiAgentTool::from_spec(spec, tool_cb.clone(), Arc::clone(&next_tool_call_id));
+                if baseline_set.contains(spec.name.as_str()) {
+                    by_name.entry(spec.name.as_str()).or_insert(tool);
+                } else {
+                    non_baseline.push((spec, tool));
+                }
+            }
+            for name in &baseline_names {
+                if let Some(tool) = by_name.remove(name.as_str()) {
+                    resident.push(tool);
+                }
+            }
+            let pinned = resident
+                .iter()
+                .map(|tool| tool.definition())
+                .chain(
+                    non_baseline
+                        .iter()
+                        .filter(|(spec, _)| !spec.deferred && reserved(&spec.name))
+                        .map(|(spec, _)| spec.definition()),
+                )
+                .collect::<Vec<_>>();
+            let mut budget = ToolSchemaBudget::new(auto_defer, &pinned);
+            for (spec, tool) in non_baseline {
+                if spec.deferred
+                    || (auto_defer.is_some()
+                        && !reserved(&spec.name)
+                        && !budget.admit(&tool.definition()))
+                {
+                    deferred.push(tool);
+                } else {
+                    resident.push(tool);
+                }
+            }
+        } else {
+            let pinned = config
+                .tools
+                .iter()
+                .filter(|spec| !spec.deferred && reserved(&spec.name))
+                .map(FfiToolSpec::definition)
+                .collect::<Vec<_>>();
+            let mut budget = ToolSchemaBudget::new(auto_defer, &pinned);
+            for spec in &config.tools {
+                let tool =
+                    FfiAgentTool::from_spec(spec, tool_cb.clone(), Arc::clone(&next_tool_call_id));
+                if spec.deferred
+                    || (auto_defer.is_some()
+                        && !reserved(&spec.name)
+                        && !budget.admit(&tool.definition()))
+                {
+                    deferred.push(tool);
+                } else {
+                    resident.push(tool);
+                }
             }
         }
 
-        let enable_skill_search = config.skill_discovery.is_some();
         let skill_discovery = if let Some(mut discovery) = config.skill_discovery {
             if discovery.cwd.is_none() {
                 discovery.cwd = config.cwd.as_ref().map(PathBuf::from);
@@ -171,6 +252,7 @@ impl FfiSession {
         } else {
             None
         };
+        let enable_skill_search = skill_discovery.is_some();
         let skills = Arc::new(Mutex::new(
             skill_discovery
                 .as_ref()
@@ -251,11 +333,6 @@ impl FfiSession {
         }
 
         let resident_defs: Vec<ToolDefinition> = resident.iter().map(|t| t.definition()).collect();
-        let store: Arc<dyn SessionStore> = match &config.persistence_path {
-            Some(path) if !path.is_empty() => Arc::new(JsonlSessionStore::new(path)),
-            _ => Arc::new(MemorySessionStore::new()),
-        };
-
         let compaction: CompactionConfig = config.compaction.map(Into::into).unwrap_or_default();
 
         let mut session_cfg =
@@ -905,7 +982,7 @@ impl FfiSession {
             .map(|spec| {
                 FfiAgentTool::from_spec(
                     spec,
-                    self.tool_callbacks,
+                    self.tool_callbacks.clone(),
                     Arc::clone(&self.next_tool_call_id),
                 )
             })

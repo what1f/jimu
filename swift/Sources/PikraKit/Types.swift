@@ -378,16 +378,19 @@ public enum PikraContentPart: Codable, Sendable, Equatable {
 public struct PikraToolOutput: Codable, Sendable, Equatable {
     public var content: [PikraContentPart] {
         didSet {
-            // Workspace bash mirrors its JSON text as structured content. Keep that copy
-            // synchronized when a host wrapper redacts or limits the rendered output.
-            guard let payload = structuredContent,
-                  payload["exit_code"]?.intValue != nil,
-                  payload["output"]?.stringValue != nil,
-                  payload["output_truncated"]?.boolValue != nil,
-                  oldValue.count == 1, case .text(let text) = oldValue[0],
-                  (try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))) == payload
-            else { return }
-            structuredContent = try? JSONDecoder().decode(JSONValue.self, from: Data(textOutput.utf8))
+            // Keep structuredContent synchronized when a host wrapper redacts JSON-backed
+            // content; otherwise drop it so unredacted structured payloads never leak.
+            guard let payload = structuredContent else { return }
+            if oldValue.count == 1,
+               case .text(let text) = oldValue[0],
+               (try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))) == payload,
+               let updated = try? JSONDecoder().decode(JSONValue.self, from: Data(textOutput.utf8)),
+               case .object = updated
+            {
+                structuredContent = updated
+            } else {
+                structuredContent = nil
+            }
         }
     }
     public var details: JSONValue
@@ -502,6 +505,7 @@ public struct PikraTool: Sendable {
     public let deferred: Bool
     public let executionMode: PikraToolExecutionMode
     public let execute: @Sendable (PikraToolCallContext, JSONValue) async throws -> PikraToolOutput
+    internal var associatedEnvironment: PikraWorkspaceEnvironment?
 
     public init(
         name: String,
@@ -520,6 +524,7 @@ public struct PikraTool: Sendable {
         self.deferred = deferred
         self.executionMode = executionMode
         self.execute = execute
+        self.associatedEnvironment = nil
     }
 }
 
