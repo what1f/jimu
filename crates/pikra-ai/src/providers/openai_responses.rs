@@ -50,7 +50,7 @@ fn parse_text_signature(sig: Option<&str>) -> Option<(String, Option<String>)> {
     Some((sig.to_string(), None))
 }
 
-fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+pub(crate) fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
@@ -101,7 +101,7 @@ fn convert_tool_output(model: &Model, content: &[ContentPart]) -> Value {
     Value::Array(out)
 }
 
-fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
+pub(crate) fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
     let transformed = transform_messages(messages, model, |id, target, src| {
         normalize_tool_call_id_openai_responses(
             id,
@@ -188,20 +188,15 @@ fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
                             input.push(Value::Object(item));
                         }
                         AssistantBlock::ToolCall(tc) => {
-                            let (call_id, legacy_item_id) = match tc.id.split_once('|') {
-                                Some((c, i)) => (c, Some(i)),
-                                None => (tc.id.as_str(), None),
-                            };
-                            let raw_item_id = tc.thought_signature.as_deref().or(legacy_item_id);
                             let mut item = Map::new();
                             item.insert("type".into(), json!("function_call"));
                             if is_same_model
-                                && let Some(item_id) = raw_item_id
+                                && let Some(item_id) = tc.item_id.as_deref()
                                 && item_id.starts_with("fc_")
                             {
                                 item.insert("id".into(), Value::String(item_id.to_string()));
                             }
-                            item.insert("call_id".into(), Value::String(call_id.to_string()));
+                            item.insert("call_id".into(), Value::String(tc.id.clone()));
                             item.insert("name".into(), Value::String(tc.name.clone()));
                             let args_str = serde_json::to_string(&Value::Object(tc.arguments.clone()))
                                 .unwrap_or_else(|_| "{}".into());
@@ -215,10 +210,9 @@ fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
                 }
             }
             Message::ToolResult(tr) => {
-                let call_id = tr.tool_call_id.split('|').next().unwrap_or(&tr.tool_call_id);
                 input.push(json!({
                     "type": "function_call_output",
-                    "call_id": call_id,
+                    "call_id": &tr.tool_call_id,
                     "output": convert_tool_output(model, &tr.content),
                 }));
             }
@@ -285,17 +279,20 @@ pub fn build_request_body(
 
     if model.supports_reasoning
         && let Some(level) = options.reasoning
-        && level != ThinkingLevel::Off
         && let Some(effort) = thinking_level_effort_str(level)
     {
-        body.insert(
-            "reasoning".into(),
-            json!({
-                "effort": effort,
-                "summary": "auto",
-            }),
-        );
-        body.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        if level == ThinkingLevel::None {
+            body.insert("reasoning".into(), json!({ "effort": effort }));
+        } else {
+            body.insert(
+                "reasoning".into(),
+                json!({
+                    "effort": effort,
+                    "summary": "auto",
+                }),
+            );
+            body.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        }
     }
 
     for (k, v) in &options.sampling_params {
@@ -320,7 +317,7 @@ pub fn stream(
     drive_event_stream(move |sink| async move {
         let started_at = now_ms();
         let cancel = options.cancel.clone();
-        let mut output = new_assistant_message(&model, options.reasoning);
+        let output = new_assistant_message(&model, options.reasoning);
 
         let body_val = build_request_body(&model, &context, &options);
         let body_bytes = match serde_json::to_vec(&body_val) {
@@ -366,11 +363,24 @@ pub fn stream(
             }
         };
 
+        consume_responses_sse_stream(response.body, &model, output, &sink, &cancel, started_at)
+            .await;
+    })
+}
+
+pub(crate) async fn consume_responses_sse_stream(
+    response_body: crate::ByteStream,
+    model: &Model,
+    mut output: crate::AssistantMessage,
+    sink: &crate::providers::EventSink,
+    cancel: &crate::CancelToken,
+    started_at: u64,
+) {
         sink.send(AssistantMessageEvent::Start {
             partial: output.clone(),
         });
 
-        let mut sse = SseStream::new(response.body, cancel.clone());
+        let mut sse = SseStream::new(response_body, cancel.clone());
         let mut slots: HashMap<usize, OutputSlot> = HashMap::new();
         let mut reasoning_by_id: HashMap<String, usize> = HashMap::new();
         let mut saw_terminal = false;
@@ -379,7 +389,7 @@ pub fn stream(
             let ev = match frame {
                 Ok(ev) => ev,
                 Err(err) => {
-                    emit_transport_error(&sink, output, err, &cancel, started_at);
+                    emit_transport_error(sink, output, err, cancel, started_at);
                     return;
                 }
             };
@@ -391,11 +401,11 @@ pub fn stream(
                 Ok(v) => v,
                 Err(err) => {
                     emit_protocol_error(
-                        &sink,
+                        sink,
                         output,
                         "sse_parse_error",
                         format!("invalid OpenAI Responses SSE JSON: {err}"),
-                        &cancel,
+                        cancel,
                         started_at,
                     );
                     return;
@@ -429,7 +439,7 @@ pub fn stream(
                             item,
                             &mut output,
                             &mut slots,
-                            &sink,
+                            sink,
                         );
                     }
                 }
@@ -534,7 +544,7 @@ pub fn stream(
                         continue;
                     };
                     if !slots.contains_key(&output_index) {
-                        create_slot_from_item(output_index, item, &mut output, &mut slots, &sink);
+                        create_slot_from_item(output_index, item, &mut output, &mut slots, sink);
                     }
                     let Some(slot) = slots.remove(&output_index) else {
                         continue;
@@ -749,11 +759,11 @@ pub fn stream(
                                         |r| format!("Response incomplete: {r}"),
                                     );
                                     emit_protocol_error(
-                                        &sink,
+                                        sink,
                                         output,
                                         "response_incomplete",
                                         reason_msg,
-                                        &cancel,
+                                        cancel,
                                         started_at,
                                     );
                                     return;
@@ -766,11 +776,11 @@ pub fn stream(
                                     .and_then(Value::as_str)
                                     .unwrap_or("OpenAI Responses request failed");
                                 emit_protocol_error(
-                                    &sink,
+                                    sink,
                                     output,
                                     "response_failed",
                                     err_msg,
-                                    &cancel,
+                                    cancel,
                                     started_at,
                                 );
                                 return;
@@ -796,11 +806,11 @@ pub fn stream(
                         })
                         .unwrap_or_else(|| "OpenAI Responses failed".into());
                     emit_protocol_error(
-                        &sink,
+                        sink,
                         output,
                         "response_failed",
                         err_msg,
-                        &cancel,
+                        cancel,
                         started_at,
                     );
                     return;
@@ -815,11 +825,11 @@ pub fn stream(
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown stream error");
                     emit_protocol_error(
-                        &sink,
+                        sink,
                         output,
                         code,
                         format!("{code}: {msg}"),
-                        &cancel,
+                        cancel,
                         started_at,
                     );
                     return;
@@ -831,17 +841,17 @@ pub fn stream(
         }
 
         if cancel.is_cancelled() {
-            emit_transport_error(&sink, output, crate::TransportError::Aborted, &cancel, started_at);
+            emit_transport_error(sink, output, crate::TransportError::Aborted, cancel, started_at);
             return;
         }
 
         if !saw_terminal || output.stop_reason == StopReason::Pending {
             emit_protocol_error(
-                &sink,
+                sink,
                 output,
                 "incomplete_stream",
                 "OpenAI Responses stream ended before a terminal response event",
-                &cancel,
+                cancel,
                 started_at,
             );
             return;
@@ -852,7 +862,6 @@ pub fn stream(
             reason: output.stop_reason,
             message: output,
         });
-    })
 }
 
 fn create_slot_from_item(
@@ -914,7 +923,8 @@ fn create_slot_from_item(
                 id: id.clone(),
                 name: name.clone(),
                 arguments: Map::new(),
-                thought_signature: stored_item_id,
+                item_id: stored_item_id,
+                thought_signature: None,
                 namespace,
                 arguments_error: None,
             }));

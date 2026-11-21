@@ -31,6 +31,7 @@ fn test_model(id: &str) -> Model {
         supports_reasoning: true,
         cost: ModelCost::default(),
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -186,6 +187,7 @@ fn make_tool_call(id: &str, name: &str, args: Value, arguments_error: Option<&st
         id: id.into(),
         name: name.into(),
         arguments: map,
+        item_id: None,
         thought_signature: None,
         namespace: None,
         arguments_error: arguments_error.map(str::to_string),

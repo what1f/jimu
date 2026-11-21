@@ -2,7 +2,7 @@
 
 use crate::providers::{
     anthropic_messages, drive_event_stream, emit_protocol_error, google_generative_ai,
-    new_assistant_message, now_ms, openai_completions, openai_responses,
+    new_assistant_message, now_ms, openai_codex_responses, openai_completions, openai_responses,
 };
 use crate::{
     ApiKind, AssistantEventStream, AssistantMessage, AssistantMessageEvent, HttpTransport, Model,
@@ -48,6 +48,12 @@ impl StreamProvider for Client {
             ApiKind::OpenaiResponses => {
                 openai_responses::stream(self.transport.clone(), model.clone(), context.clone(), options)
             }
+            ApiKind::OpenaiCodexResponses => openai_codex_responses::stream(
+                self.transport.clone(),
+                model.clone(),
+                context.clone(),
+                options,
+            ),
             ApiKind::OpenaiCompletions => openai_completions::stream(
                 self.transport.clone(),
                 model.clone(),

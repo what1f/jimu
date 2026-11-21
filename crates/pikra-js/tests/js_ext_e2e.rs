@@ -26,6 +26,7 @@ fn test_model() -> Model {
         supports_reasoning: true,
         cost: ModelCost::default(),
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn tool_call(id: &str, name: &str, args: Value) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments,
+        item_id: None,
         thought_signature: None,
         namespace: None,
         arguments_error: None,

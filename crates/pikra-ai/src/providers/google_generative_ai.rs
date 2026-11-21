@@ -215,37 +215,44 @@ fn uses_thinking_level(model_id: &str) -> bool {
 }
 
 fn build_thinking_config(model: &Model, level: ThinkingLevel) -> Option<Value> {
-    if level == ThinkingLevel::Off {
-        let lower = model.id.to_ascii_lowercase();
-        if lower.contains("pro") || uses_thinking_level(&model.id) {
-            return None;
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::None => {
+            if uses_thinking_level(&model.id) {
+                Some(json!({ "thinkingLevel": "MINIMAL" }))
+            } else if model.id.to_ascii_lowercase().contains("pro") {
+                None
+            } else {
+                Some(json!({ "thinkingBudget": 0 }))
+            }
         }
-        return Some(json!({ "thinkingBudget": 0 }));
-    }
-    if uses_thinking_level(&model.id) {
-        let lvl = match level {
-            ThinkingLevel::Minimal => "MINIMAL",
-            ThinkingLevel::Low => "LOW",
-            ThinkingLevel::Medium => "MEDIUM",
-            ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "HIGH",
-            ThinkingLevel::Off => "MINIMAL",
-        };
-        Some(json!({
-            "includeThoughts": true,
-            "thinkingLevel": lvl,
-        }))
-    } else {
-        let budget = match level {
-            ThinkingLevel::Minimal => 128,
-            ThinkingLevel::Low => 2_048,
-            ThinkingLevel::Medium => 8_192,
-            ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => 24_576,
-            ThinkingLevel::Off => 0,
-        };
-        Some(json!({
-            "includeThoughts": true,
-            "thinkingBudget": budget,
-        }))
+        other => {
+            if uses_thinking_level(&model.id) {
+                let lvl = match other {
+                    ThinkingLevel::Minimal => "MINIMAL",
+                    ThinkingLevel::Low => "LOW",
+                    ThinkingLevel::Medium => "MEDIUM",
+                    ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "HIGH",
+                    ThinkingLevel::Off | ThinkingLevel::None => "MINIMAL",
+                };
+                Some(json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": lvl,
+                }))
+            } else {
+                let budget = match other {
+                    ThinkingLevel::Minimal => 128,
+                    ThinkingLevel::Low => 2_048,
+                    ThinkingLevel::Medium => 8_192,
+                    ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => 24_576,
+                    ThinkingLevel::Off | ThinkingLevel::None => 0,
+                };
+                Some(json!({
+                    "includeThoughts": true,
+                    "thinkingBudget": budget,
+                }))
+            }
+        }
     }
 }
 
@@ -557,6 +564,7 @@ pub fn stream(
                                 id: id.clone(),
                                 name: name.clone(),
                                 arguments,
+                                item_id: None,
                                 thought_signature: thought_sig.map(ToString::to_string),
                                 namespace: None,
                                 arguments_error,

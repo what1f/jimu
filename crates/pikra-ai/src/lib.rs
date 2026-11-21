@@ -1,6 +1,7 @@
 //! Unified multi-provider streaming LLM API, transcript model, and transport traits.
 
 pub mod models;
+pub mod oauth;
 pub mod providers;
 pub mod sse;
 pub mod transcript;
@@ -13,7 +14,7 @@ pub use transcript::{ResolvedTranscript, render_system_message_text};
 pub use transform::{
     ERROR_TOOL_IMAGE_PLACEHOLDER, NON_VISION_TOOL_IMAGE_PLACEHOLDER,
     NON_VISION_USER_IMAGE_PLACEHOLDER, SplitErrorToolResult, normalize_tool_call_id_anthropic,
-    normalize_tool_call_id_openai_completions, normalize_tool_call_id_openai_responses,
+    normalize_tool_call_id_openai_completions, normalize_tool_call_id_openai_responses, short_hash,
     split_error_tool_result_images, transform_messages,
 };
 pub use usage::{calculate_cost, clamp_prompt_cache_key, parse_tool_call_arguments};
@@ -103,6 +104,7 @@ impl Future for CancelledFuture {
 #[serde(rename_all = "kebab-case")]
 pub enum ApiKind {
     OpenaiResponses,
+    OpenaiCodexResponses,
     OpenaiCompletions,
     AnthropicMessages,
     GoogleGenerativeAi,
@@ -114,12 +116,46 @@ pub enum ApiKind {
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     Off,
+    None,
     Minimal,
     Low,
     Medium,
     High,
     Xhigh,
     Max,
+}
+
+impl std::str::FromStr for ThinkingLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "none" | "disable" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            other => Err(format!(
+                "unsupported thinking level `{other}` (expected off, none, minimal, low, medium, high, xhigh, or max)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -155,6 +191,8 @@ pub struct Model {
     pub cost: ModelCost,
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<ModelCompat>,
 }
 
 impl Model {
@@ -177,6 +215,7 @@ impl Model {
             supports_reasoning: false,
             cost: ModelCost::default(),
             headers: Vec::new(),
+            compat: None,
         }
     }
 }
@@ -225,6 +264,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

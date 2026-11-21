@@ -1,8 +1,8 @@
 //! Cross-provider message handoff, vision downgrade, tool call ID normalization, and error image splitting.
 
 use crate::{
-    AssistantBlock, AssistantMessage, ContentPart, ImageContent, Message, Model, StopReason,
-    TextContent, ToolCall, ToolResultMessage,
+    ApiKind, AssistantBlock, AssistantMessage, ContentPart, ImageContent, Message, Model,
+    StopReason, TextContent, ToolCall, ToolResultMessage,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -128,11 +128,10 @@ pub fn normalize_tool_call_id_anthropic(id: &str) -> String {
 
 /// Normalize tool call IDs for OpenAI Chat Completions (max 40 chars, `^[a-zA-Z0-9_-]+$`).
 pub fn normalize_tool_call_id_openai_completions(id: &str) -> String {
-    if !id.is_empty() && !id.contains('|') && id.len() <= 40 && id.chars().all(is_valid_id_char) {
+    if !id.is_empty() && id.len() <= 40 && id.chars().all(is_valid_id_char) {
         return id.to_string();
     }
-    let call_part = id.split('|').next().unwrap_or(id);
-    let sanitized = sanitize_id_chars(call_part);
+    let sanitized = sanitize_id_chars(id);
     let hash = &short_hash(id)[..8];
     let max_prefix = 40 - 1 - hash.len(); // 31
     let prefix = sanitized
@@ -148,28 +147,9 @@ pub fn normalize_tool_call_id_openai_completions(id: &str) -> String {
     }
 }
 
-/// Normalize tool call IDs for OpenAI Responses (`{call_id}` or `{call_id}|{fc_...}`).
-pub fn normalize_tool_call_id_openai_responses(id: &str, same_provider_api: bool) -> String {
-    if let Some((call_id, item_id)) = id.split_once('|') {
-        let norm_call = normalize_tool_call_id_anthropic(call_id);
-        let norm_item = if !same_provider_api {
-            format!("fc_{}", short_hash(item_id))
-        } else {
-            let clean = normalize_tool_call_id_anthropic(item_id);
-            if clean.starts_with("fc_") {
-                clean
-            } else {
-                let mut prefixed = format!("fc_{clean}");
-                if prefixed.len() > 64 {
-                    prefixed = format!("fc_{}", short_hash(item_id));
-                }
-                prefixed
-            }
-        };
-        format!("{norm_call}|{norm_item}")
-    } else {
-        normalize_tool_call_id_anthropic(id)
-    }
+/// Normalize tool call IDs for OpenAI Responses (`^[a-zA-Z0-9_-]{1,64}$`).
+pub fn normalize_tool_call_id_openai_responses(id: &str, _same_provider_api: bool) -> String {
+    normalize_tool_call_id_anthropic(id)
 }
 
 /// Transform conversation messages for a target `model`:
@@ -243,6 +223,21 @@ where
                             if !is_same_model {
                                 cloned.thought_signature = None;
                                 cloned.namespace = None;
+                                let target_is_responses = matches!(
+                                    model.api,
+                                    ApiKind::OpenaiResponses | ApiKind::OpenaiCodexResponses
+                                );
+                                let is_foreign_provider_or_api =
+                                    assistant.provider != model.provider || assistant.api != model.api;
+                                if target_is_responses && is_foreign_provider_or_api {
+                                    cloned.item_id = tc
+                                        .item_id
+                                        .as_deref()
+                                        .filter(|s| !s.is_empty())
+                                        .map(|item_id| format!("fc_{}", short_hash(item_id)));
+                                } else {
+                                    cloned.item_id = None;
+                                }
                                 let normalized = normalize_tool_call_id(&tc.id, model, assistant);
                                 if normalized != tc.id {
                                     tool_call_id_map.insert(tc.id.clone(), normalized.clone());

@@ -12,8 +12,8 @@ use pikra_ai::{
     ToolDefinition,
 };
 use pikra_kit::{
-    KitEvent, KitSession, KitSessionConfig, McpClient, McpToolRegistrationMode, CALL_TOOL_NAME,
-    CODEMODE_EXEC_TOOL_NAME, TOOL_SEARCH_NAME,
+    KitEvent, KitSession, KitSessionConfig, McpClient, McpToolRegistrationMode, StdioMcpConfig,
+    StdioMcpTransport, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, TOOL_SEARCH_NAME,
 };
 use pikra_schema::{int_schema, obj_schema, str_schema};
 use pikra_testkit::{assert_prompt_prefix_identical, FauxTransport, ScriptedHttpResponse};
@@ -34,6 +34,7 @@ fn test_model() -> Model {
         supports_reasoning: true,
         cost: ModelCost::default(),
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -447,5 +448,145 @@ fn streamable_http_mcp_client_json_and_sse_integrated_into_kit_session() {
         assert_eq!(mcp_reqs[3].body_json["method"], "tools/call");
         assert_eq!(mcp_reqs[3].body_json["params"]["name"], "lookup_weather");
         assert_eq!(mcp_reqs[3].body_json["params"]["arguments"]["city"], "Tokyo");
+    });
+}
+
+#[test]
+fn stdio_mcp_transport_real_python_subprocess_integrated_into_kit_session() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let py_server = r#"
+import json, sys
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    if method == "initialize":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "py-stdio-mcp", "version": "0.1.0"},
+            },
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        # Emit an unsolicited notification before the real response to verify correlation!
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "info", "data": "listing tools"},
+        }) + "\n")
+        resp = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [{
+                    "name": "multiply",
+                    "description": "Multiply two integers",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"}
+                        },
+                        "required": ["x", "y"]
+                    }
+                }]
+            },
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        args = msg.get("params", {}).get("arguments", {})
+        prod = int(args["x"]) * int(args["y"])
+        resp = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": f"product={prod}"}],
+                "structuredContent": {"product": prod},
+                "isError": False,
+            },
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+        let transport = Arc::new(
+            StdioMcpTransport::spawn(StdioMcpConfig {
+                command: "python3".into(),
+                args: vec!["-u".into(), "-c".into(), py_server.into()],
+                env: Vec::new(),
+                cwd: None,
+            })
+            .unwrap(),
+        );
+        let mcp_client = Arc::new(McpClient::new(transport.clone()));
+
+        let init = mcp_client
+            .initialize("pikra-stdio-e2e", "0.1.0", CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(init.server_info.name, "py-stdio-mcp");
+
+        let llm_http = Arc::new(FauxTransport::new());
+        let llm_provider = Arc::new(Client::new(llm_http.clone()));
+        let session = KitSession::new(llm_provider, KitSessionConfig::new(test_model())).unwrap();
+
+        let attached = session
+            .attach_mcp_client(
+                Arc::clone(&mcp_client),
+                McpToolRegistrationMode::Deferred,
+                Some("stdio"),
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attached, vec!["stdio_multiply".to_string()]);
+
+        llm_http.enqueue_sse(openai_sse_tool_call(
+            "s1",
+            "call_mul",
+            CALL_TOOL_NAME,
+            &json!({ "name": "stdio_multiply", "arguments": { "x": 6, "y": 7 } }),
+        ));
+        llm_http.enqueue_sse(openai_sse_text("s2", "6 * 7 = 42."));
+
+        let msgs = session.prompt("Multiply 6 and 7").await.unwrap();
+        let tr = msgs
+            .iter()
+            .find_map(|m| match m {
+                pikra_agent::AgentMessage::Llm(Message::ToolResult(tr)) => Some(tr),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!tr.is_error);
+        match &tr.content[0] {
+            ContentPart::Text(t) => assert_eq!(t.text, "product=42"),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // Verify pre-cancelled request returns McpError::Cancelled immediately.
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        let err = mcp_client.list_tools(cancelled).await.unwrap_err();
+        assert!(matches!(err, pikra_kit::McpError::Cancelled));
+
+        // Clean shutdown terminates the subprocess cleanly.
+        transport.close().await;
     });
 }

@@ -86,11 +86,12 @@ pub fn version_text() -> String {
 pub fn parse_api_kind(raw: &str) -> Result<ApiKind, String> {
     match raw.trim() {
         "openai-responses" => Ok(ApiKind::OpenaiResponses),
+        "openai-codex-responses" => Ok(ApiKind::OpenaiCodexResponses),
         "openai-completions" => Ok(ApiKind::OpenaiCompletions),
         "anthropic-messages" => Ok(ApiKind::AnthropicMessages),
         "google-generative-ai" => Ok(ApiKind::GoogleGenerativeAi),
         other => Err(format!(
-            "unsupported --api `{other}` (expected openai-responses, openai-completions, anthropic-messages, or google-generative-ai)"
+            "unsupported --api `{other}` (expected openai-responses, openai-codex-responses, openai-completions, anthropic-messages, or google-generative-ai)"
         )),
     }
 }
@@ -98,6 +99,7 @@ pub fn parse_api_kind(raw: &str) -> Result<ApiKind, String> {
 pub fn parse_thinking_level(raw: &str) -> Result<ThinkingLevel, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" => Ok(ThinkingLevel::Off),
+        "none" | "disable" => Ok(ThinkingLevel::None),
         "minimal" => Ok(ThinkingLevel::Minimal),
         "low" => Ok(ThinkingLevel::Low),
         "medium" => Ok(ThinkingLevel::Medium),
@@ -105,7 +107,7 @@ pub fn parse_thinking_level(raw: &str) -> Result<ThinkingLevel, String> {
         "xhigh" => Ok(ThinkingLevel::Xhigh),
         "max" => Ok(ThinkingLevel::Max),
         other => Err(format!(
-            "unsupported --thinking `{other}` (expected off, minimal, low, medium, high, xhigh, or max)"
+            "unsupported --thinking `{other}` (expected off, none, minimal, low, medium, high, xhigh, or max)"
         )),
     }
 }

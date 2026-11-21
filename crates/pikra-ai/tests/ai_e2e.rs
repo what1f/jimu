@@ -1,17 +1,29 @@
 //! End-to-end tests for `pikra-ai` across all 4 wire protocols, Anthropic production edge cases,
 //! cross-provider handoffs, multi-turn prompt cache prefix stability, and cooperative abort.
 
+use bytes::Bytes;
 use futures_executor::block_on;
 use futures_util::StreamExt;
+use pikra_ai::oauth::{
+    CODEX_DEFAULT_BASE_URL, CodexCredentials, exchange_codex_code, fetch_codex_models,
+    generate_pkce_from_bytes, parse_authorization_input, refresh_codex_credentials,
+    start_codex_authorization,
+};
+use pikra_ai::providers::{
+    anthropic_messages, google_generative_ai, openai_codex_responses, openai_completions,
+    openai_responses,
+};
 use pikra_ai::{
     ApiKind, AssistantBlock, AssistantMessage, AssistantMessageEvent, CacheRetention, CancelToken,
-    ContentPart, ImageContent, Message, Model, ModelCost, Models, ProviderConfig,
-    SimpleStreamOptions, StopReason, StreamProvider, SystemMessage, TextContent, ThinkingContent,
-    ThinkingLevel, ToolCall, ToolDefinition, ToolResultMessage, TranscriptContext, UserMessage,
+    ContentPart, ImageContent, MaxTokensField, Message, Model, ModelCompat, ModelCost, Models,
+    ProviderConfig, SimpleStreamOptions, StopReason, StreamProvider, SystemMessage, TextContent,
+    ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, ToolResultMessage, TranscriptContext,
+    UserMessage, transform_messages,
 };
 use pikra_schema::{int_schema, obj_schema, str_schema};
-use pikra_testkit::{FauxTransport, assert_prompt_prefix_identical};
+use pikra_testkit::{FauxTransport, ScriptedHttpResponse, assert_prompt_prefix_identical};
 use serde_json::{Map, Value, json};
+use std::str::FromStr;
 use std::sync::Arc;
 
 fn sample_tools() -> Vec<ToolDefinition> {
@@ -54,6 +66,7 @@ fn openai_responses_model() -> Model {
             cache_write: 0.0,
         },
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -75,6 +88,7 @@ fn openai_completions_model() -> Model {
             cache_write: 0.0,
         },
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -96,6 +110,7 @@ fn anthropic_model() -> Model {
             cache_write: 3.75,
         },
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -117,6 +132,7 @@ fn google_model() -> Model {
             cache_write: 0.0,
         },
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -167,10 +183,8 @@ fn all_four_protocols_stream_thinking_parallel_tools_malformed_json_and_cost() {
         assert_eq!(resp_msg.response_id.as_deref(), Some("resp_1"));
         assert_eq!(resp_msg.tool_calls().len(), 2);
         assert_eq!(resp_msg.tool_calls()[0].id, "call_1");
-        assert_eq!(
-            resp_msg.tool_calls()[0].thought_signature.as_deref(),
-            Some("fc_a")
-        );
+        assert_eq!(resp_msg.tool_calls()[0].item_id.as_deref(), Some("fc_a"));
+        assert!(resp_msg.tool_calls()[0].thought_signature.is_none());
         assert_eq!(resp_msg.usage.input, 600);
         assert_eq!(resp_msg.usage.cache_read, 400);
         assert_eq!(resp_msg.usage.reasoning, Some(50));
@@ -355,6 +369,7 @@ fn anthropic_tool_result_merging_error_image_splitting_cache_control_and_cross_p
                     id: oa_id_1.clone(),
                     name: "read_file".into(),
                     arguments: args1,
+                    item_id: Some("fc_orig_1".into()),
                     thought_signature: Some("foreign_thought_sig".into()),
                     namespace: Some("ns".into()),
                     arguments_error: None,
@@ -363,6 +378,7 @@ fn anthropic_tool_result_merging_error_image_splitting_cache_control_and_cross_p
                     id: oa_id_2.clone(),
                     name: "read_file".into(),
                     arguments: args2,
+                    item_id: Some("fc_orig_2".into()),
                     thought_signature: None,
                     namespace: None,
                     arguments_error: None,
@@ -621,5 +637,347 @@ fn multi_turn_prompt_cache_prefix_byte_stability_and_mid_stream_cancel() {
         assert_eq!(saw_delta, "Hello 🚀");
         let aborted = final_error.expect("expected Error event with StopReason::Aborted");
         assert_eq!(aborted.stop_reason, StopReason::Aborted);
+    });
+}
+
+fn json_http_ok(body: Value) -> ScriptedHttpResponse {
+    let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+    ScriptedHttpResponse::stream(
+        200,
+        vec![("content-type".into(), "application/json".into())],
+        Box::pin(futures_util::stream::iter(vec![Ok(bytes)])),
+    )
+}
+
+fn make_jwt(claims: Value) -> String {
+    use base64::Engine;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = enc.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload = enc.encode(serde_json::to_vec(&claims).unwrap());
+    format!("{header}.{payload}.sig")
+}
+
+#[test]
+fn thinking_level_none_vs_off_compat_and_item_id_handoff() {
+    assert_eq!(ThinkingLevel::from_str("none").unwrap(), ThinkingLevel::None);
+    assert_eq!(
+        ThinkingLevel::from_str("disable").unwrap(),
+        ThinkingLevel::None
+    );
+    assert_eq!(ThinkingLevel::from_str("off").unwrap(), ThinkingLevel::Off);
+    assert_eq!(
+        serde_json::to_string(&ThinkingLevel::None).unwrap(),
+        "\"none\""
+    );
+    assert_eq!(
+        serde_json::to_string(&ApiKind::OpenaiCodexResponses).unwrap(),
+        "\"openai-codex-responses\""
+    );
+
+    let ctx = TranscriptContext::new(
+        "Be concise.",
+        vec![],
+        vec![Message::User(UserMessage::text("Ping", 1))],
+    );
+
+    // 1. OpenAI Completions: ModelCompat & ThinkingLevel::None vs None (unset).
+    let ds_model = openai_completions_model();
+    let opts_unset = SimpleStreamOptions {
+        max_tokens: Some(1024),
+        reasoning: None,
+        ..Default::default()
+    };
+    let ds_body_unset = openai_completions::build_request_body(&ds_model, &ctx, &opts_unset);
+    assert_eq!(ds_body_unset["max_tokens"], 1024);
+    assert!(ds_body_unset.get("max_completion_tokens").is_none());
+    assert!(ds_body_unset.get("reasoning_effort").is_none());
+
+    let opts_none = SimpleStreamOptions {
+        max_tokens: Some(1024),
+        reasoning: Some(ThinkingLevel::None),
+        ..Default::default()
+    };
+    let ds_body_none = openai_completions::build_request_body(&ds_model, &ctx, &opts_none);
+    assert_eq!(ds_body_none["reasoning_effort"], "none");
+
+    let mut oa_comp = ds_model.clone();
+    oa_comp.provider = "openai".into();
+    oa_comp.base_url = "https://api.openai.com/v1".into();
+    let oa_comp_body = openai_completions::build_request_body(&oa_comp, &ctx, &opts_unset);
+    assert_eq!(oa_comp_body["max_completion_tokens"], 1024);
+    assert!(oa_comp_body.get("max_tokens").is_none());
+
+    // Explicit ModelCompat override beats provider heuristic.
+    oa_comp.compat = Some(ModelCompat {
+        max_tokens_field: Some(MaxTokensField::MaxTokens),
+    });
+    let oa_override_body = openai_completions::build_request_body(&oa_comp, &ctx, &opts_unset);
+    assert_eq!(oa_override_body["max_tokens"], 1024);
+    assert!(oa_override_body.get("max_completion_tokens").is_none());
+
+    // 2. OpenAI Responses & Codex Responses: ThinkingLevel::None sends effort "none" WITHOUT include.
+    let resp_body_none =
+        openai_responses::build_request_body(&openai_responses_model(), &ctx, &opts_none);
+    assert_eq!(resp_body_none["reasoning"], json!({ "effort": "none" }));
+    assert!(resp_body_none.get("include").is_none());
+
+    let mut codex_model = Model::new(
+        "gpt-5.4-codex",
+        "openai-codex",
+        ApiKind::OpenaiCodexResponses,
+        CODEX_DEFAULT_BASE_URL,
+    );
+    codex_model.supports_reasoning = true;
+    let codex_body_none = openai_codex_responses::build_request_body(&codex_model, &ctx, &opts_none);
+    assert_eq!(codex_body_none["reasoning"], json!({ "effort": "none" }));
+    assert!(codex_body_none.get("include").is_none());
+    assert!(codex_body_none.get("max_output_tokens").is_none());
+
+    // 3. Anthropic Messages: ThinkingLevel::None sends thinking.type == "disabled".
+    let ant_body_none = anthropic_messages::build_request_body(&anthropic_model(), &ctx, &opts_none);
+    assert_eq!(ant_body_none["thinking"], json!({ "type": "disabled" }));
+
+    // 4. Google Generative AI: non-Pro 2.5 -> thinkingBudget: 0; Gemini 3 -> thinkingLevel: MINIMAL; Off -> omitted.
+    let mut gem_flash = google_model();
+    gem_flash.id = "gemini-2.5-flash".into();
+    let gem_flash_none = google_generative_ai::build_request_body(&gem_flash, &ctx, &opts_none);
+    assert_eq!(
+        gem_flash_none["generationConfig"]["thinkingConfig"],
+        json!({ "thinkingBudget": 0 })
+    );
+    let gem_flash_off = google_generative_ai::build_request_body(
+        &gem_flash,
+        &ctx,
+        &SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        },
+    );
+    assert!(gem_flash_off.get("generationConfig").is_none());
+
+    let mut gem3 = google_model();
+    gem3.id = "gemini-3-flash".into();
+    let gem3_none = google_generative_ai::build_request_body(&gem3, &ctx, &opts_none);
+    assert_eq!(
+        gem3_none["generationConfig"]["thinkingConfig"],
+        json!({ "thinkingLevel": "MINIMAL" })
+    );
+
+    // 5. ToolCall.item_id handoff: same-model replays `fc_`, same-provider different-model clears, foreign normalizes to bounded `fc_{hash}`.
+    let assistant_msg = Message::Assistant(AssistantMessage {
+        content: vec![AssistantBlock::ToolCall(ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: Map::new(),
+            item_id: Some("fc_original_item".into()),
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        })],
+        api: ApiKind::OpenaiResponses,
+        provider: "openai".into(),
+        model: "gpt-5.4".into(),
+        response_id: None,
+        thinking_level: None,
+        usage: Default::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        diagnostics: Vec::new(),
+        timestamp: 1,
+        duration_ms: None,
+    });
+    let tr_msg = Message::ToolResult(ToolResultMessage {
+        tool_call_id: "call_1".into(),
+        tool_name: "read_file".into(),
+        content: vec![ContentPart::Text(TextContent::plain("ok"))],
+        is_error: false,
+        timestamp: 2,
+    });
+
+    // Same-provider different-model clears item_id.
+    let mut same_prov_diff_model = openai_responses_model();
+    same_prov_diff_model.id = "gpt-5.4-mini".into();
+    let transformed_diff = transform_messages(
+        &[assistant_msg.clone(), tr_msg.clone()],
+        &same_prov_diff_model,
+        |id, _, _| id.to_string(),
+    );
+    if let Message::Assistant(a) = &transformed_diff[0] {
+        assert_eq!(a.tool_calls()[0].item_id, None);
+    } else {
+        panic!("expected assistant");
+    }
+
+    // Foreign provider/API targeting OpenAI Codex Responses normalizes item_id to bounded fc_{hash}.
+    let transformed_foreign = transform_messages(
+        &[assistant_msg, tr_msg],
+        &codex_model,
+        |id, _, _| id.to_string(),
+    );
+    if let Message::Assistant(a) = &transformed_foreign[0] {
+        let item_id = a.tool_calls()[0].item_id.as_deref().unwrap();
+        assert!(item_id.starts_with("fc_"));
+        assert!(item_id.len() <= 64);
+        assert_ne!(item_id, "fc_original_item");
+    } else {
+        panic!("expected assistant");
+    }
+}
+
+#[test]
+fn codex_oauth_pkce_refresh_models_and_codex_responses_stream() {
+    block_on(async {
+        let pkce = generate_pkce_from_bytes(&[7u8; 32]);
+        assert_eq!(pkce.verifier.len(), 43);
+        assert_eq!(pkce.challenge.len(), 43);
+
+        let auth = start_codex_authorization(None).unwrap();
+        assert!(auth.url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+        assert!(auth.url.contains("code_challenge_method=S256"));
+        assert!(auth.url.contains("originator=pikra"));
+        assert!(auth.url.contains(&format!("state={}", auth.state)));
+
+        let parsed_url = parse_authorization_input(&format!(
+            "http://localhost:1455/auth/callback?code=auth_code_1&state={}",
+            auth.state
+        ));
+        assert_eq!(parsed_url.code.as_deref(), Some("auth_code_1"));
+        assert_eq!(parsed_url.state.as_deref(), Some(auth.state.as_str()));
+        let parsed_hash = parse_authorization_input("code_abc#state_xyz");
+        assert_eq!(parsed_hash.code.as_deref(), Some("code_abc"));
+        assert_eq!(parsed_hash.state.as_deref(), Some("state_xyz"));
+
+        let access_jwt = make_jwt(json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_codex_42" },
+            "https://api.openai.com/profile": { "email": "dev@pikra.ai" },
+            "exp": 2_000_000_000u64,
+        }));
+        let refreshed_jwt = make_jwt(json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct_codex_42" },
+            "email": "dev@pikra.ai",
+            "exp": 2_000_003_600u64,
+        }));
+
+        let transport = Arc::new(FauxTransport::new());
+        transport.enqueue(json_http_ok(json!({
+            "access_token": access_jwt,
+            "refresh_token": "rt_initial",
+            "expires_in": 3600
+        })));
+        transport.enqueue(json_http_ok(json!({
+            "access_token": refreshed_jwt,
+            "expires_in": 3600
+        })));
+        transport.enqueue(json_http_ok(json!({
+            "models": [{
+                "slug": "gpt-5.4-codex",
+                "display_name": "GPT-5.4 Codex",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                "default_reasoning_level": "medium",
+                "input_modalities": ["text", "image"],
+                "service_tiers": ["default", "priority"]
+            }]
+        })));
+        transport.enqueue_sse([
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_cdx\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Codex ready\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_cdx\",\"content\":[{\"type\":\"output_text\",\"text\":\"Codex ready\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cdx\",\"status\":\"completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":10,\"total_tokens\":60}}}\n\n",
+        ]);
+
+        let creds = exchange_codex_code(
+            transport.as_ref(),
+            &auth,
+            &format!(
+                "http://localhost:1455/auth/callback?code=auth_code_1&state={}",
+                auth.state
+            ),
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(creds.account_id.as_deref(), Some("acct_codex_42"));
+        assert_eq!(creds.extract_email().as_deref(), Some("dev@pikra.ai"));
+        assert!(creds.is_expiring_within(creds.expires_at_ms.unwrap() - 1000, 5000));
+        assert!(!creds.is_expiring_within(1000, 5000));
+
+        // Refresh preserves refresh_token when omitted by server.
+        let refreshed = refresh_codex_credentials(transport.as_ref(), &creds, CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("rt_initial"));
+        assert_eq!(refreshed.account_id.as_deref(), Some("acct_codex_42"));
+        assert_eq!(
+            CodexCredentials::extract_account_id(&refreshed.access_token).as_deref(),
+            Some("acct_codex_42")
+        );
+
+        let catalog = fetch_codex_models(
+            transport.as_ref(),
+            None,
+            &refreshed,
+            "0.1.0",
+            CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "gpt-5.4-codex");
+        assert_eq!(catalog[0].reasoning_levels, vec!["low", "high"]);
+        assert!(catalog[0].supports_images);
+        assert!(catalog[0].supports_fast);
+
+        // Stream via Models with ApiKind::OpenaiCodexResponses!
+        let mut models = Models::new(transport.clone());
+        models.register_provider(
+            "openai-codex",
+            ProviderConfig::with_api_key(refreshed.access_token.clone()),
+        );
+        let mut codex_model = Model::new(
+            "gpt-5.4-codex",
+            "openai-codex",
+            ApiKind::OpenaiCodexResponses,
+            "https://chatgpt.com/backend-api/",
+        );
+        codex_model.supports_reasoning = true;
+        let ctx = TranscriptContext::new(
+            "",
+            vec![],
+            vec![Message::User(UserMessage::text("Hello Codex", 1))],
+        );
+        let reply = models
+            .complete(
+                &codex_model,
+                &ctx,
+                SimpleStreamOptions {
+                    session_id: Some("sess_codex_1".into()),
+                    reasoning: Some(ThinkingLevel::High),
+                    max_tokens: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(reply.stop_reason, StopReason::Stop);
+        assert_eq!(reply.text_output(), "Codex ready");
+
+        let reqs = transport.requests();
+        let codex_req = reqs.last().unwrap();
+        assert_eq!(codex_req.url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(codex_req.header("openai-beta"), Some("responses=experimental"));
+        assert_eq!(codex_req.header("originator"), Some("pikra"));
+        assert_eq!(codex_req.header("session_id"), Some("sess_codex_1"));
+        assert_eq!(codex_req.header("chatgpt-account-id"), Some("acct_codex_42"));
+        assert_eq!(codex_req.body_json["store"], false);
+        assert_eq!(codex_req.body_json["stream"], true);
+        assert_eq!(
+            codex_req.body_json["instructions"],
+            "You are a helpful assistant."
+        );
+        assert!(codex_req.body_json.get("max_output_tokens").is_none());
+        assert_eq!(codex_req.body_json["reasoning"]["effort"], "high");
+        assert_eq!(
+            codex_req.body_json["include"],
+            json!(["reasoning.encrypted_content"])
+        );
     });
 }

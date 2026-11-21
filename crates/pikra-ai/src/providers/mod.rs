@@ -1,7 +1,8 @@
-//! Streaming wire adapters for OpenAI Responses, OpenAI Completions, Anthropic Messages, and Google Generative AI.
+//! Streaming wire adapters for OpenAI Responses, OpenAI Codex Responses, OpenAI Completions, Anthropic Messages, and Google Generative AI.
 
 pub mod anthropic_messages;
 pub mod google_generative_ai;
+pub mod openai_codex_responses;
 pub mod openai_completions;
 pub mod openai_responses;
 
@@ -213,6 +214,7 @@ pub(crate) fn emit_protocol_error(
 pub(crate) fn thinking_level_effort_str(level: ThinkingLevel) -> Option<&'static str> {
     match level {
         ThinkingLevel::Off => None,
+        ThinkingLevel::None => Some("none"),
         ThinkingLevel::Minimal => Some("minimal"),
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),

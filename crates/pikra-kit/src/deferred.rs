@@ -442,6 +442,7 @@ impl AgentTool for CallToolGateway {
                 id: tool_call_id,
                 name: name.to_string(),
                 arguments: args_obj,
+                item_id: None,
                 thought_signature: None,
                 namespace: None,
                 arguments_error: None,

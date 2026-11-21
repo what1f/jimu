@@ -12,8 +12,8 @@ use crate::usage::{
 };
 use crate::{
     AssistantBlock, AssistantEventStream, AssistantMessageEvent, ContentPart, HttpRequest,
-    HttpTransport, Message, Model, SimpleStreamOptions, StopReason, TextContent, ThinkingContent,
-    ThinkingLevel, ToolCall, ToolDefinition, TranscriptContext, Usage,
+    HttpTransport, MaxTokensField, Message, Model, SimpleStreamOptions, StopReason, TextContent,
+    ThinkingContent, ToolCall, ToolDefinition, TranscriptContext, Usage,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -192,7 +192,18 @@ pub fn build_request_body(
     }
 
     if let Some(max_tokens) = options.max_tokens {
-        body.insert("max_completion_tokens".into(), json!(max_tokens));
+        let field = match model.compat.as_ref().and_then(|c| c.max_tokens_field) {
+            Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
+            Some(MaxTokensField::MaxTokens) => "max_tokens",
+            None => {
+                if model.provider == "openai" || model.base_url.contains("api.openai.com") {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                }
+            }
+        };
+        body.insert(field.into(), json!(max_tokens));
     }
 
     if let Some(temperature) = options.temperature {
@@ -201,7 +212,6 @@ pub fn build_request_body(
 
     if model.supports_reasoning
         && let Some(level) = options.reasoning
-        && level != ThinkingLevel::Off
         && let Some(effort) = thinking_level_effort_str(level)
     {
         body.insert("reasoning_effort".into(), Value::String(effort.into()));
@@ -489,6 +499,7 @@ pub fn stream(
                                 id: id.clone(),
                                 name: name.clone(),
                                 arguments: Map::new(),
+                                item_id: None,
                                 thought_signature: None,
                                 namespace: None,
                                 arguments_error: None,

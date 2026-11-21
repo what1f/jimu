@@ -120,6 +120,7 @@ impl CodemodeTool for AgentToolCodemodeBridge {
                     id: call_id,
                     name: self.definition.name.clone(),
                     arguments: args_obj,
+                    item_id: None,
                     thought_signature: None,
                     namespace: None,
                     arguments_error: None,

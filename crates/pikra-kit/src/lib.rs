@@ -17,5 +17,7 @@ pub use mcp::{
     McpServerInfo, McpToolCallResult, McpToolInfo, McpToolRegistrationMode, McpTransport,
     StreamableHttpMcpTransport, MCP_PROTOCOL_VERSION,
 };
+#[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
+pub use mcp::{StdioMcpConfig, StdioMcpTransport};
 pub use session::{KitEvent, KitEventStream, KitSession, KitSessionConfig, KitToolSpec};
 pub use skills::{Skill, SkillCatalog, SkillDiagnostic};

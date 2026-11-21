@@ -138,6 +138,7 @@ fn build_model(
         supports_reasoning: supports_reasoning.unwrap_or(true),
         cost: ModelCost::default(),
         headers: Vec::new(),
+        compat: None,
     }
 }
 
@@ -1067,6 +1068,7 @@ impl RpcRuntime {
                 supports_reasoning: supports_reasoning.unwrap_or(current.supports_reasoning),
                 cost: current.cost,
                 headers: current.headers,
+                compat: current.compat,
             }
         } else {
             build_model(

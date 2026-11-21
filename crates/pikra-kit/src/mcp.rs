@@ -434,6 +434,359 @@ impl McpTransport for StreamableHttpMcpTransport {
     }
 }
 
+#[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
+mod stdio {
+    use super::{JsonRpcId, JsonRpcResponse, McpError, McpTransport};
+    use futures_util::future::{self, Either};
+    use pikra_ai::{BoxFuture, CancelToken};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::{Child, ChildStdin, Command};
+    use tokio::sync::{Mutex as AsyncMutex, oneshot};
+    use tokio::task::JoinHandle;
+
+    /// Configuration for spawning a local stdio MCP server subprocess.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StdioMcpConfig {
+        pub command: String,
+        pub args: Vec<String>,
+        pub env: Vec<(String, String)>,
+        pub cwd: Option<PathBuf>,
+    }
+
+    impl StdioMcpConfig {
+        pub fn new(command: impl Into<String>) -> Self {
+            Self {
+                command: command.into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn kill_process_group(pid: u32) {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return;
+        }
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        // SAFETY: `pid` is the process group leader created via `Command::process_group(0)`
+        // and we only signal it while the child has not yet been reaped.
+        unsafe {
+            let _ = kill(-(pid as i32), SIGKILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kill_process_group(_pid: u32) {}
+
+    type PendingMap = HashMap<u64, oneshot::Sender<Result<JsonRpcResponse, McpError>>>;
+
+    fn fail_all_pending(pending: &Mutex<PendingMap>, message: &str) {
+        let waiters: Vec<_> = {
+            let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+            map.drain().map(|(_, tx)| tx).collect()
+        };
+        for tx in waiters {
+            let _ = tx.send(Err(McpError::Protocol(message.to_string())));
+        }
+    }
+
+    fn id_as_u64(id: &JsonRpcId) -> Option<u64> {
+        match id {
+            JsonRpcId::Number(n) => Some(*n),
+            JsonRpcId::String(s) => s.parse::<u64>().ok(),
+        }
+    }
+
+    fn dispatch_parsed_frame(value: Value, pending: &Mutex<PendingMap>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    dispatch_parsed_frame(item, pending);
+                }
+            }
+            Value::Object(_) => {
+                if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(value)
+                    && (resp.result.is_some() || resp.error.is_some())
+                    && let Some(id) = resp.id.as_ref().and_then(id_as_u64)
+                {
+                    let waiter = pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(Ok(resp));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Newline-delimited JSON-RPC 2.0 MCP transport over a child process's `stdin`/`stdout`.
+    pub struct StdioMcpTransport {
+        stdin: AsyncMutex<Option<ChildStdin>>,
+        child: Mutex<Option<Child>>,
+        child_pid: AtomicU32,
+        pending: Arc<Mutex<PendingMap>>,
+        reader_task: Mutex<Option<JoinHandle<()>>>,
+        closed: AtomicBool,
+    }
+
+    impl StdioMcpTransport {
+        /// Spawn the configured MCP subprocess and start its stdout JSON-RPC frame reader.
+        pub fn spawn(config: StdioMcpConfig) -> Result<Self, McpError> {
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                McpError::Protocol("StdioMcpTransport::spawn requires an active Tokio runtime".into())
+            })?;
+
+            let mut cmd = Command::new(&config.command);
+            cmd.args(&config.args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            for (k, v) in &config.env {
+                cmd.env(k, v);
+            }
+            if let Some(cwd) = &config.cwd {
+                cmd.current_dir(cwd);
+            }
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            let mut child = cmd.spawn().map_err(|err| {
+                McpError::Protocol(format!(
+                    "failed to spawn stdio MCP server `{}`: {err}",
+                    config.command
+                ))
+            })?;
+
+            let pid = child.id().unwrap_or(0);
+            let stdin = child.stdin.take().ok_or_else(|| {
+                McpError::Protocol("failed to capture stdio MCP child stdin".into())
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                McpError::Protocol("failed to capture stdio MCP child stdout".into())
+            })?;
+
+            let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+            let reader_pending = Arc::clone(&pending);
+            let reader_task = handle.spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => {
+                            fail_all_pending(
+                                &reader_pending,
+                                "stdio MCP server closed stdout before responding",
+                            );
+                            break;
+                        }
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                                dispatch_parsed_frame(val, &reader_pending);
+                            }
+                        }
+                        Err(err) => {
+                            fail_all_pending(
+                                &reader_pending,
+                                &format!("stdio MCP stdout read error: {err}"),
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+
+            Ok(Self {
+                stdin: AsyncMutex::new(Some(stdin)),
+                child: Mutex::new(Some(child)),
+                child_pid: AtomicU32::new(pid),
+                pending,
+                reader_task: Mutex::new(Some(reader_task)),
+                closed: AtomicBool::new(false),
+            })
+        }
+
+        /// Close stdin, terminate the child process group cleanly, and fail any pending waiters.
+        pub async fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+            {
+                let mut stdin_guard = self.stdin.lock().await;
+                let _ = stdin_guard.take();
+            }
+            if let Some(handle) = self
+                .reader_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                handle.abort();
+            }
+            fail_all_pending(&self.pending, "stdio MCP transport closed");
+
+            let pid = self.child_pid.swap(0, Ordering::SeqCst);
+            let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut child) = child {
+                let still_running = matches!(child.try_wait(), Ok(None));
+                if still_running {
+                    kill_process_group(pid);
+                    let _ = child.kill().await;
+                }
+            }
+        }
+
+        async fn write_frame(&self, frame: &[u8]) -> Result<(), McpError> {
+            let mut guard = self.stdin.lock().await;
+            let stdin = guard.as_mut().ok_or_else(|| {
+                McpError::Protocol("stdio MCP transport is closed".into())
+            })?;
+            stdin
+                .write_all(frame)
+                .await
+                .map_err(|err| McpError::Protocol(format!("stdio MCP write error: {err}")))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|err| McpError::Protocol(format!("stdio MCP flush error: {err}")))?;
+            Ok(())
+        }
+    }
+
+    impl Drop for StdioMcpTransport {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+            if let Some(handle) = self
+                .reader_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                handle.abort();
+            }
+            let pid = self.child_pid.swap(0, Ordering::SeqCst);
+            if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && matches!(child.try_wait(), Ok(None))
+            {
+                kill_process_group(pid);
+                let _ = child.start_kill();
+            }
+        }
+    }
+
+    impl McpTransport for StdioMcpTransport {
+        fn request<'a>(
+            &'a self,
+            method: &'a str,
+            params: Option<Value>,
+            id: u64,
+            cancel: CancelToken,
+        ) -> BoxFuture<'a, Result<JsonRpcResponse, McpError>> {
+            Box::pin(async move {
+                if cancel.is_cancelled() {
+                    return Err(McpError::Cancelled);
+                }
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(McpError::Protocol("stdio MCP transport is closed".into()));
+                }
+
+                let mut body_obj = serde_json::Map::new();
+                body_obj.insert("jsonrpc".into(), json!("2.0"));
+                body_obj.insert("id".into(), json!(id));
+                body_obj.insert("method".into(), json!(method));
+                if let Some(p) = params {
+                    body_obj.insert("params".into(), p);
+                }
+                let mut frame = serde_json::to_vec(&Value::Object(body_obj))?;
+                frame.push(b'\n');
+
+                let (tx, rx) = oneshot::channel();
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, tx);
+
+                if let Err(err) = self.write_frame(&frame).await {
+                    self.pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                    return Err(err);
+                }
+
+                let cancel_fut = cancel.cancelled();
+                futures_util::pin_mut!(rx, cancel_fut);
+                match future::select(rx, cancel_fut).await {
+                    Either::Left((Ok(res), _)) => res,
+                    Either::Left((Err(_), _)) => Err(McpError::Protocol(
+                        "stdio MCP response channel closed".into(),
+                    )),
+                    Either::Right(((), _)) => {
+                        self.pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id);
+                        Err(McpError::Cancelled)
+                    }
+                }
+            })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            method: &'a str,
+            params: Option<Value>,
+            cancel: CancelToken,
+        ) -> BoxFuture<'a, Result<(), McpError>> {
+            Box::pin(async move {
+                if cancel.is_cancelled() {
+                    return Err(McpError::Cancelled);
+                }
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(McpError::Protocol("stdio MCP transport is closed".into()));
+                }
+
+                let mut body_obj = serde_json::Map::new();
+                body_obj.insert("jsonrpc".into(), json!("2.0"));
+                body_obj.insert("method".into(), json!(method));
+                if let Some(p) = params {
+                    body_obj.insert("params".into(), p);
+                }
+                let mut frame = serde_json::to_vec(&Value::Object(body_obj))?;
+                frame.push(b'\n');
+                self.write_frame(&frame).await
+            })
+        }
+
+        fn close(&self) -> BoxFuture<'_, Result<(), McpError>> {
+            Box::pin(async move {
+                StdioMcpTransport::close(self).await;
+                Ok(())
+            })
+        }
+    }
+}
+
+#[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
+pub use stdio::{StdioMcpConfig, StdioMcpTransport};
+
 /// JSON-RPC 2.0 MCP client backed by any [`McpTransport`].
 pub struct McpClient {
     transport: Arc<dyn McpTransport>,

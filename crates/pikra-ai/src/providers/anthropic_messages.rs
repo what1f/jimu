@@ -277,7 +277,7 @@ fn convert_messages(
 
 fn thinking_budget_for_level(level: ThinkingLevel, max_tokens: u32) -> Option<u32> {
     let raw = match level {
-        ThinkingLevel::Off => return None,
+        ThinkingLevel::Off | ThinkingLevel::None => return None,
         ThinkingLevel::Minimal => 1_024,
         ThinkingLevel::Low => 2_048,
         ThinkingLevel::Medium => 8_192,
@@ -331,28 +331,32 @@ pub fn build_request_body(
         && let Some(level) = options.reasoning
         && level != ThinkingLevel::Off
     {
-        let lower_id = model.id.to_ascii_lowercase();
-        let uses_adaptive = lower_id.contains("4-7") || lower_id.contains("4.7");
-        if uses_adaptive {
-            thinking_enabled = true;
-            let effort = match level {
-                ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
-                ThinkingLevel::Medium => "medium",
-                ThinkingLevel::High => "high",
-                ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
-                ThinkingLevel::Off => "low",
-            };
-            body.insert("thinking".into(), json!({ "type": "adaptive" }));
-            body.insert("output_config".into(), json!({ "effort": effort }));
-        } else if let Some(budget) = thinking_budget_for_level(level, max_tokens) {
-            thinking_enabled = true;
-            body.insert(
-                "thinking".into(),
-                json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                }),
-            );
+        if level == ThinkingLevel::None {
+            body.insert("thinking".into(), json!({ "type": "disabled" }));
+        } else {
+            let lower_id = model.id.to_ascii_lowercase();
+            let uses_adaptive = lower_id.contains("4-7") || lower_id.contains("4.7");
+            if uses_adaptive {
+                thinking_enabled = true;
+                let effort = match level {
+                    ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                    ThinkingLevel::Medium => "medium",
+                    ThinkingLevel::High => "high",
+                    ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
+                    ThinkingLevel::Off | ThinkingLevel::None => "low",
+                };
+                body.insert("thinking".into(), json!({ "type": "adaptive" }));
+                body.insert("output_config".into(), json!({ "effort": effort }));
+            } else if let Some(budget) = thinking_budget_for_level(level, max_tokens) {
+                thinking_enabled = true;
+                body.insert(
+                    "thinking".into(),
+                    json!({
+                        "type": "enabled",
+                        "budget_tokens": budget,
+                    }),
+                );
+            }
         }
     }
 
@@ -589,6 +593,7 @@ pub fn stream(
                                 id: id.clone(),
                                 name: name.clone(),
                                 arguments: initial_input,
+                                item_id: None,
                                 thought_signature: None,
                                 namespace: None,
                                 arguments_error: None,
