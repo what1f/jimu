@@ -45,6 +45,7 @@ flowchart TD
     subgraph Entry["接入入口层"]
         Swift["swift/PikraKit (Swift 6 Actor SDK)"]
         FFI["pikra-ffi (C-ABI 静态库桥接，零 reqwest/rustls)"]
+        ACP["pikra-acp (Agent Client Protocol 适配器与 CLI)"]
         RPC["apps/pikra-rpc (pikra CLI & stdio JSONL RPC)"]
     end
 
@@ -68,6 +69,9 @@ flowchart TD
     FFI --> Kit
     FFI --> Tools
     FFI --> JS
+    ACP --> Kit
+    ACP --> Tools
+    ACP --> HTTP
     RPC --> Kit
     RPC --> Tools
     RPC --> HTTP

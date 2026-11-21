@@ -1,6 +1,6 @@
 # Pikra
 
-用 Rust 构建的超轻量、模块化、Prompt Cache 友好的无头（Headless）Agent 运行时引擎，内置单源可裁剪的产品级工具箱、可扩展 Skills 与 BM25 动态工具网关，原生提供 **Rust Crates**、零外部依赖的 **Swift 6 SDK (`PikraKit`)** 与跨语言 **JSONL RPC (`pikra --mode rpc`)**。
+用 Rust 构建的超轻量、模块化、Prompt Cache 友好的无头（Headless）Agent 运行时引擎，内置单源可裁剪的产品级工具箱、可扩展 Skills 与 BM25 动态工具网关，原生提供 **Rust Crates**、零外部依赖的 **Swift 6 SDK (`PikraKit`)**、标准 **ACP 编辑器协议 (`pikra-acp`)** 与跨语言 **JSONL RPC (`pikra --mode rpc`)**。
 
 ---
 
@@ -24,6 +24,7 @@
 - **[架构与设计边界 (`docs/architecture.md`)](./docs/architecture.md)**：包依赖拓扑、引擎与宿主分工边界、核心状态机设计。
 - **[Rust 接入指南 (`docs/guide-rust.md`)](./docs/guide-rust.md)**：按层选包、工具定制、Skills 配置、后台唤醒与拦截切面。
 - **[Swift SDK (`PikraKit`) 接入指南 (`docs/guide-swift.md`)](./docs/guide-swift.md)**：macOS / iOS 集成、订阅登录、工具裁剪与权限审批。
+- **[ACP 编辑器接入指南 (`docs/guide-acp.md`)](./docs/guide-acp.md)**：接入 Zed、JetBrains、Neovim 等标准 ACP 客户端与 OAuth 登录。
 - **[JSONL RPC 跨语言接入指南 (`docs/guide-rpc.md`)](./docs/guide-rpc.md)**：`pikra --mode rpc` 命令与事件流协议。
 
 ---
@@ -40,6 +41,6 @@ cargo test --workspace --all-features
 ./swift/scripts/build-xcframework.sh --all-platforms --zip
 swift test --package-path swift
 
-# 3. 构建独立 CLI / RPC 二进制
-cargo build --release -p pikra-rpc
+# 3. 构建独立 ACP 适配器与 CLI / RPC 二进制
+cargo build --release -p pikra-acp -p pikra-rpc
 ```

@@ -10,6 +10,7 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
 - `docs/architecture.md`：整体分层拓扑、设计理念、为什么这么切边界、核心状态机与体积控制机制。
 - `docs/guide-rust.md`：Rust 进程内接入指南（按层选包、内置工具与覆盖、Skills、动态工具与 MCP、拦截钩子、`pikra-durable`）。
 - `docs/guide-swift.md`：Swift 6 `PikraKit`（macOS / iOS）接入指南（模型与订阅登录、按需工具裁剪、审批与脱敏、后台唤醒）。
+- `docs/guide-acp.md`：`pikra-acp` 标准 Agent Client Protocol（Zed / JetBrains / Neovim 等）接入指南。
 - `docs/guide-rpc.md`：`pikra --mode rpc` 跨语言子进程 JSONL 通信协议指南。
 
 ---
@@ -46,7 +47,8 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
 | `pikra-js` | QuickJS 动态扩展运行时（注册自定义工具与回合/工具级钩子，支持热重载） | 流式高频 `delta` 事件严禁跨 JS 边界 |
 | `pikra-tools` | 模块化内置工具箱（`fs`、`patch`、`search`、`shell`、`monitor`、`sleep`、`web-fetch` + Schema 覆盖） | 子进程工具（`bash`、`exec_command`、`write_stdin`、`monitor`）必须用 `#[cfg(not(target_os = "ios"))]` 隔离，确保全仓库可通过 `aarch64-apple-ios` 编译 |
 | `pikra-kit` | 高阶无头会话组装（可扩展 `SkillCatalog` + 增量 Diff、BM25 `tool_search`、MCP、后台唤醒收件箱） | 默认关 `stdio` 时零 `tokio` |
-| `pikra-ffi` | C-ABI 桥接层（供 Swift `PikraKit` 等原生 SDK 链接） | **严禁**引入 `pikra-http` / `reqwest` / `rustls` |
+| `pikra-acp` | 标准 Agent Client Protocol（ACP v1 + 编辑器扩展）库与独立二进制 `pikra-acp` | `stdout` 仅输出 JSON-RPC 2.0 报文；**严禁**被 `pikra-ffi` 引用 |
+| `pikra-ffi` | C-ABI 桥接层（供 Swift `PikraKit` 等原生 SDK 链接） | **严禁**引入 `pikra-http` / `reqwest` / `rustls` / `pikra-acp` |
 
 ---
 
