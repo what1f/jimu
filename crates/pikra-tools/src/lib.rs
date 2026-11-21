@@ -1,4 +1,8 @@
 //! Optional local workspace tools implementing [`pikra_agent::AgentTool`].
+//!
+//! Hosts opt into background tools by registering the command and monitor tools
+//! with their managers. Share a `WakeGate` between the managers and `SleepTool`
+//! to wake an ongoing wait when a background event arrives.
 
 #[cfg(feature = "patch")]
 mod apply_patch;
@@ -6,15 +10,23 @@ mod apply_patch;
 mod bash;
 #[cfg(feature = "patch")]
 mod edit;
+#[cfg(feature = "sleep")]
+mod events;
+#[cfg(all(feature = "shell", unix, not(target_os = "ios")))]
+mod exec_session;
 #[cfg(feature = "search")]
 mod find;
 #[cfg(feature = "search")]
 mod grep;
+#[cfg(all(feature = "monitor", unix, not(target_os = "ios")))]
+mod monitor;
 mod override_spec;
 #[cfg(feature = "fs")]
 mod read;
 #[cfg(feature = "patch")]
 mod seek_sequence;
+#[cfg(feature = "sleep")]
+mod sleep;
 mod util;
 #[cfg(feature = "fs")]
 mod write;
@@ -25,15 +37,26 @@ pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 #[cfg(feature = "patch")]
 pub use edit::EditTool;
+#[cfg(feature = "sleep")]
+pub use events::{
+    BackgroundEventCallback, BackgroundToolEvent, MonitorStopReason, WakeGate, WakeOutcome,
+    format_background_events_xml,
+};
+#[cfg(all(feature = "shell", unix, not(target_os = "ios")))]
+pub use exec_session::{ExecCommandTool, ProcessSessionManager, WriteStdinTool};
 #[cfg(feature = "search")]
 pub use find::FindTool;
 #[cfg(feature = "search")]
 pub use grep::GrepTool;
+#[cfg(all(feature = "monitor", unix, not(target_os = "ios")))]
+pub use monitor::{MonitorConfig, MonitorManager, MonitorTool};
 pub use override_spec::{
     DescriptionOverride, OverriddenTool, ToolDefinitionOverride, wrap_tool_with_override,
 };
 #[cfg(feature = "fs")]
 pub use read::ReadTool;
+#[cfg(feature = "sleep")]
+pub use sleep::SleepTool;
 pub use util::{TruncatedOutput, truncate_output};
 #[cfg(feature = "fs")]
 pub use write::WriteTool;

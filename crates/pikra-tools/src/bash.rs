@@ -41,16 +41,16 @@ fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}
 
-struct ProcessGroupGuard {
+pub(crate) struct ProcessGroupGuard {
     pid: Option<u32>,
 }
 
 impl ProcessGroupGuard {
-    fn new(pid: Option<u32>) -> Self {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
         Self { pid }
     }
 
-    fn kill_now(&mut self) {
+    pub(crate) fn kill_now(&mut self) {
         if let Some(pid) = self.pid.take() {
             kill_process_group(pid);
         }
@@ -363,7 +363,7 @@ impl AgentTool for BashTool {
     }
 }
 
-fn build_shell_command(shell: Option<&str>, command: &str) -> Command {
+pub(crate) fn build_shell_command(shell: Option<&str>, command: &str) -> Command {
     #[cfg(unix)]
     {
         let bin = shell.unwrap_or("/bin/sh");

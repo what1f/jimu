@@ -9,11 +9,13 @@ rust-version.workspace = true
 test = false
 
 [features]
-default = ["fs", "patch", "search", "shell"]
+default = ["fs", "patch", "search", "shell", "monitor", "sleep"]
 fs = ["dep:tempfile"]
 patch = ["fs"]
 search = ["dep:ignore", "dep:grep-searcher", "dep:grep-regex", "dep:grep-matcher", "dep:globset"]
-shell = ["dep:tokio", "dep:libc"]
+sleep = ["dep:tokio"]
+shell = ["sleep", "dep:libc"]
+monitor = ["shell"]
 
 [dependencies]
 pikra-schema.workspace = true
@@ -27,8 +29,6 @@ grep-searcher = { version = "0.1", optional = true }
 grep-regex = { version = "0.1", optional = true }
 grep-matcher = { version = "0.1", optional = true }
 globset = { version = "0.4", optional = true }
-
-[target.'cfg(not(target_os = "ios"))'.dependencies]
 tokio = { workspace = true, optional = true }
 
 [target.'cfg(all(unix, not(target_os = "ios")))'.dependencies]
