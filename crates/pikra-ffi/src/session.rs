@@ -1,0 +1,1023 @@
+use crate::tools::{FfiAgentTool, PikraToolCallbacks, SendToolCallbacks};
+use crate::transport::{FfiHttpTransport, PikraHttpCallbacks, SendHttpCallbacks};
+use crate::types::{
+    FfiCompactionResultJson, FfiEvent, FfiPromptRequest, FfiSessionConfig, FfiSessionInfo,
+    FfiToolSpec, PikraStatus,
+};
+use futures_channel::oneshot;
+use futures_executor::ThreadPool;
+use futures_util::StreamExt;
+use pikra_agent::{Agent, AgentConfig, AgentEvent, AgentMessage, AgentMiddleware, AgentTool};
+use pikra_ai::{
+    AssistantMessageEvent, CacheRetention, CancelToken, Client, Message, Model,
+    SimpleStreamOptions, StopReason, ThinkingLevel, ToolDefinition, UserMessage,
+};
+use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
+use pikra_kit::{
+    CallToolGateway, CodemodeExecTool, DeferredToolRegistry, SkillCatalog, ToolSearchTool,
+    CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, TOOL_SEARCH_NAME,
+};
+use pikra_session::{
+    context_block_to_agent_message, CompactionConfig, CompactionResult, JsonlSessionStore,
+    MemorySessionStore, SessionConfig, SessionEntry, SessionEntryPayload, SessionEvent,
+    SessionManager, SessionStore,
+};
+use serde_json::Map;
+use std::ffi::{c_char, c_void, CString};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const SKILLS_CONTEXT_NAME: &str = "skills";
+const DEFERRED_TOOLS_CONTEXT_NAME: &str = "deferred_tools";
+
+pub type PikraEventFn = extern "C" fn(ctx: *mut c_void, event_json: *const c_char);
+pub type PikraStreamDoneFn =
+    extern "C" fn(ctx: *mut c_void, status: PikraStatus, error_message: *const c_char);
+pub type PikraVoidDoneFn = extern "C" fn(ctx: *mut c_void);
+pub type PikraResultDoneFn = extern "C" fn(
+    ctx: *mut c_void,
+    status: PikraStatus,
+    result_json: *const c_char,
+    error_message: *const c_char,
+);
+
+#[derive(Clone, Copy)]
+pub(crate) struct SendCallbackCtx(pub *mut c_void);
+
+impl SendCallbackCtx {
+    #[inline]
+    pub(crate) fn as_ptr(self) -> *mut c_void {
+        self.0
+    }
+}
+
+// SAFETY: Host guarantees callback context pointers are thread-safe until completion fires.
+unsafe impl Send for SendCallbackCtx {}
+unsafe impl Sync for SendCallbackCtx {}
+
+pub(crate) fn global_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| ThreadPool::new().expect("failed to initialize Pikra FFI ThreadPool"))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+struct ActivePromptRun {
+    cancel: CancelToken,
+    idle_waiters: Vec<oneshot::Sender<()>>,
+}
+
+struct SessionRunState {
+    closed: bool,
+    active: Option<ActivePromptRun>,
+}
+
+pub struct FfiSession {
+    provider: Arc<Client>,
+    agent: Agent,
+    session: Arc<Mutex<SessionManager>>,
+    deferred_registry: Arc<DeferredToolRegistry>,
+    skills: Mutex<SkillCatalog>,
+    skill_roots: Vec<PathBuf>,
+    had_deferred_catalog: Mutex<bool>,
+    tool_callbacks: SendToolCallbacks,
+    next_tool_call_id: Arc<AtomicU64>,
+    js_runtime: Option<JsExtensionRuntime>,
+    api_key: Option<String>,
+    cache_retention: CacheRetention,
+    headers: Vec<(String, Option<String>)>,
+    rollback_first_turn_on_failure: bool,
+    run_state: Mutex<SessionRunState>,
+}
+
+/// Opaque C handle wrapping `Arc<FfiSession>`.
+pub struct PikraSession {
+    pub(crate) inner: Arc<FfiSession>,
+}
+
+impl FfiSession {
+    pub(crate) fn create(
+        config: FfiSessionConfig,
+        http_callbacks: PikraHttpCallbacks,
+        tool_callbacks: PikraToolCallbacks,
+    ) -> Result<Arc<Self>, String> {
+        let http_cb = SendHttpCallbacks::new(http_callbacks)?;
+        let tool_cb = SendToolCallbacks::new(tool_callbacks);
+        let next_tool_call_id = Arc::new(AtomicU64::new(1));
+
+        let transport = Arc::new(FfiHttpTransport::new(http_cb));
+        let provider = Arc::new(Client::new(transport));
+
+        let deferred_registry = Arc::new(DeferredToolRegistry::new());
+        let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
+        let mut deferred: Vec<Arc<dyn AgentTool>> = Vec::new();
+
+        for spec in &config.tools {
+            let tool = FfiAgentTool::from_spec(spec, tool_cb, Arc::clone(&next_tool_call_id));
+            if spec.deferred {
+                deferred.push(tool);
+            } else {
+                resident.push(tool);
+            }
+        }
+
+        // Load optional QuickJS extensions (`pikra-js`).
+        let mut middlewares: Vec<Arc<dyn AgentMiddleware>> = Vec::new();
+        let mut js_runtime: Option<JsExtensionRuntime> = None;
+        if let Some(js_cfg) = config.js_extensions
+            && !js_cfg.sources.is_empty()
+        {
+            let rt_cfg: JsExtensionConfig = js_cfg.into();
+            let rt = JsExtensionRuntime::new(rt_cfg)
+                .map_err(|e| format!("failed to load JS extensions: {e}"))?;
+            for tool in rt.tools() {
+                if !resident
+                    .iter()
+                    .any(|t| t.definition().name == tool.definition().name)
+                {
+                    resident.push(tool);
+                }
+            }
+            middlewares.push(Arc::new(rt.clone()));
+            js_runtime = Some(rt);
+        }
+
+        deferred_registry.upsert(deferred);
+
+        // Keep deferred gateway resident when enabled so dynamic deferred tool updates
+        // NEVER mutate the top-level resident `tools` array (prompt cache stability).
+        if config.enable_deferred_gateway {
+            if !resident.iter().any(|t| t.definition().name == TOOL_SEARCH_NAME) {
+                resident.push(Arc::new(ToolSearchTool::new(Arc::clone(&deferred_registry))));
+            }
+            if !resident.iter().any(|t| t.definition().name == CALL_TOOL_NAME) {
+                resident.push(Arc::new(CallToolGateway::new(Arc::clone(
+                    &deferred_registry,
+                ))));
+            }
+        }
+
+        let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
+
+        if config.enable_codemode
+            && !resident
+                .iter()
+                .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
+        {
+            let cm_opts = config
+                .codemode_options
+                .map(Into::into)
+                .unwrap_or_default();
+            let exec_tool: Arc<dyn AgentTool> = Arc::new(CodemodeExecTool::new(
+                Arc::clone(&resident_tools_handle),
+                Arc::clone(&deferred_registry),
+                cm_opts,
+            ));
+            resident.push(exec_tool);
+            *resident_tools_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = resident.clone();
+        }
+
+        let resident_defs: Vec<ToolDefinition> = resident.iter().map(|t| t.definition()).collect();
+        let store: Arc<dyn SessionStore> = match &config.persistence_path {
+            Some(path) if !path.is_empty() => Arc::new(JsonlSessionStore::new(path)),
+            _ => Arc::new(MemorySessionStore::new()),
+        };
+
+        let compaction: CompactionConfig = config
+            .compaction
+            .map(Into::into)
+            .unwrap_or_default();
+
+        let mut session_cfg =
+            SessionConfig::new(&config.system_prompt, resident_defs).with_compaction(compaction);
+        if let Some(cwd) = &config.cwd {
+            session_cfg = session_cfg.with_cwd(cwd.clone());
+        }
+
+        let mut session_manager = SessionManager::open(store, session_cfg)
+            .map_err(|e| format!("failed to open session: {e}"))?;
+        let reconstructed = session_manager.reconstruct_context();
+        let session_id = session_manager.session_id().to_string();
+
+        let effective_thinking = reconstructed
+            .thinking
+            .map(|(lvl, _)| lvl)
+            .unwrap_or(config.thinking_level);
+        let effective_fast = reconstructed
+            .thinking
+            .map(|(_, f)| f)
+            .unwrap_or(config.fast);
+
+        let skill_roots: Vec<PathBuf> = config.skill_roots.into_iter().map(PathBuf::from).collect();
+        let skills = SkillCatalog::discover(&skill_roots);
+        if let Some(skills_xml) = skills.format_for_context() {
+            session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
+        }
+
+        let mut had_deferred_catalog = false;
+        if let Some(catalog) = deferred_registry.format_catalog() {
+            session_manager.set_context(DEFERRED_TOOLS_CONTEXT_NAME, catalog);
+            had_deferred_catalog = true;
+        }
+
+        let mut agent_cfg = AgentConfig::new(config.model)
+            .with_system_prompt(reconstructed.system_prompt)
+            .with_tools(resident)
+            .with_thinking_level(effective_thinking)
+            .with_fast(effective_fast)
+            .with_tool_execution_mode(config.tool_execution_mode)
+            .with_steering_mode(config.steering_mode)
+            .with_follow_up_mode(config.follow_up_mode)
+            .with_rollback_first_turn_on_failure(config.rollback_first_turn_on_failure);
+        agent_cfg.middlewares = middlewares;
+        agent_cfg.api_key = config.api_key.clone();
+        agent_cfg.temperature = config.temperature;
+        agent_cfg.max_tokens = config.max_tokens;
+        agent_cfg.cache_retention = config.cache_retention;
+        agent_cfg.session_id = Some(session_id);
+        agent_cfg.headers = config.headers.clone();
+        agent_cfg.sampling_params = config.sampling_params;
+        agent_cfg.initial_messages = reconstructed.messages;
+
+        let agent = Agent::new(provider.clone(), agent_cfg);
+
+        Ok(Arc::new(Self {
+            provider,
+            agent,
+            session: Arc::new(Mutex::new(session_manager)),
+            deferred_registry,
+            skills: Mutex::new(skills),
+            skill_roots,
+            had_deferred_catalog: Mutex::new(had_deferred_catalog),
+            tool_callbacks: tool_cb,
+            next_tool_call_id,
+            js_runtime,
+            api_key: config.api_key,
+            cache_retention: config.cache_retention,
+            headers: config.headers,
+            rollback_first_turn_on_failure: config.rollback_first_turn_on_failure,
+            run_state: Mutex::new(SessionRunState {
+                closed: false,
+                active: None,
+            }),
+        }))
+    }
+
+    fn is_busy(&self) -> bool {
+        let state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active.is_some() || self.agent.is_running()
+    }
+
+    fn check_open_and_idle(&self) -> Result<(), PikraStatus> {
+        let state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(PikraStatus::ErrClosed);
+        }
+        if state.active.is_some() || self.agent.is_running() {
+            return Err(PikraStatus::ErrBusy);
+        }
+        Ok(())
+    }
+
+    fn finish_active_run(&self) -> Vec<oneshot::Sender<()>> {
+        let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .active
+            .take()
+            .map(|r| r.idle_waiters)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn start_prompt(
+        self: &Arc<Self>,
+        req: FfiPromptRequest,
+        ctx: SendCallbackCtx,
+        on_event: PikraEventFn,
+        on_done: PikraStreamDoneFn,
+    ) -> Result<(), (PikraStatus, String)> {
+        if req.content.is_empty() {
+            return Err((
+                PikraStatus::ErrInvalidArgument,
+                "prompt content must not be empty".to_string(),
+            ));
+        }
+
+        let prompt_cancel = CancelToken::new();
+        {
+            let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.closed {
+                return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+            }
+            if state.active.is_some() || self.agent.is_running() {
+                return Err((PikraStatus::ErrBusy, "session is currently busy".to_string()));
+            }
+            state.active = Some(ActivePromptRun {
+                cancel: prompt_cancel.clone(),
+                idle_waiters: Vec::new(),
+            });
+        }
+
+        let user_msg = AgentMessage::Llm(Message::User(UserMessage {
+            id: req.id,
+            content: req.content,
+            timestamp: now_ms(),
+        }));
+
+        let (prompt_messages, flushed_count, flushed_events) =
+            match self.prepare_turn_prompt_messages(user_msg) {
+                Ok(v) => v,
+                Err(err) => {
+                    let waiters = self.finish_active_run();
+                    for w in waiters {
+                        let _ = w.send(());
+                    }
+                    return Err((PikraStatus::ErrIo, err));
+                }
+            };
+
+        let this = Arc::clone(self);
+        global_pool().spawn_ok(async move {
+            let emit = move |event: &FfiEvent| {
+                if let Ok(json) = serde_json::to_string(event)
+                    && let Ok(cstr) = CString::new(json)
+                {
+                    on_event(ctx.as_ptr(), cstr.as_ptr());
+                }
+            };
+
+            for ev in flushed_events {
+                if let SessionEvent::ContextAppended { name, text } = ev {
+                    emit(&FfiEvent::ContextAppended { name, text });
+                }
+            }
+
+            let stream_res = this.agent.prompt_messages_stream(prompt_messages);
+            let mut agent_stream = match stream_res {
+                Ok(s) => s,
+                Err(err) => {
+                    let waiters = this.finish_active_run();
+                    let err_c = CString::new(err.to_string()).ok();
+                    on_done(
+                        ctx.as_ptr(),
+                        PikraStatus::ErrInternal,
+                        err_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                    );
+                    for w in waiters {
+                        let _ = w.send(());
+                    }
+                    return;
+                }
+            };
+
+            let mut seen_ends = 0usize;
+            let mut deferred_persist: Vec<AgentMessage> = Vec::new();
+            let mut last_stop_reason = StopReason::Stop;
+            let mut last_error_message: Option<String> = None;
+            let mut user_message_kept = true;
+
+            while let Some(ev) = agent_stream.next().await {
+                match &ev {
+                    AgentEvent::MessageEnd { message } => {
+                        if seen_ends >= flushed_count {
+                            if this.rollback_first_turn_on_failure {
+                                deferred_persist.push(message.clone());
+                            } else {
+                                let mut session =
+                                    this.session.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = session.append_message(message.clone());
+                            }
+                        }
+                        seen_ends += 1;
+                    }
+                    AgentEvent::TurnStart => {
+                        emit(&FfiEvent::TurnStarted);
+                    }
+                    AgentEvent::MessageUpdate {
+                        assistant_message_event,
+                        ..
+                    } => match assistant_message_event {
+                        AssistantMessageEvent::TextDelta {
+                            content_index,
+                            delta,
+                        } => {
+                            emit(&FfiEvent::TextDelta {
+                                content_index: *content_index,
+                                delta: delta.clone(),
+                            });
+                        }
+                        AssistantMessageEvent::ThinkingDelta {
+                            content_index,
+                            delta,
+                        } => {
+                            emit(&FfiEvent::ThinkingDelta {
+                                content_index: *content_index,
+                                delta: delta.clone(),
+                            });
+                        }
+                        _ => {}
+                    },
+                    AgentEvent::ToolExecutionStart {
+                        tool_call_id,
+                        tool_name,
+                        args,
+                    } => {
+                        emit(&FfiEvent::ToolStarted {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                        });
+                    }
+                    AgentEvent::ToolExecutionUpdate {
+                        tool_call_id,
+                        tool_name,
+                        args,
+                        partial_result,
+                    } => {
+                        emit(&FfiEvent::ToolUpdated {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                            partial_result: partial_result.clone(),
+                        });
+                    }
+                    AgentEvent::ToolExecutionEnd {
+                        tool_call_id,
+                        tool_name,
+                        result,
+                        is_error,
+                    } => {
+                        emit(&FfiEvent::ToolFinished {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            result: result.clone(),
+                            is_error: *is_error,
+                        });
+                    }
+                    AgentEvent::RequestUsage {
+                        model,
+                        provider,
+                        usage,
+                    } => {
+                        emit(&FfiEvent::RequestUsage {
+                            model: model.clone(),
+                            provider: provider.clone(),
+                            usage: usage.clone(),
+                        });
+                    }
+                    AgentEvent::Steered { id, text } => {
+                        emit(&FfiEvent::Steered {
+                            id: id.clone(),
+                            text: text.clone(),
+                        });
+                    }
+                    AgentEvent::TurnEnd { message, .. } => {
+                        last_stop_reason = message.stop_reason;
+                        last_error_message = message.error_message.clone();
+                    }
+                    AgentEvent::AgentEnd {
+                        user_message_kept: kept,
+                        ..
+                    } => {
+                        user_message_kept = *kept;
+                    }
+                    AgentEvent::AgentStart | AgentEvent::MessageStart { .. } => {}
+                }
+            }
+
+            if this.rollback_first_turn_on_failure && user_message_kept {
+                let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
+                for msg in deferred_persist {
+                    let _ = session.append_message(msg);
+                }
+            }
+
+            // Ensure Agent's internal active_run is fully released before auto-compaction.
+            this.agent.wait_for_idle().await;
+
+            // Run auto-compaction if needed and not cancelled.
+            if !prompt_cancel.is_cancelled() && !this.is_closed() {
+                let _ = this
+                    .run_compaction_internal(true, Some(&emit), prompt_cancel.clone())
+                    .await;
+            }
+
+            emit(&FfiEvent::TurnEnded {
+                stop_reason: last_stop_reason,
+                user_message_kept,
+                error_message: last_error_message,
+            });
+
+            // Release busy state BEFORE notifying Swift stream completion so the consumer
+            // can immediately issue follow-up calls after `for try await` exits with zero `busy`.
+            let waiters = this.finish_active_run();
+            on_done(ctx.as_ptr(), PikraStatus::Ok, std::ptr::null());
+            for w in waiters {
+                let _ = w.send(());
+            }
+        });
+
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.run_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed
+    }
+
+    fn prepare_turn_prompt_messages(
+        &self,
+        user_msg: AgentMessage,
+    ) -> Result<(Vec<AgentMessage>, usize, Vec<SessionEvent>), String> {
+        let flushed = {
+            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            session
+                .flush_pending_context()
+                .map_err(|e| format!("failed to flush pending context: {e}"))?
+        };
+
+        let mut prompt_messages = Vec::with_capacity(flushed.len() + 1);
+        let mut events = Vec::with_capacity(flushed.len());
+        for entry in &flushed {
+            if let SessionEntryPayload::ContextBlock { name, text } = &entry.payload {
+                prompt_messages.push(context_block_to_agent_message(name, text, entry.timestamp));
+                events.push(SessionEvent::ContextAppended {
+                    name: name.clone(),
+                    text: text.clone(),
+                });
+            }
+        }
+        let flushed_count = prompt_messages.len();
+        prompt_messages.push(user_msg);
+        Ok((prompt_messages, flushed_count, events))
+    }
+
+    pub(crate) fn steer(&self, id: String, text: String) -> bool {
+        let state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed || (state.active.is_none() && !self.agent.is_running()) {
+            return false;
+        }
+        self.agent.steer(id, text);
+        true
+    }
+
+    pub(crate) fn follow_up(&self, id: String, text: String) -> Result<(), (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+        }
+        self.agent.follow_up(id, text);
+        Ok(())
+    }
+
+    pub(crate) fn interrupt_async(
+        self: &Arc<Self>,
+        ctx: SendCallbackCtx,
+        on_done: PikraVoidDoneFn,
+    ) {
+        let waiter = {
+            let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(active) = state.active.as_mut() {
+                active.cancel.cancel();
+                let (tx, rx) = oneshot::channel();
+                active.idle_waiters.push(tx);
+                Some(rx)
+            } else {
+                None
+            }
+        };
+        self.agent.abort_now();
+
+        let this = Arc::clone(self);
+        global_pool().spawn_ok(async move {
+            this.agent.abort().await;
+            if let Some(rx) = waiter {
+                let _ = rx.await;
+            }
+            on_done(ctx.as_ptr());
+        });
+    }
+
+    pub(crate) fn close_async(
+        self: &Arc<Self>,
+        ctx: SendCallbackCtx,
+        on_done: PikraVoidDoneFn,
+    ) {
+        let waiter = {
+            let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            if let Some(active) = state.active.as_mut() {
+                active.cancel.cancel();
+                let (tx, rx) = oneshot::channel();
+                active.idle_waiters.push(tx);
+                Some(rx)
+            } else {
+                None
+            }
+        };
+        self.agent.abort_now();
+
+        let this = Arc::clone(self);
+        global_pool().spawn_ok(async move {
+            this.agent.abort().await;
+            if let Some(rx) = waiter {
+                let _ = rx.await;
+            }
+            on_done(ctx.as_ptr());
+        });
+    }
+
+    pub(crate) fn cancel_for_destroy(&self) {
+        let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        if let Some(active) = state.active.as_ref() {
+            active.cancel.cancel();
+        }
+        drop(state);
+        self.agent.abort_now();
+    }
+
+    pub(crate) fn set_context(
+        &self,
+        name: String,
+        text: String,
+    ) -> Result<bool, (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+        }
+        let changed = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_context(name, text);
+        Ok(changed)
+    }
+
+    pub(crate) fn append_context(&self, text: String) -> Result<(), (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+        }
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_context(text);
+        Ok(())
+    }
+
+    pub(crate) fn set_model(&self, model: Model) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        self.agent
+            .set_model(model.clone())
+            .map_err(|e| (PikraStatus::ErrBusy, e.to_string()))?;
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_model_change(model.provider, model.id)
+            .map_err(|e| (PikraStatus::ErrIo, e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn set_thinking_level(
+        &self,
+        level: ThinkingLevel,
+    ) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        self.agent
+            .set_thinking_level(level)
+            .map_err(|e| (PikraStatus::ErrBusy, e.to_string()))?;
+        let fast = self.agent.fast();
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_thinking_change(level, fast)
+            .map_err(|e| (PikraStatus::ErrIo, e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn set_fast(&self, fast: bool) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        self.agent
+            .set_fast(fast)
+            .map_err(|e| (PikraStatus::ErrBusy, e.to_string()))?;
+        let level = self.agent.thinking_level();
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_thinking_change(level, fast)
+            .map_err(|e| (PikraStatus::ErrIo, e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn upsert_tools(&self, specs: Vec<FfiToolSpec>) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        let tools: Vec<Arc<dyn AgentTool>> = specs
+            .iter()
+            .map(|spec| {
+                FfiAgentTool::from_spec(spec, self.tool_callbacks, Arc::clone(&self.next_tool_call_id))
+            })
+            .collect();
+        self.deferred_registry.upsert(tools);
+        self.sync_deferred_tools_context();
+        Ok(())
+    }
+
+    pub(crate) fn remove_tools(&self, names: &[String]) -> Result<usize, (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let removed = self.deferred_registry.remove(&refs);
+        if removed > 0 {
+            self.sync_deferred_tools_context();
+        }
+        Ok(removed)
+    }
+
+    fn sync_deferred_tools_context(&self) {
+        let mut had_catalog = self
+            .had_deferred_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match self.deferred_registry.format_catalog() {
+            Some(catalog) => {
+                *had_catalog = true;
+                self.session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_context(DEFERRED_TOOLS_CONTEXT_NAME, catalog);
+            }
+            None if *had_catalog => {
+                self.session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_context(
+                        DEFERRED_TOOLS_CONTEXT_NAME,
+                        "No deferred tools are currently registered.",
+                    );
+            }
+            None => {}
+        }
+    }
+
+    pub(crate) fn compact_async(
+        self: &Arc<Self>,
+        ctx: SendCallbackCtx,
+        on_done: PikraResultDoneFn,
+    ) {
+        let cancel = CancelToken::new();
+        {
+            let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.closed {
+                let err_c = CString::new("session is closed").ok();
+                on_done(
+                    ctx.as_ptr(),
+                    PikraStatus::ErrClosed,
+                    std::ptr::null(),
+                    err_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                );
+                return;
+            }
+            if state.active.is_some() || self.agent.is_running() {
+                let err_c = CString::new("session is currently busy").ok();
+                on_done(
+                    ctx.as_ptr(),
+                    PikraStatus::ErrBusy,
+                    std::ptr::null(),
+                    err_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                );
+                return;
+            }
+            state.active = Some(ActivePromptRun {
+                cancel: cancel.clone(),
+                idle_waiters: Vec::new(),
+            });
+        }
+
+        let this = Arc::clone(self);
+        global_pool().spawn_ok(async move {
+            let outcome = this.run_compaction_internal(false, None, cancel).await;
+            let waiters = this.finish_active_run();
+            match outcome {
+                Ok(Some(res)) => {
+                    let payload = FfiCompactionResultJson {
+                        entry_id: res.entry_id,
+                        summary: res.summary,
+                        first_kept_entry_id: res.first_kept_entry_id,
+                        tokens_before: res.tokens_before,
+                        usage: res.usage,
+                    };
+                    match serde_json::to_string(&payload).ok().and_then(|s| CString::new(s).ok()) {
+                        Some(json_c) => {
+                            on_done(ctx.as_ptr(), PikraStatus::Ok, json_c.as_ptr(), std::ptr::null())
+                        }
+                        None => {
+                            let err_c = CString::new("failed to serialize compaction result").ok();
+                            on_done(
+                                ctx.as_ptr(),
+                                PikraStatus::ErrInternal,
+                                std::ptr::null(),
+                                err_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    on_done(ctx.as_ptr(), PikraStatus::Ok, std::ptr::null(), std::ptr::null());
+                }
+                Err(err) => {
+                    let err_c = CString::new(err).ok();
+                    on_done(
+                        ctx.as_ptr(),
+                        PikraStatus::ErrInternal,
+                        std::ptr::null(),
+                        err_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                    );
+                }
+            }
+            for w in waiters {
+                let _ = w.send(());
+            }
+        });
+    }
+
+    async fn run_compaction_internal(
+        &self,
+        auto_only: bool,
+        emit: Option<&(dyn Fn(&FfiEvent) + Send + Sync)>,
+        cancel: CancelToken,
+    ) -> Result<Option<CompactionResult>, String> {
+        let model = self.agent.model();
+        let options = SimpleStreamOptions {
+            api_key: self.api_key.clone(),
+            reasoning: Some(self.agent.thinking_level()),
+            fast: Some(self.agent.fast()),
+            temperature: None,
+            max_tokens: None,
+            cache_retention: self.cache_retention,
+            session_id: Some(self.session_id()),
+            headers: self.headers.clone(),
+            sampling_params: Map::new(),
+            cancel,
+        };
+
+        let prepared = {
+            let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            if auto_only && !session.needs_compaction(&model) {
+                return Ok(None);
+            }
+            let Some(prep) = session.prepare_compaction(&model, options) else {
+                return Ok(None);
+            };
+            session.notify_compaction_start(prep.input.tokens_before);
+            prep
+        };
+
+        let tokens_before = prepared.input.tokens_before;
+        if let Some(cb) = emit {
+            cb(&FfiEvent::CompactionStarted { tokens_before });
+        }
+
+        let output = SessionManager::execute_prepared_compaction(&*self.provider, prepared)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (result, reconstructed) = {
+            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let res = session
+                .commit_compaction(output, tokens_before)
+                .map_err(|e| e.to_string())?;
+            let recon = session.reconstruct_context();
+            (res, recon)
+        };
+
+        self.deferred_registry.clear_seen_schemas();
+        self.agent
+            .replace_messages(reconstructed.messages)
+            .map_err(|e| e.to_string())?;
+
+        if let Some(cb) = emit {
+            cb(&FfiEvent::CompactionEnded {
+                summary: result.summary.clone(),
+                tokens_before: result.tokens_before,
+                first_kept_entry_id: result.first_kept_entry_id.clone(),
+                usage: result.usage.clone(),
+            });
+        }
+
+        Ok(Some(result))
+    }
+
+    pub(crate) fn fork(&self, entry_id: &str) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        let reconstructed = {
+            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            session
+                .fork(entry_id)
+                .map_err(|e| (PikraStatus::ErrNotFound, e.to_string()))?;
+            session.reconstruct_context()
+        };
+        self.deferred_registry.clear_seen_schemas();
+        self.agent
+            .replace_messages(reconstructed.messages)
+            .map_err(|e| (PikraStatus::ErrBusy, e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn entries(&self) -> Result<Vec<SessionEntry>, (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+        }
+        Ok(self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries()
+            .to_vec())
+    }
+
+    pub(crate) fn session_id(&self) -> String {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_id()
+            .to_string()
+    }
+
+    pub(crate) fn info(&self) -> Result<FfiSessionInfo, (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+        }
+        let (session_id, leaf_id) = {
+            let s = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                s.session_id().to_string(),
+                s.leaf_id().map(ToString::to_string),
+            )
+        };
+        let deferred_tools = self
+            .deferred_registry
+            .list_tools()
+            .into_iter()
+            .map(|t| t.definition())
+            .collect();
+        Ok(FfiSessionInfo {
+            session_id,
+            leaf_id,
+            model: self.agent.model(),
+            thinking_level: self.agent.thinking_level(),
+            fast: self.agent.fast(),
+            is_running: self.is_busy(),
+            resident_tools: self.agent.tool_definitions(),
+            deferred_tools,
+        })
+    }
+
+    pub(crate) fn reload_extensions(&self) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        if let Some(rt) = &self.js_runtime {
+            rt.reload()
+                .map_err(|e| (PikraStatus::ErrInternal, e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reload_skills(&self) -> Result<bool, (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
+        }
+        let discovered = SkillCatalog::discover(&self.skill_roots);
+        let formatted = discovered.format_for_context();
+        *self.skills.lock().unwrap_or_else(|e| e.into_inner()) = discovered;
+        if let Some(xml) = formatted {
+            Ok(self
+                .session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_context(SKILLS_CONTEXT_NAME, xml))
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+fn status_message(status: PikraStatus) -> String {
+    match status {
+        PikraStatus::ErrClosed => "session is closed".to_string(),
+        PikraStatus::ErrBusy => "session is currently busy".to_string(),
+        _ => format!("error status {:?}", status),
+    }
+}
