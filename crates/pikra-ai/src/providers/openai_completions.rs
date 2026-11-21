@@ -53,9 +53,12 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
         }));
     }
 
-    for msg in &transformed {
-        match msg {
-            Message::System(_) => {}
+    let mut i = 0;
+    while i < transformed.len() {
+        match &transformed[i] {
+            Message::System(_) => {
+                i += 1;
+            }
             Message::User(user) => {
                 let has_images = user
                     .content
@@ -102,6 +105,7 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                         }));
                     }
                 }
+                i += 1;
             }
             Message::Assistant(assistant) => {
                 let mut text_parts = Vec::new();
@@ -134,6 +138,7 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                 }
 
                 if text_parts.is_empty() && thinking_parts.is_empty() && tool_calls.is_empty() {
+                    i += 1;
                     continue;
                 }
 
@@ -154,22 +159,58 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                     obj.insert("tool_calls".into(), Value::Array(tool_calls));
                 }
                 out.push(Value::Object(obj));
+                i += 1;
             }
-            Message::ToolResult(tr) => {
-                let text = tr
-                    .content
-                    .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text(t) => Some(t.text.as_str()),
-                        ContentPart::Image(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tr.tool_call_id,
-                    "content": text,
-                }));
+            Message::ToolResult(_) => {
+                let mut batch_images: Vec<Value> = Vec::new();
+                while i < transformed.len() {
+                    let Message::ToolResult(tr) = &transformed[i] else {
+                        break;
+                    };
+                    let mut text_parts = Vec::new();
+                    let mut has_images = false;
+                    for part in &tr.content {
+                        match part {
+                            ContentPart::Text(t) => text_parts.push(t.text.as_str()),
+                            ContentPart::Image(img) => {
+                                has_images = true;
+                                if model.supports_images {
+                                    batch_images.push(json!({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    let text = text_parts.join("\n");
+                    let content = if text.is_empty() && has_images {
+                        "[image attached]".to_string()
+                    } else {
+                        text
+                    };
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tr.tool_call_id,
+                        "content": content,
+                    }));
+                    i += 1;
+                }
+
+                if model.supports_images && !batch_images.is_empty() {
+                    let mut user_blocks = Vec::with_capacity(batch_images.len() + 1);
+                    user_blocks.push(json!({
+                        "type": "text",
+                        "text": "Attached image(s) from tool result:",
+                    }));
+                    user_blocks.extend(batch_images);
+                    out.push(json!({
+                        "role": "user",
+                        "content": user_blocks,
+                    }));
+                }
             }
         }
     }

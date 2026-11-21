@@ -160,10 +160,19 @@ pub enum MaxTokensField {
     MaxCompletionTokens,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingMode {
+    Adaptive,
+    ManualBudget,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelCompat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens_field: Option<MaxTokensField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_thinking: Option<AnthropicThinkingMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]

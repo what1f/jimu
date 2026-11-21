@@ -7,14 +7,17 @@ use crate::loop_runner::{
 use crate::{AgentEvent, AgentMessage, AgentMiddleware, AgentTool, QueueMode, ToolExecutionMode};
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
+use futures_util::lock::{Mutex as AsyncMutex, OwnedMutexGuard};
+use futures_util::task::AtomicWaker;
 use pikra_ai::{
     BoxFuture, CacheRetention, CancelToken, ContentPart, Message, Model, StreamProvider,
     ThinkingLevel, ToolDefinition, UserMessage,
 };
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -191,15 +194,55 @@ impl QueueSource for SharedQueues {
     }
 }
 
+struct SharedRunDriver {
+    future: Arc<AsyncMutex<Option<BoxFuture<'static, ()>>>>,
+    stream_waker: AtomicWaker,
+    completed: AtomicBool,
+    cancel: CancelToken,
+}
+
+impl SharedRunDriver {
+    fn new(cancel: CancelToken) -> Self {
+        Self {
+            future: Arc::new(AsyncMutex::new(None)),
+            stream_waker: AtomicWaker::new(),
+            completed: AtomicBool::new(false),
+            cancel,
+        }
+    }
+}
+
+struct WakeOnDrop<'a>(&'a AtomicWaker);
+
+impl Drop for WakeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.wake();
+    }
+}
+
+async fn drive_shared_driver(driver: &SharedRunDriver) {
+    let _wake = WakeOnDrop(&driver.stream_waker);
+    let mut guard = driver.future.lock().await;
+    if let Some(fut) = guard.as_mut() {
+        fut.as_mut().await;
+        *guard = None;
+        driver.completed.store(true, Ordering::Release);
+    }
+}
+
 struct ActiveRun {
+    run_id: u64,
     cancel: CancelToken,
     idle_waiters: Vec<oneshot::Sender<()>>,
+    shared_driver: Option<Arc<SharedRunDriver>>,
 }
 
 struct AgentInner {
     model: Model,
     system_prompt: String,
+    system_prompt_updated: bool,
     tools: Vec<Arc<dyn AgentTool>>,
+    tools_updated: bool,
     thinking_level: ThinkingLevel,
     fast: bool,
     tool_execution_mode: ToolExecutionMode,
@@ -243,6 +286,8 @@ impl AgentInner {
             headers: self.headers.clone(),
             sampling_params: self.sampling_params.clone(),
             rollback_first_turn_on_failure: self.rollback_first_turn_on_failure,
+            system_prompt_updated: self.system_prompt_updated,
+            tools_updated: self.tools_updated,
         }
     }
 
@@ -256,20 +301,94 @@ impl AgentInner {
     }
 }
 
+struct RunGuardState {
+    active_cleared: bool,
+    pending_waiters: Vec<oneshot::Sender<()>>,
+}
+
 /// Ensures `active_run` is always cleared and waiters woken even if a run future is dropped early.
 struct RunGuard {
+    run_id: u64,
     inner: Arc<Mutex<AgentInner>>,
     queues: Arc<SharedQueues>,
-    settled: bool,
+    state: Arc<Mutex<RunGuardState>>,
 }
 
 impl RunGuard {
-    fn settle(mut self) {
-        self.settled = true;
+    fn new(run_id: u64, inner: Arc<Mutex<AgentInner>>, queues: Arc<SharedQueues>) -> Self {
+        Self {
+            run_id,
+            inner,
+            queues,
+            state: Arc::new(Mutex::new(RunGuardState {
+                active_cleared: false,
+                pending_waiters: Vec::new(),
+            })),
+        }
+    }
+
+    fn clear_active_for_agent_end(
+        run_id: u64,
+        inner_lock: &Mutex<AgentInner>,
+        state_lock: &Mutex<RunGuardState>,
+        final_messages: &[AgentMessage],
+        rolled_back: bool,
+    ) {
         let waiters = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.finish_run_locked()
+            let mut inner = inner_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if rolled_back {
+                inner.messages = final_messages.to_vec();
+            }
+            if inner
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active.run_id == run_id)
+            {
+                inner.finish_run_locked()
+            } else {
+                Vec::new()
+            }
         };
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.active_cleared = true;
+        state.pending_waiters.extend(waiters);
+    }
+
+    fn settle(self) {
+        self.finish_and_notify(false);
+    }
+
+    fn finish_and_notify(&self, from_drop: bool) {
+        let already_cleared = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = state.active_cleared;
+            state.active_cleared = true;
+            prev
+        };
+
+        let mut waiters = Vec::new();
+        if !already_cleared {
+            if from_drop {
+                self.queues.discard_steering();
+            }
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active.run_id == self.run_id)
+            {
+                if from_drop && let Some(active) = &inner.active_run {
+                    active.cancel.cancel();
+                }
+                waiters.extend(inner.finish_run_locked());
+            }
+        }
+
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            waiters.append(&mut state.pending_waiters);
+        }
+
         for tx in waiters {
             let _ = tx.send(());
         }
@@ -278,19 +397,7 @@ impl RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if !self.settled {
-            self.queues.discard_steering();
-            let waiters = {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(active) = &inner.active_run {
-                    active.cancel.cancel();
-                }
-                inner.finish_run_locked()
-            };
-            for tx in waiters {
-                let _ = tx.send(());
-            }
-        }
+        self.finish_and_notify(true);
     }
 }
 
@@ -298,36 +405,81 @@ impl Drop for RunGuard {
 /// [`Agent::continue_stream`].
 pub struct AgentEventStream<'a> {
     rx: mpsc::UnboundedReceiver<AgentEvent>,
-    driver: Option<BoxFuture<'a, ()>>,
+    driver: Arc<SharedRunDriver>,
+    _marker: PhantomData<&'a Agent>,
 }
 
 impl Stream for AgentEventStream<'_> {
     type Item = AgentEvent;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(event)) = Pin::new(&mut self.rx).poll_next(cx) {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Poll::Ready(Some(event)) = Pin::new(&mut this.rx).poll_next(cx) {
             return Poll::Ready(Some(event));
         }
 
-        if let Some(driver) = self.driver.as_mut() {
-            match driver.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    self.driver = None;
-                    return match Pin::new(&mut self.rx).poll_next(cx) {
+        if !this.driver.completed.load(Ordering::Acquire) {
+            this.driver.stream_waker.register(cx.waker());
+            let poll_res = {
+                if let Some(mut guard) = this.driver.future.try_lock() {
+                    if let Some(fut) = guard.as_mut() {
+                        match fut.as_mut().poll(cx) {
+                            Poll::Ready(()) => {
+                                *guard = None;
+                                this.driver.completed.store(true, Ordering::Release);
+                                Some(Poll::Ready(()))
+                            }
+                            Poll::Pending => Some(Poll::Pending),
+                        }
+                    } else {
+                        Some(Poll::Ready(()))
+                    }
+                } else {
+                    None
+                }
+            };
+
+            match poll_res {
+                Some(Poll::Ready(())) => {
+                    return match Pin::new(&mut this.rx).poll_next(cx) {
                         Poll::Ready(item) => Poll::Ready(item),
                         Poll::Pending => Poll::Ready(None),
                     };
                 }
-                Poll::Pending => {
-                    if let Poll::Ready(Some(event)) = Pin::new(&mut self.rx).poll_next(cx) {
+                Some(Poll::Pending) => {
+                    if let Poll::Ready(Some(event)) = Pin::new(&mut this.rx).poll_next(cx) {
                         return Poll::Ready(Some(event));
                     }
                     return Poll::Pending;
                 }
+                None => {
+                    if let Poll::Ready(Some(event)) = Pin::new(&mut this.rx).poll_next(cx) {
+                        return Poll::Ready(Some(event));
+                    }
+                    if !this.driver.completed.load(Ordering::Acquire) {
+                        return Poll::Pending;
+                    }
+                }
             }
         }
 
-        Pin::new(&mut self.rx).poll_next(cx)
+        Pin::new(&mut this.rx).poll_next(cx)
+    }
+}
+
+impl Drop for AgentEventStream<'_> {
+    fn drop(&mut self) {
+        if self.driver.completed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(mut guard) = self.driver.future.try_lock() {
+            let dropped_fut = guard.take();
+            self.driver.completed.store(true, Ordering::Release);
+            drop(guard);
+            drop(dropped_fut);
+        } else {
+            self.driver.cancel.cancel();
+        }
     }
 }
 
@@ -337,6 +489,7 @@ pub struct Agent {
     inner: Arc<Mutex<AgentInner>>,
     queues: Arc<SharedQueues>,
     next_sub_id: AtomicU64,
+    next_run_id: AtomicU64,
 }
 
 impl Agent {
@@ -349,7 +502,9 @@ impl Agent {
         let inner = Arc::new(Mutex::new(AgentInner {
             model: config.model,
             system_prompt: config.system_prompt,
+            system_prompt_updated: false,
             tools: config.tools,
+            tools_updated: false,
             thinking_level: config.thinking_level,
             fast: config.fast,
             tool_execution_mode: config.tool_execution_mode,
@@ -377,6 +532,7 @@ impl Agent {
             inner,
             queues,
             next_sub_id: AtomicU64::new(1),
+            next_run_id: AtomicU64::new(1),
         }
     }
 
@@ -537,12 +693,14 @@ impl Agent {
         let prompt = prompt.into();
         self.with_idle_inner(|inner| {
             inner.system_prompt = prompt;
+            inner.system_prompt_updated = true;
         })
     }
 
     pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) -> Result<(), AgentError> {
         self.with_idle_inner(|inner| {
             inner.tools = tools;
+            inner.tools_updated = true;
         })
     }
 
@@ -701,17 +859,20 @@ impl Agent {
     /// Cancel the active run and wait until all in-flight tools finish, unread steering items are
     /// discarded, `AgentEnd` is emitted, and the active-run lock is released.
     pub async fn abort(&self) {
-        let rx = {
+        let (rx, shared_driver) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(active) = inner.active_run.as_mut() {
                 active.cancel.cancel();
                 let (tx, rx) = oneshot::channel();
                 active.idle_waiters.push(tx);
-                Some(rx)
+                (Some(rx), active.shared_driver.clone())
             } else {
-                None
+                (None, None)
             }
         };
+        if let Some(driver) = shared_driver {
+            drive_shared_driver(&driver).await;
+        }
         if let Some(rx) = rx {
             let _ = rx.await;
         }
@@ -719,16 +880,19 @@ impl Agent {
 
     /// Resolve once any active run has fully settled and released its lock.
     pub async fn wait_for_idle(&self) {
-        let rx = {
+        let (rx, shared_driver) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(active) = inner.active_run.as_mut() {
                 let (tx, rx) = oneshot::channel();
                 active.idle_waiters.push(tx);
-                Some(rx)
+                (Some(rx), active.shared_driver.clone())
             } else {
-                None
+                (None, None)
             }
         };
+        if let Some(driver) = shared_driver {
+            drive_shared_driver(&driver).await;
+        }
         if let Some(rx) = rx {
             let _ = rx.await;
         }
@@ -761,8 +925,15 @@ impl Agent {
         if messages.is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
-        let prepared = self.begin_run(messages, false)?;
-        Ok(self.drive_prepared_run(prepared, None).await)
+        let (prepared, _) = self.begin_run(messages, false, false)?;
+        Ok(drive_prepared_run(
+            Arc::clone(&self.provider),
+            Arc::clone(&self.inner),
+            Arc::clone(&self.queues),
+            prepared,
+            None,
+        )
+        .await)
     }
 
     /// Run a text prompt as a [`Stream`] of [`AgentEvent`]s.
@@ -782,36 +953,59 @@ impl Agent {
         if messages.is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
-        let prepared = self.begin_run(messages, false)?;
-        Ok(self.spawn_stream_driver(prepared))
+        let (prepared, driver_slot) = self.begin_run(messages, false, true)?;
+        let (driver, init_guard) = driver_slot.expect("stream run initializes shared driver");
+        Ok(self.spawn_stream_driver(prepared, driver, init_guard))
     }
 
     /// Continue from the current transcript without adding a new prompt.
     pub async fn continue_run(&self) -> Result<Vec<AgentMessage>, AgentError> {
-        let prepared = self.begin_continue_run()?;
-        Ok(self.drive_prepared_run(prepared, None).await)
+        let (prepared, _) = self.begin_continue_run(false)?;
+        Ok(drive_prepared_run(
+            Arc::clone(&self.provider),
+            Arc::clone(&self.inner),
+            Arc::clone(&self.queues),
+            prepared,
+            None,
+        )
+        .await)
     }
 
     /// Continue from the current transcript as a [`Stream`] of [`AgentEvent`]s.
     pub fn continue_stream(&self) -> Result<AgentEventStream<'_>, AgentError> {
-        let prepared = self.begin_continue_run()?;
-        Ok(self.spawn_stream_driver(prepared))
+        let (prepared, driver_slot) = self.begin_continue_run(true)?;
+        let (driver, init_guard) = driver_slot.expect("stream run initializes shared driver");
+        Ok(self.spawn_stream_driver(prepared, driver, init_guard))
     }
 
     fn begin_run(
         &self,
         prompts: Vec<AgentMessage>,
         skip_initial_steering: bool,
-    ) -> Result<PreparedRun, AgentError> {
+        with_shared_driver: bool,
+    ) -> Result<(PreparedRun, Option<SharedDriverInit>), AgentError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.active_run.is_some() {
             return Err(AgentError::Busy);
         }
 
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         let cancel = CancelToken::new();
+        let driver_init = if with_shared_driver {
+            let driver = Arc::new(SharedRunDriver::new(cancel.clone()));
+            let guard = Arc::clone(&driver.future)
+                .try_lock_owned()
+                .expect("fresh shared driver mutex");
+            Some((driver, guard))
+        } else {
+            None
+        };
+
         inner.active_run = Some(ActiveRun {
+            run_id,
             cancel: cancel.clone(),
             idle_waiters: Vec::new(),
+            shared_driver: driver_init.as_ref().map(|(d, _)| Arc::clone(d)),
         });
         inner.streaming_message = None;
         inner.pending_tool_calls.clear();
@@ -821,24 +1015,26 @@ impl Agent {
         let existing_messages = inner.messages.clone();
         drop(inner);
 
-        Ok(PreparedRun {
-            prompts,
-            initial_steers: Vec::new(),
-            existing_messages,
-            config,
-            cancel,
-            skip_initial_steering,
-            guard: RunGuard {
-                inner: Arc::clone(&self.inner),
-                queues: Arc::clone(&self.queues),
-                settled: false,
+        Ok((
+            PreparedRun {
+                prompts,
+                initial_steers: Vec::new(),
+                existing_messages,
+                config,
+                cancel,
+                skip_initial_steering,
+                guard: RunGuard::new(run_id, Arc::clone(&self.inner), Arc::clone(&self.queues)),
             },
-        })
+            driver_init,
+        ))
     }
 
-    fn begin_continue_run(&self) -> Result<PreparedRun, AgentError> {
+    fn begin_continue_run(
+        &self,
+        with_shared_driver: bool,
+    ) -> Result<(PreparedRun, Option<SharedDriverInit>), AgentError> {
         // Acquire active_run atomically under `inner` lock before touching queues.
-        let (last_is_assistant, config, existing_messages, cancel) = {
+        let (run_id, last_is_assistant, config, existing_messages, cancel, driver_init) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner.active_run.is_some() {
                 return Err(AgentError::Busy);
@@ -861,41 +1057,55 @@ impl Agent {
                 validate_continuable(&inner.messages)?;
             }
 
+            let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
             let cancel = CancelToken::new();
+            let driver_init = if with_shared_driver {
+                let driver = Arc::new(SharedRunDriver::new(cancel.clone()));
+                let guard = Arc::clone(&driver.future)
+                    .try_lock_owned()
+                    .expect("fresh shared driver mutex");
+                Some((driver, guard))
+            } else {
+                None
+            };
+
             inner.active_run = Some(ActiveRun {
+                run_id,
                 cancel: cancel.clone(),
                 idle_waiters: Vec::new(),
+                shared_driver: driver_init.as_ref().map(|(d, _)| Arc::clone(d)),
             });
             inner.streaming_message = None;
             inner.pending_tool_calls.clear();
             inner.error_message = None;
 
             (
+                run_id,
                 last_is_assistant,
                 inner.snapshot_loop_config(),
                 inner.messages.clone(),
                 cancel,
+                driver_init,
             )
         };
 
-        let guard = RunGuard {
-            inner: Arc::clone(&self.inner),
-            queues: Arc::clone(&self.queues),
-            settled: false,
-        };
+        let guard = RunGuard::new(run_id, Arc::clone(&self.inner), Arc::clone(&self.queues));
 
         if last_is_assistant {
             let queued_steers = self.queues.drain_steering();
             if !queued_steers.is_empty() {
-                return Ok(PreparedRun {
-                    prompts: Vec::new(),
-                    initial_steers: queued_steers,
-                    existing_messages,
-                    config,
-                    cancel,
-                    skip_initial_steering: true,
-                    guard,
-                });
+                return Ok((
+                    PreparedRun {
+                        prompts: Vec::new(),
+                        initial_steers: queued_steers,
+                        existing_messages,
+                        config,
+                        cancel,
+                        skip_initial_steering: true,
+                        guard,
+                    },
+                    driver_init,
+                ));
             }
             let queued_follow_ups = self.queues.drain_follow_up();
             if !queued_follow_ups.is_empty() {
@@ -903,15 +1113,23 @@ impl Agent {
                     .into_iter()
                     .map(QueuedInput::into_agent_message)
                     .collect();
-                return Ok(PreparedRun {
-                    prompts: msgs,
-                    initial_steers: Vec::new(),
-                    existing_messages,
-                    config,
-                    cancel,
-                    skip_initial_steering: false,
-                    guard,
-                });
+                return Ok((
+                    PreparedRun {
+                        prompts: msgs,
+                        initial_steers: Vec::new(),
+                        existing_messages,
+                        config,
+                        cancel,
+                        skip_initial_steering: false,
+                        guard,
+                    },
+                    driver_init,
+                ));
+            }
+            if let Some((driver, init_guard)) = driver_init {
+                driver.completed.store(true, Ordering::Release);
+                drop(init_guard);
+                driver.stream_waker.wake();
             }
             guard.settle();
             return Err(AgentError::CannotContinue(
@@ -919,115 +1137,142 @@ impl Agent {
             ));
         }
 
-        Ok(PreparedRun {
-            prompts: Vec::new(),
-            initial_steers: Vec::new(),
-            existing_messages,
-            config,
-            cancel,
-            skip_initial_steering: false,
-            guard,
-        })
+        Ok((
+            PreparedRun {
+                prompts: Vec::new(),
+                initial_steers: Vec::new(),
+                existing_messages,
+                config,
+                cancel,
+                skip_initial_steering: false,
+                guard,
+            },
+            driver_init,
+        ))
     }
 
-    fn spawn_stream_driver(&self, prepared: PreparedRun) -> AgentEventStream<'_> {
-        let (tx, rx) = mpsc::unbounded();
-        let driver = Box::pin(async move {
-            let _ = self.drive_prepared_run(prepared, Some(tx)).await;
-        });
-        AgentEventStream {
-            rx,
-            driver: Some(driver),
-        }
-    }
-
-    async fn drive_prepared_run(
+    fn spawn_stream_driver(
         &self,
         prepared: PreparedRun,
-        stream_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
-    ) -> Vec<AgentMessage> {
-        let inner_for_emit = Arc::clone(&self.inner);
-        let emit: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
-            let listeners = {
-                let mut inner = inner_for_emit.lock().unwrap_or_else(|e| e.into_inner());
-                match &event {
-                    AgentEvent::MessageStart { message } => {
-                        inner.streaming_message = Some(message.clone());
-                    }
-                    AgentEvent::MessageUpdate { message, .. } => {
-                        inner.streaming_message =
-                            Some(AgentMessage::Llm(Message::Assistant(message.clone())));
-                    }
-                    AgentEvent::MessageEnd { message } => {
-                        inner.streaming_message = None;
-                        inner.messages.push(message.clone());
-                    }
-                    AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
-                        if !inner.pending_tool_calls.contains(tool_call_id) {
-                            inner.pending_tool_calls.push(tool_call_id.clone());
-                        }
-                    }
-                    AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
-                        inner.pending_tool_calls.retain(|id| id != tool_call_id);
-                    }
-                    AgentEvent::TurnEnd { message, .. } => {
-                        if let Some(err) = &message.error_message {
-                            inner.error_message = Some(err.clone());
-                        }
-                    }
-                    AgentEvent::AgentEnd { .. } => {
-                        inner.streaming_message = None;
-                        inner.pending_tool_calls.clear();
-                    }
-                    AgentEvent::AgentStart
-                    | AgentEvent::TurnStart
-                    | AgentEvent::RequestUsage { .. }
-                    | AgentEvent::ToolExecutionUpdate { .. }
-                    | AgentEvent::Steered { .. } => {}
-                }
-                inner
-                    .listeners
-                    .iter()
-                    .map(|(_, l)| Arc::clone(l))
-                    .collect::<Vec<_>>()
-            };
+        driver: Arc<SharedRunDriver>,
+        mut init_guard: OwnedMutexGuard<Option<BoxFuture<'static, ()>>>,
+    ) -> AgentEventStream<'_> {
+        let (tx, rx) = mpsc::unbounded();
+        let provider = Arc::clone(&self.provider);
+        let inner = Arc::clone(&self.inner);
+        let queues = Arc::clone(&self.queues);
+        let fut: BoxFuture<'static, ()> = Box::pin(async move {
+            let _ = drive_prepared_run(provider, inner, queues, prepared, Some(tx)).await;
+        });
+        *init_guard = Some(fut);
+        drop(init_guard);
+        AgentEventStream {
+            rx,
+            driver,
+            _marker: PhantomData,
+        }
+    }
+}
 
-            for listener in listeners {
-                listener(&event);
+type SharedDriverInit = (
+    Arc<SharedRunDriver>,
+    OwnedMutexGuard<Option<BoxFuture<'static, ()>>>,
+);
+
+async fn drive_prepared_run(
+    provider: Arc<dyn StreamProvider>,
+    inner: Arc<Mutex<AgentInner>>,
+    queues: Arc<SharedQueues>,
+    prepared: PreparedRun,
+    stream_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+) -> Vec<AgentMessage> {
+    let inner_for_emit = Arc::clone(&inner);
+    let emit: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
+        let listeners = {
+            let mut inner = inner_for_emit.lock().unwrap_or_else(|e| e.into_inner());
+            match &event {
+                AgentEvent::MessageStart { message } => {
+                    inner.streaming_message = Some(message.clone());
+                }
+                AgentEvent::MessageUpdate { message, .. } => {
+                    inner.streaming_message =
+                        Some(AgentMessage::Llm(Message::Assistant(message.clone())));
+                }
+                AgentEvent::MessageEnd { message } => {
+                    inner.streaming_message = None;
+                    inner.messages.push(message.clone());
+                }
+                AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                    if !inner.pending_tool_calls.contains(tool_call_id) {
+                        inner.pending_tool_calls.push(tool_call_id.clone());
+                    }
+                }
+                AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                    inner.pending_tool_calls.retain(|id| id != tool_call_id);
+                }
+                AgentEvent::TurnEnd { message, .. } => {
+                    if let Some(err) = &message.error_message {
+                        inner.error_message = Some(err.clone());
+                    }
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    inner.streaming_message = None;
+                    inner.pending_tool_calls.clear();
+                }
+                AgentEvent::AgentStart
+                | AgentEvent::TurnStart
+                | AgentEvent::RequestUsage { .. }
+                | AgentEvent::ToolExecutionUpdate { .. }
+                | AgentEvent::Steered { .. } => {}
             }
-            if let Some(tx) = &stream_tx {
-                let _ = tx.unbounded_send(event);
-            }
+            inner
+                .listeners
+                .iter()
+                .map(|(_, l)| Arc::clone(l))
+                .collect::<Vec<_>>()
+        };
+
+        for listener in listeners {
+            listener(&event);
+        }
+        if let Some(tx) = &stream_tx {
+            let _ = tx.unbounded_send(event);
+        }
+    });
+
+    let run_id = prepared.guard.run_id;
+    let inner_for_sync = Arc::clone(&inner);
+    let guard_state_for_sync = Arc::clone(&prepared.guard.state);
+    let before_agent_end: crate::loop_runner::BeforeAgentEndHook =
+        Box::new(move |final_messages, rolled_back| {
+            RunGuard::clear_active_for_agent_end(
+                run_id,
+                &inner_for_sync,
+                &guard_state_for_sync,
+                final_messages,
+                rolled_back,
+            );
         });
 
-        let inner_for_sync = Arc::clone(&self.inner);
-        let before_agent_end: crate::loop_runner::BeforeAgentEndHook =
-            Box::new(move |final_messages, rolled_back| {
-                let mut inner = inner_for_sync.lock().unwrap_or_else(|e| e.into_inner());
-                if rolled_back {
-                    inner.messages = final_messages.to_vec();
-                }
-            });
+    let queues_dyn: Arc<dyn QueueSource> = queues as Arc<dyn QueueSource>;
+    let outcome = agent_loop_with_queues(
+        prepared.prompts,
+        prepared.initial_steers,
+        prepared.existing_messages,
+        prepared.config,
+        provider,
+        queues_dyn,
+        prepared.cancel,
+        emit,
+        prepared.skip_initial_steering,
+        Some(before_agent_end),
+    )
+    .await;
 
-        let queues_dyn: Arc<dyn QueueSource> = Arc::clone(&self.queues) as Arc<dyn QueueSource>;
-        let outcome = agent_loop_with_queues(
-            prepared.prompts,
-            prepared.initial_steers,
-            prepared.existing_messages,
-            prepared.config,
-            Arc::clone(&self.provider),
-            queues_dyn,
-            prepared.cancel,
-            emit,
-            prepared.skip_initial_steering,
-            Some(before_agent_end),
-        )
-        .await;
-
-        // Release active_run lock BEFORE resolving prompt() / abort() / wait_for_idle().
-        prepared.guard.settle();
-        outcome.new_messages
-    }
+    // Notify idle waiters right after `AgentEnd` listeners finish (active_run was already cleared
+    // in `before_agent_end` so listeners never see `Busy`).
+    prepared.guard.settle();
+    outcome.new_messages
 }
 
 struct PreparedRun {

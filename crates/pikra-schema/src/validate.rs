@@ -578,6 +578,11 @@ fn check_string(schema: &Map<String, Value>, s: &str) -> bool {
     {
         return false;
     }
+    if let Some(pat) = schema.get("pattern").and_then(Value::as_str)
+        && !crate::pattern::is_match(pat, s)
+    {
+        return false;
+    }
     true
 }
 
@@ -609,6 +614,14 @@ fn walk_string(schema: &Map<String, Value>, s: &str, path: &str, out: &mut Vec<V
         out.push(ValidationIssue {
             path: path.to_string(),
             message: format!("must be a valid {fmt}"),
+        });
+    }
+    if let Some(pat) = schema.get("pattern").and_then(Value::as_str)
+        && !crate::pattern::is_match(pat, s)
+    {
+        out.push(ValidationIssue {
+            path: path.to_string(),
+            message: format!("must match pattern {pat}"),
         });
     }
 }

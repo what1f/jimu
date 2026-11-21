@@ -3,6 +3,7 @@
 mod builders;
 mod coerce;
 mod formats;
+mod pattern;
 mod resolve;
 mod validate;
 
@@ -17,7 +18,6 @@ pub use builders::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use thiserror::Error;
 
 pub type Schema = Value;
 
@@ -37,7 +37,7 @@ impl fmt::Display for ValidationIssue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationErrors {
     pub issues: Vec<ValidationIssue>,
 }
@@ -54,9 +54,18 @@ impl fmt::Display for ValidationErrors {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("invalid JSON schema: {0}")]
+impl std::error::Error for ValidationErrors {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaCompileError(pub String);
+
+impl fmt::Display for SchemaCompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid JSON schema: {}", self.0)
+    }
+}
+
+impl std::error::Error for SchemaCompileError {}
 
 #[derive(Debug, Clone)]
 pub struct CompiledSchema {

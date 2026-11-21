@@ -14,11 +14,11 @@ use pikra_ai::providers::{
     openai_responses,
 };
 use pikra_ai::{
-    ApiKind, AssistantBlock, AssistantMessage, AssistantMessageEvent, CacheRetention, CancelToken,
-    ContentPart, ImageContent, MaxTokensField, Message, Model, ModelCompat, ModelCost, Models,
-    ProviderConfig, SimpleStreamOptions, StopReason, StreamProvider, SystemMessage, TextContent,
-    ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, ToolResultMessage, TranscriptContext,
-    UserMessage, transform_messages,
+    AnthropicThinkingMode, ApiKind, AssistantBlock, AssistantMessage, AssistantMessageEvent,
+    CacheRetention, CancelToken, ContentPart, ImageContent, MaxTokensField, Message, Model,
+    ModelCompat, ModelCost, Models, ProviderConfig, SimpleStreamOptions, StopReason,
+    StreamProvider, SystemMessage, TextContent, ThinkingContent, ThinkingLevel, ToolCall,
+    ToolDefinition, ToolResultMessage, TranscriptContext, UserMessage, transform_messages,
 };
 use pikra_schema::{int_schema, obj_schema, str_schema};
 use pikra_testkit::{FauxTransport, ScriptedHttpResponse, assert_prompt_prefix_identical};
@@ -742,6 +742,7 @@ fn thinking_level_none_vs_off_compat_and_item_id_handoff() {
     // Explicit ModelCompat override beats provider heuristic.
     oa_comp.compat = Some(ModelCompat {
         max_tokens_field: Some(MaxTokensField::MaxTokens),
+        ..ModelCompat::default()
     });
     let oa_override_body = openai_completions::build_request_body(&oa_comp, &ctx, &opts_unset);
     assert_eq!(oa_override_body["max_tokens"], 1024);
@@ -1029,4 +1030,242 @@ fn codex_oauth_pkce_refresh_models_and_codex_responses_stream() {
             json!(["reasoning.encrypted_content"])
         );
     });
+}
+
+#[test]
+fn anthropic_thinking_modes_budget_floor_root_schema_and_completions_tool_images() {
+    let ctx = TranscriptContext::new(
+        "Be helpful.",
+        vec![],
+        vec![Message::User(UserMessage::text("Check", 1))],
+    );
+    let opts_high = SimpleStreamOptions {
+        reasoning: Some(ThinkingLevel::High),
+        max_tokens: Some(8_192),
+        ..Default::default()
+    };
+
+    // 1. (#10) Claude 4.7+, 4.8+, 5.x+ use adaptive thinking; legacy 3.7 and 4.0-4.6 use manual budget.
+    for adaptive_id in [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
+        "claude-fable-5-2",
+        "claude-haiku-5-5",
+    ] {
+        let mut m = anthropic_model();
+        m.id = adaptive_id.into();
+        let body = anthropic_messages::build_request_body(&m, &ctx, &opts_high);
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "adaptive" }),
+            "model {adaptive_id} must use adaptive thinking"
+        );
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+    }
+
+    for legacy_id in [
+        "claude-3-7-sonnet-20250219",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-opus-4-1-20250805",
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+    ] {
+        let mut m = anthropic_model();
+        m.id = legacy_id.into();
+        let body = anthropic_messages::build_request_body(&m, &ctx, &opts_high);
+        assert_eq!(
+            body["thinking"]["type"], "enabled",
+            "legacy model {legacy_id} must use manual budget"
+        );
+        let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!((1024..8192).contains(&budget));
+        assert!(body.get("output_config").is_none());
+    }
+
+    // Explicit ModelCompat.anthropic_thinking overrides version heuristic in both directions.
+    let mut legacy_forced_adaptive = anthropic_model();
+    legacy_forced_adaptive.id = "claude-sonnet-4-6".into();
+    legacy_forced_adaptive.compat = Some(ModelCompat {
+        anthropic_thinking: Some(AnthropicThinkingMode::Adaptive),
+        ..ModelCompat::default()
+    });
+    let forced_adaptive_body =
+        anthropic_messages::build_request_body(&legacy_forced_adaptive, &ctx, &opts_high);
+    assert_eq!(
+        forced_adaptive_body["thinking"],
+        json!({ "type": "adaptive" })
+    );
+
+    let mut modern_forced_manual = anthropic_model();
+    modern_forced_manual.id = "claude-opus-4-8".into();
+    modern_forced_manual.compat = Some(ModelCompat {
+        anthropic_thinking: Some(AnthropicThinkingMode::ManualBudget),
+        ..ModelCompat::default()
+    });
+    let forced_manual_body =
+        anthropic_messages::build_request_body(&modern_forced_manual, &ctx, &opts_high);
+    assert_eq!(forced_manual_body["thinking"]["type"], "enabled");
+
+    // 2. (#26) Legacy manual budget omits `thinking` when max_tokens <= 1024, and clamps to 1024..=(max_tokens-1).
+    let legacy = anthropic_model(); // claude-sonnet-4-6
+    for tiny_max in [512u32, 1024u32] {
+        let opts_tiny = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            max_tokens: Some(tiny_max),
+            temperature: Some(0.5),
+            ..Default::default()
+        };
+        let body = anthropic_messages::build_request_body(&legacy, &ctx, &opts_tiny);
+        assert!(
+            body.get("thinking").is_none(),
+            "max_tokens={tiny_max} must omit manual thinking instead of emitting illegal budget_tokens"
+        );
+        assert_eq!(body["temperature"], 0.5);
+    }
+    let opts_1025 = SimpleStreamOptions {
+        reasoning: Some(ThinkingLevel::High),
+        max_tokens: Some(1025),
+        ..Default::default()
+    };
+    let body_1025 = anthropic_messages::build_request_body(&legacy, &ctx, &opts_1025);
+    assert_eq!(body_1025["thinking"]["budget_tokens"], 1024);
+
+    // 3. (#25) Anthropic convert_tools preserves root-level constraints and expands root `$ref`.
+    let ref_tool = ToolDefinition {
+        name: "search".into(),
+        description: "Search with root $ref".into(),
+        parameters: json!({
+            "$defs": {
+                "Query": {
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string", "minLength": 1 },
+                        "limit": { "type": "integer" }
+                    },
+                    "required": ["q"],
+                    "additionalProperties": false
+                }
+            },
+            "$ref": "#/$defs/Query",
+            "minProperties": 1
+        }),
+    };
+    let oneof_tool = ToolDefinition {
+        name: "dispatch".into(),
+        description: "Root oneOf preserved".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+            "oneOf": [{ "required": ["a"] }, { "required": ["b"] }]
+        }),
+    };
+    let tool_ctx = TranscriptContext::new(
+        "Use tools.",
+        vec![ref_tool, oneof_tool],
+        vec![Message::User(UserMessage::text("Go", 1))],
+    );
+    let ant_tool_body =
+        anthropic_messages::build_request_body(&legacy, &tool_ctx, &SimpleStreamOptions::default());
+    let tools = ant_tool_body["tools"].as_array().unwrap();
+    let search_schema = &tools[0]["input_schema"];
+    assert_eq!(search_schema["type"], "object");
+    assert_eq!(search_schema["properties"]["q"]["minLength"], 1);
+    assert_eq!(search_schema["required"], json!(["q"]));
+    assert_eq!(search_schema["additionalProperties"], false);
+    assert_eq!(search_schema["minProperties"], 1);
+    assert!(search_schema.get("$defs").is_some());
+    assert!(search_schema.get("$ref").is_none());
+
+    let dispatch_schema = &tools[1]["input_schema"];
+    assert_eq!(
+        dispatch_schema["oneOf"],
+        json!([{ "required": ["a"] }, { "required": ["b"] }])
+    );
+
+    // 4. (#24) OpenAI Chat Completions preserves ToolResult images after contiguous `role: "tool"` block.
+    let mut vision_comp = openai_completions_model();
+    vision_comp.supports_images = true;
+    let assistant_calls = AssistantMessage {
+        content: vec![
+            AssistantBlock::ToolCall(ToolCall {
+                id: "call_img".into(),
+                name: "screenshot".into(),
+                arguments: Map::new(),
+                item_id: None,
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            }),
+            AssistantBlock::ToolCall(ToolCall {
+                id: "call_txt".into(),
+                name: "read".into(),
+                arguments: Map::new(),
+                item_id: None,
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            }),
+        ],
+        api: ApiKind::OpenaiCompletions,
+        provider: vision_comp.provider.clone(),
+        model: vision_comp.id.clone(),
+        response_id: None,
+        thinking_level: None,
+        usage: Default::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        diagnostics: Vec::new(),
+        timestamp: 1,
+        duration_ms: None,
+    };
+    let img_tr = ToolResultMessage {
+        tool_call_id: "call_img".into(),
+        tool_name: "screenshot".into(),
+        content: vec![ContentPart::Image(ImageContent {
+            data: "iVBORw0KGgo=".into(),
+            mime_type: "image/png".into(),
+        })],
+        is_error: false,
+        timestamp: 2,
+    };
+    let txt_tr = ToolResultMessage {
+        tool_call_id: "call_txt".into(),
+        tool_name: "read".into(),
+        content: vec![ContentPart::Text(TextContent::plain("done"))],
+        is_error: false,
+        timestamp: 3,
+    };
+    let img_ctx = TranscriptContext::new(
+        "Sys",
+        vec![],
+        vec![
+            Message::User(UserMessage::text("Take screenshot", 0)),
+            Message::Assistant(assistant_calls),
+            Message::ToolResult(img_tr),
+            Message::ToolResult(txt_tr),
+        ],
+    );
+    let comp_body = openai_completions::build_request_body(
+        &vision_comp,
+        &img_ctx,
+        &SimpleStreamOptions::default(),
+    );
+    let msgs = comp_body["messages"].as_array().unwrap();
+    // [0] system, [1] user, [2] assistant, [3] tool(call_img), [4] tool(call_txt), [5] user(image_url)
+    assert_eq!(msgs.len(), 6);
+    assert_eq!(msgs[3]["role"], "tool");
+    assert_eq!(msgs[3]["tool_call_id"], "call_img");
+    assert_eq!(msgs[3]["content"], "[image attached]");
+    assert_eq!(msgs[4]["role"], "tool");
+    assert_eq!(msgs[4]["tool_call_id"], "call_txt");
+    assert_eq!(msgs[4]["content"], "done");
+    assert_eq!(msgs[5]["role"], "user");
+    let trailing_parts = msgs[5]["content"].as_array().unwrap();
+    assert!(trailing_parts.iter().any(|p| {
+        p["type"] == "image_url" && p["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+    }));
 }

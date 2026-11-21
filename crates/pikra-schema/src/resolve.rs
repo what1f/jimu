@@ -197,6 +197,17 @@ pub(crate) fn validate_schema_tree(
                 )));
             }
 
+            if let Some(v) = map.get("pattern") {
+                let Some(pat) = v.as_str() else {
+                    return Err(SchemaCompileError(format!(
+                        "{loc}: 'pattern' must be a string"
+                    )));
+                };
+                crate::pattern::compile_pattern(pat).map_err(|err| {
+                    SchemaCompileError(format!("{loc}: invalid 'pattern' '{pat}': {err}"))
+                })?;
+            }
+
             for kw in ["properties", "$defs", "definitions"] {
                 if let Some(v) = map.get(kw) {
                     let Some(submap) = v.as_object() else {

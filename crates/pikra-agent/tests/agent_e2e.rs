@@ -3,8 +3,9 @@ use futures_executor::{ThreadPool, block_on};
 use futures_util::stream::{self, StreamExt};
 use pikra_agent::{
     AfterToolCallCtx, AfterToolCallResult, Agent, AgentConfig, AgentContextSnapshot, AgentEvent,
-    AgentMessage, AgentMiddleware, AgentToolResult, BeforeToolCallCtx, BeforeToolCallResult,
-    ClosureTool, FinishTurnCtx, QueueMode, RequestOverride, ToolExecutionMode, TurnDecision,
+    AgentMessage, AgentMiddleware, AgentTool, AgentToolResult, BeforeToolCallCtx,
+    BeforeToolCallResult, ClosureTool, FinishTurnCtx, QueueMode, RequestOverride,
+    ToolExecutionMode, TurnDecision,
 };
 use pikra_ai::{
     ApiKind, AssistantBlock, AssistantEventStream, AssistantMessage, AssistantMessageEvent,
@@ -1036,5 +1037,324 @@ fn first_turn_failure_rollback_reports_user_message_kept_accurately() {
             .unwrap();
         assert_eq!(agent_end, (0, false));
         assert!(agent.messages().is_empty());
+    });
+}
+
+#[test]
+fn unpolled_and_paused_streams_settle_via_abort_and_wait_for_idle_without_busy() {
+    let pool = ThreadPool::new().unwrap();
+
+    block_on(async {
+        // 1. Holding an unpolled prompt_stream: abort().await settles it cleanly and unlocks next prompt.
+        let provider = ScriptedProvider::new(vec![
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("after abort"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("driven by wait"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+        ]);
+        let agent = Agent::new(provider, AgentConfig::new(test_model("stream-model")));
+
+        let held_stream = agent.prompt_stream("unpolled abort").unwrap();
+        assert!(agent.is_running());
+        agent.abort().await;
+        assert!(!agent.is_running());
+
+        // Even while `held_stream` is STILL alive, a new prompt succeeds without Busy!
+        let next = agent.prompt("fresh prompt").await.unwrap();
+        assert!(next.iter().any(|m| matches!(
+            m,
+            AgentMessage::Llm(Message::Assistant(a)) if a.text_output() == "after abort"
+        )));
+        drop(held_stream);
+
+        // 2. Holding an unpolled prompt_stream: wait_for_idle().await actively drives it to completion.
+        let mut held_idle_stream = agent.prompt_stream("unpolled wait").unwrap();
+        agent.wait_for_idle().await;
+        assert!(!agent.is_running());
+        let mut saw_end = false;
+        while let Some(ev) = held_idle_stream.next().await {
+            if matches!(ev, AgentEvent::AgentEnd { .. }) {
+                saw_end = true;
+            }
+        }
+        assert!(saw_end);
+
+        // 3. Paused stream mid-tool teardown: abort().await drives tool teardown even while stream is unpolled!
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (teardown_tx, teardown_rx) = oneshot::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let teardown_rx = Arc::new(Mutex::new(Some(teardown_rx)));
+        let teardown_done = Arc::new(AtomicBool::new(false));
+        let teardown_done_flag = Arc::clone(&teardown_done);
+
+        let blocking_tool = Arc::new(ClosureTool::new(
+            ToolDefinition {
+                name: "hold".into(),
+                description: "blocks until cancel + teardown".into(),
+                parameters: obj_schema(Vec::<(&str, Value, bool)>::new()),
+            },
+            move |_id, _args, cancel, _upd| {
+                let entered = Arc::clone(&entered_tx);
+                let td_rx = Arc::clone(&teardown_rx);
+                let flag = Arc::clone(&teardown_done_flag);
+                Box::pin(async move {
+                    if let Some(tx) = entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    cancel.cancelled().await;
+                    let rx = td_rx.lock().unwrap().take().unwrap();
+                    let _ = rx.await;
+                    flag.store(true, Ordering::SeqCst);
+                    Err("aborted".into())
+                })
+            },
+        ));
+
+        let paused_provider = ScriptedProvider::new(vec![
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::ToolCall(make_tool_call(
+                        "c_hold",
+                        "hold",
+                        json!({}),
+                        None,
+                    ))],
+                    StopReason::ToolUse,
+                    Usage::default(),
+                    None,
+                )
+            }),
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("recovered"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+        ]);
+        let paused_agent = Arc::new(Agent::new(
+            paused_provider,
+            AgentConfig::new(test_model("paused-model")).with_tools(vec![blocking_tool]),
+        ));
+
+        let mut paused_stream = paused_agent.prompt_stream("start tool").unwrap();
+        // Poll until ToolExecutionStart, then stop polling while holding `paused_stream`.
+        while let Some(ev) = paused_stream.next().await {
+            if matches!(ev, AgentEvent::ToolExecutionStart { .. }) {
+                break;
+            }
+        }
+        // Drive one more poll step concurrently with `abort().await` via pool so tool enters and aborts.
+        let agent_for_abort = Arc::clone(&paused_agent);
+        let (abort_done_tx, abort_done_rx) = oneshot::channel::<()>();
+        pool.spawn_ok(async move {
+            agent_for_abort.abort().await;
+            let _ = abort_done_tx.send(());
+        });
+        entered_rx.await.unwrap();
+        teardown_tx.send(()).unwrap();
+        abort_done_rx.await.unwrap();
+
+        assert!(teardown_done.load(Ordering::SeqCst));
+        assert!(!paused_agent.is_running());
+        let recovered = paused_agent.prompt("after paused abort").await.unwrap();
+        assert!(recovered.iter().any(|m| matches!(
+            m,
+            AgentMessage::Llm(Message::Assistant(a)) if a.text_output() == "recovered"
+        )));
+        drop(paused_stream);
+    });
+}
+
+#[test]
+fn agent_end_subscriber_sees_idle_state_and_can_start_next_prompt_without_busy() {
+    block_on(async {
+        let provider = ScriptedProvider::new(vec![
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("turn 1"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("turn 2"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+        ]);
+
+        let agent = Arc::new(Agent::new(
+            provider,
+            AgentConfig::new(test_model("end-sub-model")),
+        ));
+        let agent_cb = Arc::clone(&agent);
+        let saw_idle_in_cb = Arc::new(AtomicBool::new(false));
+        let saw_idle_flag = Arc::clone(&saw_idle_in_cb);
+        let next_stream_started = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&next_stream_started);
+        let spawned_second = Arc::new(AtomicBool::new(false));
+
+        let _sub = agent.subscribe(move |ev| {
+            if matches!(ev, AgentEvent::AgentEnd { .. })
+                && !spawned_second.swap(true, Ordering::SeqCst)
+            {
+                saw_idle_flag.store(!agent_cb.is_running(), Ordering::SeqCst);
+                agent_cb
+                    .set_model(test_model("end-sub-model-v2"))
+                    .expect("set_model inside AgentEnd must not fail with Busy");
+                let stream = agent_cb
+                    .prompt_stream("triggered from AgentEnd")
+                    .expect("prompt_stream inside AgentEnd must not fail with Busy");
+                // Keep the newly started run active until the outer test drives it to completion.
+                std::mem::forget(stream);
+                started_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let _ = agent.prompt("first").await.unwrap();
+        assert!(saw_idle_in_cb.load(Ordering::SeqCst));
+        assert!(next_stream_started.load(Ordering::SeqCst));
+        // The second run started inside AgentEnd must STILL be active (not clobbered by Run 1's guard!).
+        assert!(agent.is_running());
+        agent.wait_for_idle().await;
+        assert!(!agent.is_running());
+        assert!(agent.messages().iter().any(|m| matches!(
+            m,
+            AgentMessage::Llm(Message::Assistant(a)) if a.text_output() == "turn 2"
+        )));
+    });
+}
+
+#[test]
+fn explicit_system_prompt_and_tools_updates_override_reconstructed_leading_system_message() {
+    block_on(async {
+        let tool_a = Arc::new(ClosureTool::new(
+            ToolDefinition {
+                name: "tool_a".into(),
+                description: "A".into(),
+                parameters: obj_schema(Vec::<(&str, Value, bool)>::new()),
+            },
+            |_id, _args, _cancel, _upd| Box::pin(async { Ok(AgentToolResult::text("a")) }),
+        ));
+        let tool_b = Arc::new(ClosureTool::new(
+            ToolDefinition {
+                name: "tool_b".into(),
+                description: "B".into(),
+                parameters: obj_schema(Vec::<(&str, Value, bool)>::new()),
+            },
+            |_id, _args, _cancel, _upd| Box::pin(async { Ok(AgentToolResult::text("b")) }),
+        ));
+
+        let initial_system = Message::System(pikra_ai::SystemMessage {
+            content: "System A".into(),
+            sections: vec![("env".into(), Some("OS=macOS".into()))],
+            tools_added: vec![tool_a.definition()],
+            tools_removed: Vec::new(),
+            timestamp: 1,
+        });
+
+        let provider = ScriptedProvider::new(vec![
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("r1"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("r2"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+            Box::new(|model, _ctx, _opts| {
+                assistant_stream_from_blocks(
+                    model,
+                    vec![AssistantBlock::Text(TextContent::plain("r3"))],
+                    StopReason::Stop,
+                    Usage::default(),
+                    None,
+                )
+            }),
+        ]);
+
+        let mut cfg = AgentConfig::new(test_model("sys-override"))
+            .with_system_prompt("Different config default")
+            .with_tools(vec![tool_a.clone()]);
+        cfg.initial_messages = vec![AgentMessage::Llm(initial_system)];
+
+        let agent = Agent::new(provider.clone(), cfg);
+
+        // 1. Untouched reconstructed session preserves messages[0] byte-for-byte.
+        let _ = agent.prompt("turn 1").await.unwrap();
+        let req0 = &provider.requests()[0];
+        let resolved0 = req0.context.resolve();
+        assert!(resolved0.system_prompt.starts_with("System A"));
+        assert!(resolved0.system_prompt.contains("OS=macOS"));
+        assert_eq!(
+            resolved0
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_a"]
+        );
+
+        // 2. Explicit set_system_prompt("System B") + set_tools([tool_a, tool_b]) override messages[0].
+        agent.set_system_prompt("System B").unwrap();
+        agent
+            .set_tools(vec![tool_a.clone(), tool_b.clone()])
+            .unwrap();
+        let _ = agent.prompt("turn 2").await.unwrap();
+        let req1 = &provider.requests()[1];
+        let resolved1 = req1.context.resolve();
+        assert!(resolved1.system_prompt.starts_with("System B"));
+        assert!(resolved1.system_prompt.contains("OS=macOS"));
+        assert_eq!(
+            resolved1
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_a", "tool_b"]
+        );
+
+        // 3. Explicit set_system_prompt("") clears base system content while keeping named sections.
+        agent.set_system_prompt("").unwrap();
+        agent.set_tools(Vec::new()).unwrap();
+        let _ = agent.prompt("turn 3").await.unwrap();
+        let req2 = &provider.requests()[2];
+        let resolved2 = req2.context.resolve();
+        assert_eq!(resolved2.system_prompt, "OS=macOS");
+        assert!(resolved2.tools.is_empty());
     });
 }

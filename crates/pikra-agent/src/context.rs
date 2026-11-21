@@ -72,6 +72,9 @@ pub(crate) fn convert_to_llm_with_overrides(
         }
         if tools_overridden || (first.tools_added.is_empty() && !tools.is_empty()) {
             first.tools_added = tools.to_vec();
+            if tools_overridden {
+                first.tools_removed.clear();
+            }
         }
         TranscriptContext {
             messages: llm_messages,

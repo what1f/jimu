@@ -101,6 +101,8 @@ pub struct AgentLoopConfig {
     pub headers: Vec<(String, Option<String>)>,
     pub sampling_params: Map<String, Value>,
     pub rollback_first_turn_on_failure: bool,
+    pub system_prompt_updated: bool,
+    pub tools_updated: bool,
 }
 
 impl AgentLoopConfig {
@@ -123,6 +125,8 @@ impl AgentLoopConfig {
             headers: Vec::new(),
             sampling_params: Map::new(),
             rollback_first_turn_on_failure: false,
+            system_prompt_updated: false,
+            tools_updated: false,
         }
     }
 }
@@ -309,8 +313,8 @@ pub(crate) async fn agent_loop_with_queues(
                 thinking_level: config.thinking_level,
                 fast: config.fast,
             };
-            let mut system_overridden = false;
-            let mut tools_overridden = false;
+            let mut system_overridden = config.system_prompt_updated;
+            let mut tools_overridden = config.tools_updated;
 
             if !cancel.is_cancelled() {
                 for mw in &config.middlewares {

@@ -12,6 +12,19 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const TRUNCATED_SUFFIX: &str = "...[truncated]";
+
+fn decode_capped_utf8(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(err) if err.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..err.valid_up_to()]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 /// Native HTTP streaming transport backed by `reqwest` + `rustls` with no disk cache.
 #[derive(Clone, Debug)]
 pub struct ReqwestTransport {
@@ -142,11 +155,32 @@ impl HttpTransport for ReqwestTransport {
                 .collect();
 
             if !response.status().is_success() {
-                let body = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => return Err(TransportError::Aborted),
-                    res = response.text() => res.unwrap_or_default(),
-                };
+                let mut response = response;
+                let mut buf = Vec::new();
+                let mut truncated = false;
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Err(TransportError::Aborted),
+                        res = response.chunk() => res,
+                    };
+                    match next {
+                        Ok(Some(chunk)) => {
+                            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
+                            if chunk.len() > remaining {
+                                buf.extend_from_slice(&chunk[..remaining]);
+                                truncated = true;
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                let mut body = decode_capped_utf8(&buf);
+                if truncated {
+                    body.push_str(TRUNCATED_SUFFIX);
+                }
                 return Err(TransportError::HttpStatus {
                     status,
                     headers,

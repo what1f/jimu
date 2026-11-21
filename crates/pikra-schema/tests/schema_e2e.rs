@@ -581,3 +581,100 @@ fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
     }));
     assert!(leading_zero_idx.is_err());
 }
+
+#[test]
+fn string_pattern_validation_redos_safety_and_compile_time_rejection() {
+    // 1. Anchored 5-digit postal code rejects non-matching strings via coerce_and_validate.
+    let zip_schema = CompiledSchema::compile(json!({
+        "type": "object",
+        "properties": {
+            "zip": { "type": "string", "pattern": "^[0-9]{5}$" },
+            "code": { "type": "string", "pattern": "^(?:US|CA)-[A-Z]{2,3}\\d+$" },
+            "word": { "type": "string", "pattern": "\\bcat\\b" },
+            "tag": { "type": "string", "pattern": "[^\\s\\d]+" },
+            "cn": { "type": "string", "pattern": "^[\\u4e00-\\u9fff]{2}$" }
+        },
+        "required": ["zip"]
+    }))
+    .expect("valid pattern schema should compile");
+
+    assert!(
+        zip_schema
+            .coerce_and_validate(&json!({
+                "zip": "94107",
+                "code": "US-CA9",
+                "word": "a cat!",
+                "tag": "alpha_beta",
+                "cn": "你好"
+            }))
+            .is_ok()
+    );
+
+    let err = zip_schema
+        .coerce_and_validate(&json!({ "zip": "ABC" }))
+        .expect_err("ABC must fail ^[0-9]{5}$");
+    assert_eq!(err.issues[0].path, "zip");
+    assert!(err.issues[0].message.contains("pattern"));
+
+    assert!(zip_schema.validate(&json!({ "zip": "123456" })).is_err());
+    assert!(
+        zip_schema
+            .validate(&json!({ "zip": "94107", "code": "UK-AA1" }))
+            .is_err()
+    );
+    assert!(
+        zip_schema
+            .validate(&json!({ "zip": "94107", "word": "scatter" }))
+            .is_err()
+    );
+    assert!(
+        zip_schema
+            .validate(&json!({ "zip": "94107", "tag": "123 456" }))
+            .is_err()
+    );
+    assert!(
+        zip_schema
+            .validate(&json!({ "zip": "94107", "cn": "你a" }))
+            .is_err()
+    );
+
+    // 2. Non-exponential Thompson NFA handles classic ReDoS pattern instantly.
+    let redos = CompiledSchema::compile(json!({
+        "type": "string",
+        "pattern": "^(a+)+b$"
+    }))
+    .unwrap();
+    assert!(redos.validate(&json!("aaaaaab")).is_ok());
+    let evil = format!("{}c", "a".repeat(40));
+    assert!(redos.validate(&json!(evil)).is_err());
+
+    // 3. Invalid patterns and unsupported lookaround / backreference syntax fail at compile time,
+    //    including inside `$defs` and nested properties.
+    let bad_patterns = [
+        "[unclosed",
+        "(unclosed",
+        "a{5,2}",
+        "*leading",
+        "(?=lookahead)",
+        "(?!neg-lookahead)",
+        "(?<=lookbehind)",
+        "(?<!neg-lookbehind)",
+        "(a)\\1",
+        "\\2",
+    ];
+    for pat in bad_patterns {
+        let nested = json!({
+            "$defs": {
+                "Field": { "type": "string", "pattern": pat }
+            },
+            "type": "object",
+            "properties": {
+                "f": { "$ref": "#/$defs/Field" }
+            }
+        });
+        assert!(
+            CompiledSchema::compile(nested).is_err(),
+            "pattern `{pat}` should fail compile"
+        );
+    }
+}

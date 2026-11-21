@@ -14,9 +14,10 @@ use crate::usage::{
     anthropic_messages_url, calculate_cost, has_header, merge_headers, parse_tool_call_arguments,
 };
 use crate::{
-    AssistantBlock, AssistantEventStream, AssistantMessageEvent, CacheRetention, ContentPart,
-    HttpRequest, HttpTransport, ImageContent, Message, Model, SimpleStreamOptions, StopReason,
-    TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, TranscriptContext,
+    AnthropicThinkingMode, AssistantBlock, AssistantEventStream, AssistantMessageEvent,
+    CacheRetention, ContentPart, HttpRequest, HttpTransport, ImageContent, Message, Model,
+    SimpleStreamOptions, StopReason, TextContent, ThinkingContent, ThinkingLevel, ToolCall,
+    ToolDefinition, TranscriptContext,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -85,36 +86,110 @@ fn convert_text_slice_content(content: &[TextContent]) -> Value {
     Value::String(text)
 }
 
+fn resolve_local_def<'a>(
+    root: &'a Map<String, Value>,
+    reference: &str,
+) -> Option<&'a Map<String, Value>> {
+    let (container_key, raw_name) = if let Some(name) = reference.strip_prefix("#/$defs/") {
+        ("$defs", name)
+    } else if let Some(name) = reference.strip_prefix("#/definitions/") {
+        ("definitions", name)
+    } else {
+        return None;
+    };
+    if raw_name.is_empty() || raw_name.contains('/') {
+        return None;
+    }
+    let unescaped = raw_name.replace("~1", "/").replace("~0", "~");
+    root.get(container_key)
+        .and_then(Value::as_object)
+        .and_then(|defs| defs.get(&unescaped))
+        .and_then(Value::as_object)
+}
+
+fn merge_schema_layer(dest: &mut Map<String, Value>, layer: &Map<String, Value>, skip_ref: bool) {
+    for (k, v) in layer {
+        if skip_ref && k == "$ref" {
+            continue;
+        }
+        match (k.as_str(), dest.get_mut(k), v) {
+            ("properties", Some(Value::Object(existing)), Value::Object(incoming)) => {
+                for (pk, pv) in incoming {
+                    existing.insert(pk.clone(), pv.clone());
+                }
+            }
+            ("required", Some(Value::Array(existing)), Value::Array(incoming)) => {
+                for item in incoming {
+                    if !existing.contains(item) {
+                        existing.push(item.clone());
+                    }
+                }
+            }
+            ("allOf", Some(Value::Array(existing)), Value::Array(incoming)) => {
+                existing.extend(incoming.iter().cloned());
+            }
+            _ => {
+                dest.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn convert_tool_input_schema(parameters: &Value) -> Map<String, Value> {
+    let Value::Object(src) = parameters else {
+        let mut fallback = Map::new();
+        fallback.insert("type".into(), Value::String("object".into()));
+        fallback.insert("properties".into(), Value::Object(Map::new()));
+        fallback.insert("required".into(), Value::Array(Vec::new()));
+        return fallback;
+    };
+
+    let mut input_schema = if let Some(first_ref) = src.get("$ref").and_then(Value::as_str) {
+        let mut chain: Vec<&Map<String, Value>> = Vec::new();
+        let mut visited: Vec<&str> = Vec::new();
+        let mut cur_ref = Some(first_ref);
+
+        while let Some(r) = cur_ref {
+            if visited.len() >= 16 || visited.contains(&r) {
+                break;
+            }
+            visited.push(r);
+            let Some(target) = resolve_local_def(src, r) else {
+                break;
+            };
+            chain.push(target);
+            cur_ref = target.get("$ref").and_then(Value::as_str);
+        }
+
+        if chain.is_empty() {
+            src.clone()
+        } else {
+            let mut merged = Map::new();
+            merged.insert("type".into(), Value::String("object".into()));
+            for target in chain.into_iter().rev() {
+                merge_schema_layer(&mut merged, target, true);
+            }
+            merge_schema_layer(&mut merged, src, true);
+            merged
+        }
+    } else {
+        src.clone()
+    };
+
+    input_schema.insert("type".into(), Value::String("object".into()));
+    if !input_schema.contains_key("properties") {
+        input_schema.insert("properties".into(), Value::Object(Map::new()));
+    }
+    input_schema
+}
+
 fn convert_tools(tools: &[ToolDefinition], cache_control: Option<&Value>) -> Vec<Value> {
     let len = tools.len();
     tools
         .iter()
         .enumerate()
         .map(|(idx, tool)| {
-            let mut input_schema = Map::new();
-            input_schema.insert("type".into(), Value::String("object".into()));
-            if let Value::Object(src) = &tool.parameters {
-                input_schema.insert(
-                    "properties".into(),
-                    src.get("properties")
-                        .cloned()
-                        .unwrap_or_else(|| Value::Object(Map::new())),
-                );
-                input_schema.insert(
-                    "required".into(),
-                    src.get("required")
-                        .cloned()
-                        .unwrap_or_else(|| Value::Array(Vec::new())),
-                );
-                for key in ["additionalProperties", "$defs", "definitions"] {
-                    if let Some(val) = src.get(key) {
-                        input_schema.insert(key.into(), val.clone());
-                    }
-                }
-            } else {
-                input_schema.insert("properties".into(), Value::Object(Map::new()));
-                input_schema.insert("required".into(), Value::Array(Vec::new()));
-            }
+            let input_schema = convert_tool_input_schema(&tool.parameters);
 
             let mut obj = Map::new();
             obj.insert("name".into(), Value::String(tool.name.clone()));
@@ -278,6 +353,46 @@ fn convert_messages(
     out
 }
 
+fn parse_short_version_number(token: &str) -> Option<u32> {
+    if token.is_empty() || token.len() > 2 || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    token.parse::<u32>().ok()
+}
+
+fn parse_claude_version(model_id: &str) -> Option<(u32, u32)> {
+    let lower = model_id.to_ascii_lowercase();
+    let idx = lower.find("claude")?;
+    let after = &lower[idx + "claude".len()..];
+    let tokens: Vec<&str> = after
+        .split(['-', '.', '_', '@', '/', ':'])
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    for (pos, token) in tokens.iter().enumerate() {
+        if let Some(major) = parse_short_version_number(token) {
+            let minor = tokens
+                .get(pos + 1)
+                .and_then(|next| parse_short_version_number(next))
+                .unwrap_or(0);
+            return Some((major, minor));
+        }
+    }
+    None
+}
+
+fn uses_adaptive_thinking(model: &Model) -> bool {
+    if let Some(mode) = model.compat.as_ref().and_then(|c| c.anthropic_thinking) {
+        return matches!(mode, AnthropicThinkingMode::Adaptive);
+    }
+    if let Some((major, minor)) = parse_claude_version(&model.id) {
+        // Legacy Claude 3.7 and Claude 4.0-4.6 use manual `budget_tokens`;
+        // Claude 4.7+, 4.8+, 5.x+, and newer require adaptive thinking.
+        return major > 4 || (major == 4 && minor >= 7);
+    }
+    false
+}
+
 fn thinking_budget_for_level(level: ThinkingLevel, max_tokens: u32) -> Option<u32> {
     let raw = match level {
         ThinkingLevel::Off | ThinkingLevel::None => return None,
@@ -287,12 +402,12 @@ fn thinking_budget_for_level(level: ThinkingLevel, max_tokens: u32) -> Option<u3
         ThinkingLevel::High => 16_384,
         ThinkingLevel::Xhigh | ThinkingLevel::Max => 32_768,
     };
-    let cap = max_tokens.saturating_sub(1_024);
-    if cap >= 1_024 {
-        Some(raw.min(cap))
-    } else {
-        Some(1_024.min(max_tokens.saturating_sub(1).max(1)))
+    if max_tokens <= 1_024 {
+        return None;
     }
+    let reserved_cap = max_tokens.saturating_sub(1_024);
+    let budget = raw.min(reserved_cap).max(1_024).min(max_tokens - 1);
+    Some(budget)
 }
 
 pub fn build_request_body(
@@ -339,30 +454,26 @@ pub fn build_request_body(
     {
         if level == ThinkingLevel::None {
             body.insert("thinking".into(), json!({ "type": "disabled" }));
-        } else {
-            let lower_id = model.id.to_ascii_lowercase();
-            let uses_adaptive = lower_id.contains("4-7") || lower_id.contains("4.7");
-            if uses_adaptive {
-                thinking_enabled = true;
-                let effort = match level {
-                    ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
-                    ThinkingLevel::Medium => "medium",
-                    ThinkingLevel::High => "high",
-                    ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
-                    ThinkingLevel::Off | ThinkingLevel::None => "low",
-                };
-                body.insert("thinking".into(), json!({ "type": "adaptive" }));
-                body.insert("output_config".into(), json!({ "effort": effort }));
-            } else if let Some(budget) = thinking_budget_for_level(level, max_tokens) {
-                thinking_enabled = true;
-                body.insert(
-                    "thinking".into(),
-                    json!({
-                        "type": "enabled",
-                        "budget_tokens": budget,
-                    }),
-                );
-            }
+        } else if uses_adaptive_thinking(model) {
+            thinking_enabled = true;
+            let effort = match level {
+                ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
+                ThinkingLevel::Off | ThinkingLevel::None => "low",
+            };
+            body.insert("thinking".into(), json!({ "type": "adaptive" }));
+            body.insert("output_config".into(), json!({ "effort": effort }));
+        } else if let Some(budget) = thinking_budget_for_level(level, max_tokens) {
+            thinking_enabled = true;
+            body.insert(
+                "thinking".into(),
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }),
+            );
         }
     }
 
