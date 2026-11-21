@@ -100,9 +100,9 @@ flowchart TD
 ### 3.2 Prompt Cache 绝对前缀保护
 所有动态能力均围绕「已发送前缀字节恒定」设计：
 1. **常驻与延迟严格分池**：顶层 `tools` 数组在会话建立时锁定顺序；外部 MCP 工具或超预算工具自动进入 `DeferredToolRegistry`，通过常驻的 `tool_search`（BM25 分词相关性排序）按需拉取参数定义，通过 `call_tool` 执行（事件流自动透出内部真实工具名供 UI 展示）或在 `exec`（QuickJS 沙盒）中批量编排。
-2. **Skills 多级发现与 Dora 式增量 Diff**：
-   - 支持从 `cwd` 向上回溯至仓库根扫描项目级目录（默认兼容跨生态 `.agents/skills` 及宿主自定义目录如 `.pikra/skills`、`.dora/skills`、`.pi/skills`）+ 用户全局目录 + 显式追加路径 + 单条启停过滤 + 8KB 体积封顶。
-   - **首轮与压缩后发全量，中途只发增删 Diff**：会话运行中若新增或删除 Skill，只在末尾追加 `# Skills changed` 增量块；修改已有 `SKILL.md` 正文不发任何冗余提醒。
+2. **无品牌硬编码的 `AGENTS.md` 与 Skills 多级发现**：
+   - 库层只内置中立规范（`.agents/skills`、`~/.agents`、`AGENTS.override.md` > `AGENTS.md`），零 `.pikra` 写死路径，所有自定义目录、回溯边界（`ProjectRoot` 停 `.git` / `FilesystemRoot` 爬到 `/` / `CurrentDirOnly`）与体积上限（默认指令 `32 KiB` 可设 `None`、Skills 目录 `8 KiB`）均交由宿主覆盖；多份正文完全一致的 `AGENTS.md` 自动去重不重复加载。
+   - **首轮与压缩后保真，中途只发增删 Diff**：`AGENTS.md` 走具名上下文块，压缩后自动保留防遗忘；会话运行中若新增或删除 Skill，只在末尾追加 `# Skills changed` 增量块，修改已有 `SKILL.md` 正文静默不刷屏。
 3. **压缩复用父前缀**：自动压缩摘要请求直接复用上一轮完整消息与工具前缀，仅在尾部追加摘要指令，最大化命中缓存读取。
 
 ### 3.3 前后台统一终端、`Monitor` 事件唤醒与 `Sleep`

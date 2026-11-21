@@ -142,29 +142,43 @@ let custom_tool = Arc::new(ClosureTool::parallel(
 
 ---
 
-## 5. 可扩展 Skills 发现与动态工具加载
+## 5. 可配置 `AGENTS.md` 规则发现、Skills 与动态工具加载
 
-### 5.1 配置多层级 Skill 目录策略
-默认兼容跨 Agent 通用规范 `.agents/skills`（支持 Kitter 软链接管理），同时允许宿主添加自有品牌目录、禁用指定 Skill 或在测试中隔离用户全局目录：
+### 5.1 配置多层级 `AGENTS.md` 规则与 Skill 目录策略
+Pikra 作为无头引擎**绝不在库层写死任何特定品牌目录（如 `.pikra`）**：默认只识别跨生态中立目录（`.agents/skills`、`~/.agents`），所有回溯边界、候选文件名、自定义目录与字节上限均支持「默认值优先 + 全项覆盖」：
 
 ```rust
-use pikra_kit::{SkillDiscoveryConfig, SkillEnableRule, SkillSelector};
+use pikra_kit::{
+    InstructionDiscoveryConfig, SkillDiscoveryConfig, SkillEnableRule, SkillSelector, WalkBoundary,
+};
 
+// 1. AGENTS.md 规则加载（默认停在 .git 根、32 KiB 封顶、完全相同正文自动去重防重复）
+let instruction_cfg = InstructionDiscoveryConfig {
+    cwd: Some(workspace.to_path_buf()),
+    walk_boundary: WalkBoundary::ProjectRoot,   // 可选 ProjectRoot | FilesystemRoot | CurrentDirOnly
+    user_dirs: vec!["~/.my-app".into()],        // 宿主自定义全局目录（库层默认为空）
+    max_bytes: Some(32 * 1024),                 // 传 None 则不限制字节上限
+    deduplicate_identical_content: true,        // 多份内容完全一致的 AGENTS.md 自动跳过不重复加载
+    ..Default::default()
+};
+
+// 2. Skills 目录发现（共用同一套 WalkBoundary）
 let skill_cfg = SkillDiscoveryConfig {
     cwd: Some(workspace.to_path_buf()),
-    project_skill_dirs: vec![".my-app/skills".into(), ".pi/skills".into()], // 从 cwd 向上回溯至 .git 根
-    include_agents_skills: true,                                            // 同时扫描项目与全局 .agents/skills
-    include_user_skills: true,                                              // 测试隔离时设为 false
+    walk_boundary: WalkBoundary::ProjectRoot,
+    project_skill_dirs: vec![".my-app/skills".into(), ".pi/skills".into()],
+    include_agents_skills: true,                // 扫描项目与全局 .agents/skills
+    include_user_skills: true,                  // 测试隔离时设为 false
     rules: vec![SkillEnableRule {
         selector: SkillSelector::ByName("legacy-helper".into()),
         enabled: false,
     }],
-    max_catalog_bytes: 8 * 1024,                                            // 超 8KB 自动压缩描述或转按需检索
+    max_catalog_bytes: 8 * 1024,
     ..Default::default()
 };
 ```
 
-- **中途热更新不破缓存**：监听到目录变化后调用 `session.reload_skills()`，内核会自动对比模型已知快照，**只追加新增/移除的 `# Skills changed` 增量块**，修改已有 Skill 正文不刷屏。
+- **保前缀缓存 + 压缩防遗忘**：`AGENTS.md` 通过具名上下文块注入，首轮进入缓存前缀，触发自动压缩（Compaction）后原样保留不会丢失；`Skills` 中途热更新调用 `session.reload_skills()` 只在末尾追加 `# Skills changed` 增删增量，修改正文不刷屏。
 
 ### 5.2 延迟加载海量工具与 MCP
 - 固定高频工具用 `KitToolSpec::resident(tool)`；

@@ -94,6 +94,7 @@ require("codecompanion").setup({
 | **会话全生命周期持久化** | 完整实现 `session/new`、`session/load`（严格按序回放历史消息、思考、工具卡片与压缩记录）、`session/resume`（免回放秒连）、`session/list`（按工作目录筛选与游标分页）、`session/fork`、`session/delete`、`session/archive`、`session/set_title`（首轮自动生成会话标题） |
 | **流中插话（`_session/steering`）与随时取消** | 兼容 `codex-acp` / `claude-agent-acp` 的 `_session/steering` 扩展（运行中实时注入指令，空闲时支持 `promptRequired`）；收到 `session/cancel` 立即中断流式生成、在途终端与审批等待并返回 `cancelled` |
 | **动态面板配置、MCP 与斜杠命令** | 原生暴露模型、思考档位、`fast` 模式与权限模式选择器；自动挂载客户端传入的 `mcpServers`（`stdio` + `http`）；自动将 `/compact`、`/plan`、`/reload-skills` 及项目 `.agents/skills` / `.pikra/skills` 注册为编辑器 `/` 快捷命令 |
+| **可配置 `AGENTS.md` 与目录边界** | 默认加载 `~/.agents` 与工作区层级的 `AGENTS.override.md` / `AGENTS.md`（自动兼容客户端传入的 `additionalDirectories` 并对完全一致的正文自动去重）；支持通过 `--walk-boundary <project-root\|filesystem-root\|cwd-only>`、`--instruction-max-bytes <bytes\|none>`、`--instruction-file <path>`、`--no-user-instructions`、`--no-instructions`、`--pikra-home <dir>` 按需定制 |
 
 ---
 

@@ -122,9 +122,10 @@ let clipboardTool = PikraTool(
 
 ## 4. Skills、动态工具与后台唤醒最佳实践
 
-1. **Skills 目录配置**：
-   - 默认支持扫描项目与全局 `.agents/skills`（兼容 Kitter 软链接）及自定义产品目录（如 `.dora/skills`）；在自动化测试中可将 `includeUserSkills` 设为 `false` 避免受本机 `~/.agents/skills` 干扰。
-   - 目录文件变更时调用刷新接口，内核自动只追加 `# Skills changed` 增删增量，不会重发整份目录破坏前缀缓存。
+1. **`AGENTS.md` 规则与 Skills 目录配置**：
+   - 库层零品牌目录硬编码：默认只识别跨生态 `.agents/skills` 与 `~/.agents`，宿主通过 `userDirs` / `projectSkillDirs` 挂载自有目录（如 `~/.dora`、`.dora/skills`）；自动化测试中可将 `includeUserInstructions` / `includeUserSkills` 设为 `false` 隔离本机全局目录。
+   - 共用 `PikraWalkBoundary`（`.projectRoot` 停在 `.git` 根、`.filesystemRoot` 一路爬到 `/`、`.currentDirOnly` 仅当前目录）；`PikraInstructionDiscovery.Configuration` 默认开启相同正文自动去重与 `32 KiB` 可调上限（传 `nil` 不限上限）。
+   - `AGENTS.md` 或 Skills 文件变更时分别调用 `reloadInstructions()` / `reloadSkills()`；Skills 只追加 `# Skills changed` 增删增量，不会重发整份目录破坏前缀缓存。
 2. **MCP 与海量工具热更新**：
    - 会话运行期增删外部 MCP 工具调用 `upsertTools` / `removeTools`（仅操作延迟工具池，保证顶层常驻工具字节不变）。
 3. **中途插话、取消与生命周期**：
