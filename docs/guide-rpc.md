@@ -35,15 +35,21 @@ pikra --mode rpc \
 - 当回合正在进行时，发送 `"type": "prompt"` 也可携带 `"streamingBehavior": "steer"` 或 `"followUp"`。
 - 支持多模态图片输入：在 `prompt` / `steer` / `follow_up` 中附带 `"images": [{"data": "<base64>", "mimeType": "image/png"}]`。
 
-### 模型、思考档位与动态上下文
+### 模型、思考档位与动态隐藏上下文（`isMeta`）
 ```json
 {"id":"5","type":"set_model","provider":"openai","modelId":"gpt-5.4","api":"openai-responses"}
 {"id":"6","type":"set_thinking_level","level":"high"}
 {"id":"7","type":"set_fast","enabled":true}
 {"id":"8","type":"set_context","name":"git_status","text":"branch: main (clean)"}
+{"id":"9","type":"append_context","name":"file_watch","text":"Cargo.toml changed externally"}
+{"id":"10","type":"append_meta","text":"<system-reminder>Custom unwrapped reminder</system-reminder>"}
+{"id":"11","type":"prompt","message":"Run background check","isMeta":true}
+{"id":"12","type":"steer","message":"Complete pending verification first","isMeta":true}
+{"id":"13","type":"get_messages","includeMeta":false}
 ```
 - `set_model` 切换的模型会自动持久化进会话元数据（`pikra.rpc.model`），进程重启恢复同一会话文件时自动还原。
 - `set_context` 同名同值自动去重，仅在内容变化时于下一轮前作为 `<system-reminder>` 追加，不破坏已有前缀缓存。
+- `prompt` / `steer` / `follow_up` 携带 `"isMeta": true`（或使用 `append_context` / `append_meta`）时，消息对模型正常可见但标记 `"is_meta": true`（隐藏插话不发 `steered` 事件）；调用 `get_messages` 传 `"includeMeta": false` 可直接获取过滤掉系统注入后的纯对话列表。
 
 ### 会话树、分叉与上下文压缩
 ```json

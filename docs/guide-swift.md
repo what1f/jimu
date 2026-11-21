@@ -128,7 +128,7 @@ let clipboardTool = PikraTool(
    - `AGENTS.md` 或 Skills 文件变更时分别调用 `reloadInstructions()` / `reloadSkills()`；Skills 只追加 `# Skills changed` 增删增量，不会重发整份目录破坏前缀缓存。
 2. **MCP 与海量工具热更新**：
    - 会话运行期增删外部 MCP 工具调用 `upsertTools` / `removeTools`（仅操作延迟工具池，保证顶层常驻工具字节不变）。
-3. **中途插话、取消与生命周期**：
-   - 回复进行中用户发新消息可调 `agent.steer(text:)` 实时插话，或调 `agent.followUp(text:)` 排入下一轮；
-   - 用户点击停止调 `await agent.interrupt()`，该函数会等待在途工具取消与未读插话清理完毕后才返回，随后可立即安全发起下一轮 `prompt`。
+3. **隐藏系统上下文（`isMeta`）、中途插话与生命周期**：
+   - **仅模型可见的隐藏消息**：轮前排队用 `try await agent.setContext(name:text:)`（去重）、`try await agent.appendContext(_:name:)` 或无标签包装的 `try await agent.appendMeta(_:)`；无用户发言直接触发隐藏轮次用 `try await agent.prompt("...", isMeta: true)`；运行中注入隐藏纠偏用 `await agent.steer(text: "...", isMeta: true)`（不会触发 `.steered` 用户气泡事件）或 `try await agent.followUp(text: "...", isMeta: true)`；读取 `agent.entries()` 时可直接用 `entry.isMeta` 过滤 UI 展示。
+   - **用户插话与停止**：回复进行中用户发新消息可调 `agent.steer(text:)` 实时插话，或调 `agent.followUp(text:)` 排入下一轮；用户点击停止调 `await agent.interrupt()`，该函数会等待在途工具取消与未读插话清理完毕后才返回，随后可立即安全发起下一轮 `prompt`。
    - 会话不用时调 `await agent.close()`（或释放引用），底层自动回收该会话启动的所有后台子进程组与 `Monitor`。

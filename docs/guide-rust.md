@@ -185,6 +185,27 @@ let skill_cfg = SkillDiscoveryConfig {
 - 低频或 MCP 工具用 `KitToolSpec::deferred(tool)`（或设置 `auto_defer_threshold_bytes` 超阈值自动转延迟）；
 - 模型通过 `tool_search`（BM25 分词打分）按需查 Schema、用 `call_tool` 执行（返回结果的 `details.delegated_tool` 原生携带真实工具名与参数，UI 可直接渲染真实工具卡片），顶层 `tools` 列表整场会话一字不变。
 
+### 5.3 注入仅模型可见的隐藏上下文（`is_meta`）
+当宿主需要追加系统提醒、外部事件唤醒或运行中协议纠偏（模型可见、聊天 UI 不可见）时，按注入时机直接调用对应接口，无需手拼或正则过滤：
+
+```rust
+// 1. 轮前排队伴随注入（随下一次用户提问一起发出）
+session.set_context("git_status", "branch: main");      // 同名同值自动去重（保缓存）
+session.append_context("Detected external file edit."); // 一次性 <system-reminder>
+session.append_meta("<custom-hint>...</custom-hint>");  // 一次性无额外包装的隐藏 UserMessage
+
+// 2. 无用户发言，直接用隐藏消息触发一轮推理（如定时心跳、外部事件触发）
+let _ = session.prompt_meta("Check pending background notifications.").await?;
+
+// 3. 运行中动态注入隐藏纠偏 / 提醒（不触发 UI 的 Steered 用户气泡事件）
+session.steer_meta("protocol-fix", "<system-reminder>Finish tool calls before replying.</system-reminder>");
+session.follow_up_meta("post-check", "Verify formatting before finishing.");
+
+// 4. UI 渲染过滤：messages() 保留完整消息（含 user.is_meta == true），visible_messages() 仅返回用户可见对话
+let chat_history = session.visible_messages();
+```
+- `pikra-durable` 同样提供事务级 `engine.set_context(...)`、`engine.append_meta(...)` 与 `engine.submit_meta(...)`。
+
 ---
 
 ## 6. 拦截切面（权限审批与输出密钥脱敏）

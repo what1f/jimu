@@ -114,3 +114,8 @@ flowchart TD
 宿主无需重写内置工具代码即可完成产品化定制：
 - **定义层覆盖（`ToolDefinitionOverride`）**：挂载内置工具时可改工具名（如把 `exec_command` 暴露为 `bash`）、替换或追加工具描述文案、隐藏指定可选参数并注入固定默认值。
 - **执行层切面（`AgentMiddleware` / SDK Hooks）**：`before_tool_call` 统一拦截权限审批与参数改写；`env_provider` 动态注入终端环境变量；`after_tool_call` 统一对输出中的敏感密钥打码脱敏或落盘截断。
+
+### 3.5 通用隐藏上下文原语（`is_meta` / `isMeta`）
+宿主在注入系统提醒、后台事件唤醒或中途协议纠偏时，无需靠正则过滤 `<system-reminder>` 标签：
+- **底层统一标记**：`UserMessage` 原生携带 `is_meta: bool`（Swift / JSON 兼容 `isMeta`），向模型发请求时完全等同于标准 `user` 消息（不向任何上游模型 API 泄露额外字段，100% 保持缓存前缀字节一致），而对 UI 历史与实时事件天然区分用户发言与系统注入。
+- **全时机覆盖**：所有 `<system-reminder>`（`set_context` / `append_context` / `append_named_context`）、无标签隐藏块（`append_meta`）、自动压缩摘要、后台 `Monitor` 唤醒轮次、独立触发的隐藏轮次（`prompt_meta` / `submit_meta`）以及运行中隐藏插话（`steer_meta` / `follow_up_meta`，不触发面向用户的 `Steered` 气泡事件）均统一标记 `is_meta: true`，`visible_messages()` 与 `pikra-acp` 历史回放自动过滤。
