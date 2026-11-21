@@ -34,6 +34,7 @@ fn test_model(context_window: u32, max_output_tokens: u32) -> Model {
         supports_reasoning: false,
         cost: ModelCost::default(),
         headers: Vec::new(),
+        compat: None,
     }
 }
 
