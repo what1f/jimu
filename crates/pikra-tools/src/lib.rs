@@ -1,16 +1,44 @@
-//! Optional local workspace tools (`read`, `write`, `edit`, `bash`, `find`) implementing [`pikra_agent::AgentTool`].
+//! Optional local workspace tools implementing [`pikra_agent::AgentTool`].
+//!
+//! Hosts opt into background tools by registering the command and monitor tools
+//! with their managers. Share a `WakeGate` between the managers and `SleepTool`
+//! to wake an ongoing wait when a background event arrives.
 
+#[cfg(not(target_os = "ios"))]
 mod bash;
 mod edit;
+mod events;
+#[cfg(all(unix, not(target_os = "ios")))]
+mod exec_session;
 mod find;
+#[cfg(all(unix, not(target_os = "ios")))]
+mod monitor;
 mod read;
+mod sleep;
+#[cfg_attr(
+    target_os = "ios",
+    allow(
+        dead_code,
+        reason = "the shared subprocess output buffer is unused on iOS"
+    )
+)]
 mod util;
 mod write;
 
+#[cfg(not(target_os = "ios"))]
 pub use bash::BashTool;
 pub use edit::EditTool;
+pub use events::{
+    BackgroundEventCallback, BackgroundToolEvent, MonitorStopReason, WakeGate, WakeOutcome,
+    format_background_events_xml,
+};
+#[cfg(all(unix, not(target_os = "ios")))]
+pub use exec_session::{ExecCommandTool, ProcessSessionManager, WriteStdinTool};
 pub use find::FindTool;
+#[cfg(all(unix, not(target_os = "ios")))]
+pub use monitor::{MonitorConfig, MonitorManager, MonitorTool};
 pub use read::ReadTool;
+pub use sleep::SleepTool;
 pub use util::{TruncatedOutput, truncate_output};
 pub use write::WriteTool;
 
@@ -36,16 +64,18 @@ pub enum BuiltinToolKind {
     Read,
     Write,
     Edit,
+    #[cfg(not(target_os = "ios"))]
     Bash,
     Find,
 }
 
 impl BuiltinToolKind {
     /// Fixed canonical ordering so tool lists and prompt-cache prefixes never drift.
-    pub const ALL: [BuiltinToolKind; 5] = [
+    pub const ALL: [BuiltinToolKind; 5 - cfg!(target_os = "ios") as usize] = [
         BuiltinToolKind::Read,
         BuiltinToolKind::Write,
         BuiltinToolKind::Edit,
+        #[cfg(not(target_os = "ios"))]
         BuiltinToolKind::Bash,
         BuiltinToolKind::Find,
     ];
@@ -55,6 +85,7 @@ impl BuiltinToolKind {
             Self::Read => "read",
             Self::Write => "write",
             Self::Edit => "edit",
+            #[cfg(not(target_os = "ios"))]
             Self::Bash => "bash",
             Self::Find => "find",
         }
@@ -73,6 +104,7 @@ impl BuiltinToolSet {
             BuiltinToolKind::Read => 1 << 0,
             BuiltinToolKind::Write => 1 << 1,
             BuiltinToolKind::Edit => 1 << 2,
+            #[cfg(not(target_os = "ios"))]
             BuiltinToolKind::Bash => 1 << 3,
             BuiltinToolKind::Find => 1 << 4,
         }
@@ -83,7 +115,13 @@ impl BuiltinToolSet {
     }
 
     pub const fn all() -> Self {
-        Self { mask: 0b1_1111 }
+        Self {
+            mask: if cfg!(target_os = "ios") {
+                0b1_0111
+            } else {
+                0b1_1111
+            },
+        }
     }
 
     pub const fn read_only() -> Self {
@@ -274,6 +312,7 @@ impl WorkspaceTools {
             BuiltinToolKind::Read => Arc::new(ReadTool::new(cfg)),
             BuiltinToolKind::Write => Arc::new(WriteTool::new(cfg)),
             BuiltinToolKind::Edit => Arc::new(EditTool::new(cfg)),
+            #[cfg(not(target_os = "ios"))]
             BuiltinToolKind::Bash => Arc::new(BashTool::new(cfg)),
             BuiltinToolKind::Find => Arc::new(FindTool::new(cfg)),
         }
