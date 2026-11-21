@@ -1,3 +1,4 @@
+use crate::bm25::{Document, score_documents};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{
@@ -154,45 +155,40 @@ impl DeferredToolRegistry {
                 }
             }
         } else {
-            let tokens: Vec<String> = trimmed
-                .split_whitespace()
-                .map(|t| t.to_ascii_lowercase())
-                .filter(|t| !t.is_empty())
+            let definitions: Vec<_> = guard
+                .order
+                .iter()
+                .map(|name| guard.tools[name].definition())
                 .collect();
-
-            if tokens.is_empty() {
-                matched_names = guard.order.iter().take(clamped_limit).cloned().collect();
-            } else {
-                let mut scored: Vec<(usize, usize, String)> = Vec::new();
-                for (order_idx, name) in guard.order.iter().enumerate() {
-                    let Some(tool) = guard.tools.get(name) else {
-                        continue;
-                    };
-                    let def = tool.definition();
-                    let name_lc = def.name.to_ascii_lowercase();
-                    let desc_lc = def.description.to_ascii_lowercase();
-                    let mut score = 0usize;
-                    for tok in &tokens {
-                        if name_lc == *tok {
-                            score += 10;
-                        } else if name_lc.contains(tok.as_str()) {
-                            score += 5;
-                        }
-                        if desc_lc.contains(tok.as_str()) {
-                            score += 2;
-                        }
-                    }
-                    if score > 0 {
-                        scored.push((score, order_idx, name.clone()));
-                    }
-                }
-                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                matched_names = scored
-                    .into_iter()
-                    .take(clamped_limit)
-                    .map(|(_, _, name)| name)
-                    .collect();
-            }
+            let property_names: Vec<_> = definitions
+                .iter()
+                .map(|def| {
+                    def.parameters["properties"]
+                        .as_object()
+                        .map(|properties| {
+                            properties
+                                .keys()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            let documents: Vec<_> = definitions
+                .iter()
+                .zip(&property_names)
+                .map(|(def, properties)| Document {
+                    name: &def.name,
+                    description: &def.description,
+                    properties,
+                })
+                .collect();
+            matched_names = score_documents(trimmed, &documents)
+                .into_iter()
+                .take(clamped_limit)
+                .map(|index| guard.order[index].clone())
+                .collect();
         }
 
         let mut newly_loaded = Vec::new();
@@ -402,9 +398,12 @@ impl AgentTool for CallToolGateway {
                     Err(_) => raw_tool_args,
                 };
 
-                return tool
+                let (delegated, on_update) = delegated_progress(name, &validated_args, on_update);
+                let result = tool
                     .execute(tool_call_id, validated_args, cancel, on_update)
-                    .await;
+                    .await
+                    .unwrap_or_else(AgentToolResult::error);
+                return Ok(with_delegation(result, &delegated));
             }
 
             let Some(args_obj) = raw_tool_args.as_object().cloned() else {
@@ -446,8 +445,14 @@ impl AgentTool for CallToolGateway {
                 namespace: None,
                 arguments_error: None,
             };
-            let tools_slice = [tool];
-            Ok(pikra_agent::run_tool_call(
+            let delegated = Arc::new(Mutex::new(
+                json!({"name": name, "arguments": raw_tool_args}),
+            ));
+            let tools_slice: [Arc<dyn AgentTool>; 1] = [Arc::new(DelegatedTool {
+                tool,
+                metadata: Arc::clone(&delegated),
+            })];
+            let result = pikra_agent::run_tool_call(
                 &tools_slice,
                 &self.middlewares,
                 &dummy_assistant,
@@ -456,7 +461,53 @@ impl AgentTool for CallToolGateway {
                 cancel,
                 on_update,
             )
-            .await)
+            .await;
+            let delegated = delegated.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(with_delegation(result, &delegated))
         })
+    }
+}
+
+fn delegated_progress(
+    name: &str,
+    args: &Value,
+    on_update: ToolProgressCallback,
+) -> (Value, ToolProgressCallback) {
+    let metadata = json!({"name": name, "arguments": args});
+    let progress_metadata = metadata.clone();
+    let callback = Arc::new(move |result| on_update(with_delegation(result, &progress_metadata)));
+    (metadata, callback)
+}
+
+fn with_delegation(mut result: AgentToolResult, delegated: &Value) -> AgentToolResult {
+    let details = std::mem::take(&mut result.details);
+    result.details = match details {
+        Value::Null => json!({"delegated_tool": delegated}),
+        other => json!({"delegated_tool": delegated, "inner_details": other}),
+    };
+    result
+}
+
+struct DelegatedTool {
+    tool: Arc<dyn AgentTool>,
+    metadata: Arc<Mutex<Value>>,
+}
+
+impl AgentTool for DelegatedTool {
+    fn definition(&self) -> ToolDefinition {
+        self.tool.definition()
+    }
+
+    fn execute(
+        &self,
+        tool_call_id: String,
+        args: Value,
+        cancel: CancelToken,
+        on_update: ToolProgressCallback,
+    ) -> BoxFuture<'_, Result<AgentToolResult, String>> {
+        let (metadata, on_update) =
+            delegated_progress(&self.tool.definition().name, &args, on_update);
+        *self.metadata.lock().unwrap_or_else(|e| e.into_inner()) = metadata;
+        self.tool.execute(tool_call_id, args, cancel, on_update)
     }
 }

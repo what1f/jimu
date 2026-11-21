@@ -12,9 +12,13 @@ use pikra_ai::{
     ToolDefinition,
 };
 use pikra_kit::{
-    CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, KitEvent, KitSession, KitSessionConfig, McpClient,
-    McpToolRegistrationMode, StdioMcpConfig, StdioMcpTransport, TOOL_SEARCH_NAME,
+    BackgroundNotification, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, KitEvent, KitSession,
+    KitSessionConfig, KitToolSpec, KitTurnOrigin, McpClient, McpToolRegistrationMode,
+    SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillEnableRule, SkillSelector,
+    TOOL_SEARCH_NAME,
 };
+#[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
+use pikra_kit::{StdioMcpConfig, StdioMcpTransport};
 use pikra_schema::{int_schema, obj_schema, str_schema};
 use pikra_testkit::{FauxTransport, ScriptedHttpResponse, assert_prompt_prefix_identical};
 use serde_json::{Value, json};
@@ -412,17 +416,20 @@ fn streamable_http_mcp_client_json_and_sse_integrated_into_kit_session() {
         let llm_http = Arc::new(FauxTransport::new());
         let llm_provider = Arc::new(Client::new(llm_http.clone()));
         let session = KitSession::new(llm_provider, KitSessionConfig::new(test_model())).unwrap();
+        llm_http.enqueue_sse(openai_sse_text("m0", "Ready."));
+        session.prompt("Start.").await.unwrap();
 
         let attached = session
             .attach_mcp_client(
                 Arc::clone(&mcp_client),
-                McpToolRegistrationMode::Deferred,
+                McpToolRegistrationMode::Auto,
                 Some("mcp"),
                 CancelToken::new(),
             )
             .await
             .unwrap();
         assert_eq!(attached, vec!["mcp_lookup_weather".to_string()]);
+        assert_eq!(session.deferred_tools()[0].name, "mcp_lookup_weather");
 
         llm_http.enqueue_sse(openai_sse_tool_call(
             "m1",
@@ -449,6 +456,9 @@ fn streamable_http_mcp_client_json_and_sse_integrated_into_kit_session() {
             other => panic!("expected text, got {other:?}"),
         }
 
+        let llm_requests = llm_http.requests();
+        assert_prompt_prefix_identical(&llm_requests[0], &llm_requests[1]);
+
         // Verify MCP HTTP protocol headers (Mcp-Session-Id & MCP-Protocol-Version propagated!).
         let mcp_reqs = mcp_http.requests();
         assert_eq!(mcp_reqs.len(), 4);
@@ -469,6 +479,7 @@ fn streamable_http_mcp_client_json_and_sse_integrated_into_kit_session() {
     });
 }
 
+#[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
 #[test]
 fn stdio_mcp_transport_real_python_subprocess_integrated_into_kit_session() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -796,6 +807,10 @@ fn review_regressions_baseline_sync_compaction_guard_unpolled_stream_mcp_and_ski
             llm_provider.clone(),
             KitSessionConfig::new(test_model())
                 .with_system_prompt("Prompt A")
+                .with_skill_discovery(SkillDiscoveryConfig {
+                    include_user_skills: false,
+                    ..SkillDiscoveryConfig::default()
+                })
                 .with_skill_root(&skills_dir)
                 .with_store(store)
                 .with_codemode(true),
@@ -872,7 +887,7 @@ fn review_regressions_baseline_sync_compaction_guard_unpolled_stream_mcp_and_ski
         std::fs::remove_file(&skill_file).unwrap();
         assert!(
             session.reload_skills(),
-            "deleting last skill must enqueue an empty <available_skills> update"
+            "deleting the last skill must report a removal"
         );
 
         llm_http.enqueue_sse(openai_sse_text("b2", "Reply B"));
@@ -892,7 +907,7 @@ fn review_regressions_baseline_sync_compaction_guard_unpolled_stream_mcp_and_ski
             reqs[1]
                 .body_json
                 .to_string()
-                .contains("<available_skills>\\n</available_skills>")
+                .contains("The only-skill skill has been removed")
         );
         // Conversation history from Turn 1 preserved.
         assert!(reqs[1].body_json.to_string().contains("Reply A"));
@@ -1135,5 +1150,410 @@ fn review_regressions_baseline_sync_compaction_guard_unpolled_stream_mcp_and_ski
             json!({ "jsonrpc": "2.0", "id": "srv-ping-1", "result": {} })
         );
         assert_eq!(reqs[6].header("mcp-session-id"), Some("sess_new"));
+    });
+}
+
+#[test]
+fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
+    use pikra_session::JsonlSessionStore;
+    use std::{fs, path::Path};
+
+    let write_skill = |root: &Path, name: &str, description: &str| {
+        fs::create_dir_all(root).unwrap();
+        let path = root.join(format!("{name}.md"));
+        fs::write(
+            &path,
+            format!("---\nname: {name}\ndescription: {description}\n---\nInstructions\n"),
+        )
+        .unwrap();
+        path
+    };
+
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let repo = home.join("work/repo");
+        let cwd = repo.join("team");
+        let extra = dir.path().join("explicit-with-a-long-locatable-root");
+        let bundled = dir.path().join("bundled");
+        let keep = write_skill(&extra, "a-build", "Build the selected app");
+        let removed = write_skill(&extra, "b-release", "Publish releases");
+        write_skill(&cwd.join(".dora/skills"), "a-build", "Lower priority");
+        write_skill(&cwd.join(".agents/skills"), "local", "Local workflow");
+        write_skill(&repo.join(".agents/skills"), "project", "Project workflow");
+        write_skill(
+            &home.join("work/.agents/skills"),
+            "out-of-repo",
+            "Outside the repository",
+        );
+        write_skill(&home.join(".agents/skills"), "user", "User workflow");
+        write_skill(&bundled, "bundled", &"部署发布与运维".repeat(80));
+        let blocked = write_skill(&extra, "blocked", "Disabled by the final rule");
+        let manual = write_skill(&extra, "manual-only", "Explicit approval workflow");
+        let frontmatter_only = extra.join("frontmatter-only.md");
+        fs::write(
+            &frontmatter_only,
+            "---\ndisable-model-invocation: true\n---\nPrivate instructions",
+        )
+        .unwrap();
+        // Directory-style SKILL.md uses a dedicated openai.yaml sidecar.
+        let manual_dir = extra.join("manual");
+        fs::create_dir_all(manual_dir.join("agents")).unwrap();
+        fs::rename(manual, manual_dir.join("SKILL.md")).unwrap();
+        fs::write(
+            manual_dir.join("agents/openai.yaml"),
+            "policy:\n  allow_implicit_invocation: false # explicit only\n",
+        )
+        .unwrap();
+        fs::write(repo.join(".git"), "gitdir: checkout").unwrap();
+        #[cfg(unix)]
+        {
+            let managed = dir.path().join("managed");
+            fs::create_dir(&managed).unwrap();
+            fs::write(
+                managed.join("SKILL.md"),
+                "---\nname: managed\n---\nManaged skill",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&managed, extra.join("managed")).unwrap();
+            std::os::unix::fs::symlink(&extra, extra.join("recursive")).unwrap();
+        }
+
+        let catalog_budget = extra.to_string_lossy().len() + 420;
+        let discovery = SkillDiscoveryConfig {
+            cwd: Some(cwd),
+            project_skill_dirs: vec![".dora/skills".into()],
+            home_dir_override: Some(home),
+            bundled_roots: vec![bundled],
+            rules: vec![
+                SkillEnableRule {
+                    selector: SkillSelector::ByName("blocked".into()),
+                    enabled: true,
+                },
+                SkillEnableRule {
+                    selector: SkillSelector::ByPath(blocked),
+                    enabled: false,
+                },
+            ],
+            max_catalog_bytes: catalog_budget,
+            shorten_paths: true,
+            ..SkillDiscoveryConfig::default()
+        };
+        let isolated = SkillCatalog::discover_with_config(&SkillDiscoveryConfig {
+            walk_ancestors: false,
+            include_user_skills: false,
+            ..discovery.clone()
+        });
+        assert!(isolated.get("local").is_some());
+        assert!(isolated.get("project").is_none() && isolated.get("user").is_none());
+
+        let http = Arc::new(FauxTransport::new());
+        let provider = Arc::new(Client::new(http.clone()));
+        let config = KitSessionConfig::new(test_model())
+            .with_skill_root(&extra)
+            .with_skill_discovery(discovery)
+            .with_store(Arc::new(JsonlSessionStore::new(
+                dir.path().join("session.jsonl"),
+            )));
+        let session = KitSession::new(provider.clone(), config.clone()).unwrap();
+        let catalog = session.skills();
+        for name in ["local", "project", "user", "bundled"] {
+            assert!(catalog.get(name).is_some(), "missing scope: {name}");
+        }
+        #[cfg(unix)]
+        assert!(catalog.get("managed").is_some());
+        assert!(catalog.get("out-of-repo").is_none() && catalog.get("blocked").is_none());
+        assert_eq!(catalog.get("a-build").unwrap().file_path, keep);
+        assert_eq!(catalog.search("部署发布", 1)[0].name, "bundled");
+        let xml = catalog.format_for_context().unwrap();
+        assert!(xml.len() <= catalog_budget && xml.contains("<truncated count="));
+        assert!(xml.contains("<skill_root alias=\"r0\">") && xml.contains("r0/a-build.md"));
+        assert!(!xml.contains("bundled") && !xml.contains("manual-only"));
+
+        http.enqueue_sse(openai_sse_tool_call(
+            "ss1",
+            "search",
+            SKILL_SEARCH_NAME,
+            &json!({"query":"部署发布"}),
+        ));
+        http.enqueue_sse(openai_sse_text("ss2", "Found the bundled skill."));
+        let messages = session
+            .prompt("请用$manual-only 和 $frontmatter-only。")
+            .await
+            .unwrap();
+        assert!(messages.iter().any(|message| matches!(message,
+            pikra_agent::AgentMessage::Llm(Message::ToolResult(result))
+            if matches!(&result.content[0], ContentPart::Text(text) if text.text.contains("bundled")))));
+        let first = &http.requests()[0];
+        let wire = first.body_json.to_string();
+        for name in ["manual-only", "frontmatter-only"] {
+            assert!(wire.contains(&format!("<skill_mention name=\\\"{name}\\\"")));
+        }
+
+        // Updating a skill in place changes its revision but causes no prompt reminder.
+        fs::write(
+            &keep,
+            "---\nname: a-build\ndescription: Updated description\n---\nUpdated instructions",
+        )
+        .unwrap();
+        assert!(!session.reload_skills());
+        http.enqueue_sse(openai_sse_text("ss3", "Still here."));
+        session.prompt("Continue.").await.unwrap();
+        assert!(
+            !http.requests()[2]
+                .body_json
+                .to_string()
+                .contains("# Skills changed")
+        );
+        drop(session);
+
+        fs::remove_file(removed).unwrap();
+        write_skill(&extra, "c-new", "New workflow");
+        let session = KitSession::new(provider, config).unwrap();
+        http.enqueue_sse(openai_sse_text("ss4", "Received changes."));
+        session.prompt("What changed?").await.unwrap();
+        let requests = http.requests();
+        let diff = requests[3].body_json.to_string();
+        assert!(
+            diff.contains("# Skills changed")
+                && diff.contains("The b-release skill has been removed")
+        );
+        assert!(diff.contains("<name>c-new</name>") && !diff.contains("Updated description"));
+        for pair in requests.windows(2) {
+            assert_prompt_prefix_identical(&pair[0], &pair[1]);
+        }
+
+        http.enqueue_sse(openai_sse_text("summary", "Prior work summarized."));
+        assert!(session.compact().await.unwrap().is_some());
+        http.enqueue_sse(openai_sse_text("ss5", "Ready."));
+        session.prompt("After compaction.").await.unwrap();
+        let latest_catalog = session
+            .entries()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry.payload {
+                pikra_session::SessionEntryPayload::ContextBlock { name, text }
+                    if name == "skills" =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            latest_catalog.contains("<name>c-new</name>") && !latest_catalog.contains("b-release"),
+            "{latest_catalog}"
+        );
+    });
+}
+
+#[test]
+fn auto_tools_rank_subwords_and_propagate_delegated_progress() {
+    struct Middleware;
+    impl pikra_agent::AgentMiddleware for Middleware {}
+
+    block_on(async {
+        let http = Arc::new(FauxTransport::new());
+        let pinned = make_echo_tool("pinned", "Always available");
+        let small = make_echo_tool("small", "Fits the budget");
+        let deploy = Arc::new(ClosureTool::new(
+            ToolDefinition {
+                name: "deployProject".into(),
+                description: "部署生产服务".into(),
+                parameters: obj_schema([("deploymentTarget", int_schema(), true)]),
+            },
+            |_id, args, _cancel, progress| {
+                Box::pin(async move {
+                    let mut result = AgentToolResult::text(args["deploymentTarget"].to_string());
+                    result.details = json!({"status":"working"});
+                    progress(result.clone());
+                    result.details = json!({"status":"done"});
+                    Ok(result)
+                })
+            },
+        ));
+        let mut config = KitSessionConfig::new(test_model())
+            .with_tool(KitToolSpec::auto(small.clone()))
+            .with_tool(KitToolSpec::auto(deploy))
+            .with_resident_tool(pinned.clone())
+            .with_deferred_tool(make_echo_tool("other", "Unrelated"));
+        config.auto_defer_threshold_bytes = Some(
+            [pinned, small]
+                .iter()
+                .map(|tool| serde_json::to_vec(&tool.definition()).unwrap().len())
+                .sum(),
+        );
+        config.middlewares.push(Arc::new(Middleware));
+        let session = KitSession::new(Arc::new(Client::new(http.clone())), config).unwrap();
+        let names: Vec<_> = session
+            .resident_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "small") && names.iter().any(|name| name == "pinned")
+        );
+        assert!(!names.iter().any(|name| name == "deployProject"));
+        http.enqueue_sse(openai_sse_tool_call(
+            "tools1",
+            "search",
+            TOOL_SEARCH_NAME,
+            &json!({"query":"deploy project 部署 target","limit":1}),
+        ));
+        http.enqueue_sse(openai_sse_tool_call(
+            "tools2",
+            "delegate",
+            CALL_TOOL_NAME,
+            &json!({"name":"deployProject","arguments":{"deploymentTarget":"42"}}),
+        ));
+        http.enqueue_sse(openai_sse_text("tools3", "Deployed."));
+        let mut stream = session
+            .prompt_stream("Find and invoke the deployment tool.")
+            .unwrap();
+        let mut saw_schema = false;
+        let mut statuses = Vec::new();
+        while let Some(event) = stream.next().await {
+            let (result, name) = match event {
+                KitEvent::Agent(AgentEvent::ToolExecutionUpdate {
+                    tool_name,
+                    partial_result,
+                    ..
+                }) => (partial_result, tool_name),
+                KitEvent::Agent(AgentEvent::ToolExecutionEnd {
+                    tool_name, result, ..
+                }) => (result, tool_name),
+                _ => continue,
+            };
+            if name == TOOL_SEARCH_NAME {
+                saw_schema =
+                    result.structured_content.unwrap()["tools"][0]["name"] == "deployProject";
+            } else if name == CALL_TOOL_NAME {
+                assert_eq!(
+                    result.details["delegated_tool"],
+                    json!({"name":"deployProject","arguments":{"deploymentTarget":42}})
+                );
+                statuses.push(
+                    result.details["inner_details"]["status"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+        }
+        assert!(saw_schema);
+        assert_eq!(statuses, ["working", "done"]);
+        for pair in http.requests().windows(2) {
+            assert_prompt_prefix_identical(&pair[0], &pair[1]);
+        }
+    });
+}
+
+#[test]
+fn background_events_coalesce_and_wait_for_clean_foreground_completion() {
+    use futures_util::FutureExt;
+
+    block_on(async {
+        let http = Arc::new(FauxTransport::new());
+        let session = KitSession::new(
+            Arc::new(Client::new(http.clone())),
+            KitSessionConfig::new(test_model()),
+        )
+        .unwrap();
+        let sender = session.background_sender();
+        let send = |index| {
+            sender.send(BackgroundNotification {
+                source_id: "ci".into(),
+                kind: "monitor".into(),
+                summary: format!("Output {index}"),
+                xml_payload: format!("<monitor_event>{index}</monitor_event>"),
+                timestamp_ms: index,
+            })
+        };
+        let mut wakeups = session.subscribe_background_wakeups();
+        let gate = http.enqueue_gated_sse();
+        let mut foreground = session.prompt_stream("Foreground first.").unwrap();
+        assert_eq!(foreground.origin(), KitTurnOrigin::Foreground);
+        while !matches!(
+            Some(foreground.next().await.expect("foreground must start")),
+            Some(KitEvent::Agent(AgentEvent::AgentStart))
+        ) {}
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    send(1);
+                    send(2);
+                })
+                .join()
+                .unwrap();
+        });
+        assert!(wakeups.next().now_or_never().is_none());
+        assert!(matches!(
+            session.run_background_turn(),
+            Err(pikra_kit::KitError::Busy)
+        ));
+        assert!(session.drain_background_prompt().is_none());
+        for chunk in openai_sse_text("foreground", "Complete") {
+            assert!(gate.push_str(chunk));
+        }
+        gate.close();
+        while foreground.next().await.is_some() {}
+        assert_eq!(wakeups.next().now_or_never(), Some(Some(())));
+        assert_eq!(
+            session.subscribe_background_wakeups().next().now_or_never(),
+            Some(Some(()))
+        );
+
+        // Dropping an unpolled reservation does not discard the batch.
+        let background = session.run_background_turn().unwrap().unwrap();
+        assert_eq!(background.origin(), KitTurnOrigin::Background);
+        drop(background);
+        assert_eq!(wakeups.next().now_or_never(), Some(Some(())));
+        http.enqueue_sse(openai_sse_text("background", "Processed"));
+        let mut background = session.run_background_turn().unwrap().unwrap();
+        send(3);
+        while background.next().await.is_some() {}
+        let requests = http.requests();
+        assert_eq!(requests.len(), 2);
+        let payload = requests[1].body_json.to_string();
+        assert!(payload.contains(r"<background_events>\n<monitor_event>1</monitor_event>\n<monitor_event>2</monitor_event>\n<monitor_event>3</monitor_event>\n</background_events>"));
+        assert!(session.run_background_turn().unwrap().is_none());
+
+        http.enqueue_gated_sse();
+        let mut aborted = session.prompt_stream("Stop this turn.").unwrap();
+        while !matches!(
+            Some(aborted.next().await.expect("foreground must start")),
+            Some(KitEvent::Agent(AgentEvent::AgentStart))
+        ) {}
+        send(4);
+        session.abort().await;
+        while aborted.next().await.is_some() {}
+        assert!(session.is_background_paused() && session.run_background_turn().unwrap().is_none());
+        send(5);
+        assert!(wakeups.next().now_or_never().is_none());
+        http.enqueue_sse(openai_sse_text("resume", "New foreground turn."));
+        session.prompt("Continue from here.").await.unwrap();
+        assert_eq!(wakeups.next().now_or_never(), Some(Some(())));
+        let drained = session.drain_background_prompt().unwrap();
+        assert!(
+            drained.contains("<monitor_event>4</monitor_event>\n<monitor_event>5</monitor_event>")
+        );
+        assert!(session.run_background_turn().unwrap().is_none());
+
+        send(6);
+        assert_eq!(wakeups.next().now_or_never(), Some(Some(())));
+        http.enqueue(ScriptedHttpResponse::Error(
+            pikra_ai::TransportError::Timeout,
+        ));
+        session.prompt("A request that times out.").await.unwrap();
+        assert!(session.is_background_paused() && session.run_background_turn().unwrap().is_none());
+        assert!(wakeups.next().now_or_never().is_none());
+        session.resume_background();
+        assert_eq!(wakeups.next().now_or_never(), Some(Some(())));
+        assert!(
+            session
+                .drain_background_prompt()
+                .unwrap()
+                .contains("<monitor_event>6</monitor_event>")
+        );
     });
 }
