@@ -9,7 +9,7 @@ use crate::instructions::{
 use crate::mcp::{McpClient, McpToolRegistrationMode};
 use crate::skills::{SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillSearchTool};
 use crate::wakeup::{
-    Activity, ActivityGuard, BackgroundEventSender, BackgroundInbox, KitTurnOrigin,
+    Activity, ActivityGuard, BackgroundEventSender, BackgroundInbox, KitTurnOrigin, SharedKitDriver,
 };
 use futures_channel::mpsc;
 use futures_core::Stream;
@@ -19,8 +19,8 @@ use pikra_agent::{
     QueueMode, ToolExecutionMode,
 };
 use pikra_ai::{
-    BoxFuture, CacheRetention, CancelToken, ContentPart, Message, Model, SimpleStreamOptions,
-    StopReason, StreamProvider, ThinkingLevel, ToolDefinition, UserMessage,
+    CacheRetention, CancelToken, ContentPart, Message, Model, SimpleStreamOptions, StopReason,
+    StreamProvider, ThinkingLevel, ToolDefinition, UserMessage,
 };
 use pikra_codemode::CodemodeSandboxOptions;
 use pikra_session::{
@@ -29,8 +29,10 @@ use pikra_session::{
     baseline_to_system_message, prepare_flushed_prompt,
 };
 use serde_json::{Map, Value};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -235,9 +237,9 @@ pub enum KitEvent {
 /// Runtime-agnostic stream returned by [`KitSession::prompt_stream`].
 pub struct KitEventStream<'a> {
     rx: mpsc::UnboundedReceiver<KitEvent>,
-    driver: Option<BoxFuture<'a, Result<(), KitError>>>,
-    terminal_error: Option<String>,
+    driver: Arc<SharedKitDriver>,
     origin: KitTurnOrigin,
+    _session: PhantomData<&'a ()>,
 }
 
 impl KitEventStream<'_> {
@@ -249,45 +251,56 @@ impl KitEventStream<'_> {
 impl Stream for KitEventStream<'_> {
     type Item = KitEvent;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(ev)) = Pin::new(&mut self.rx).poll_next(cx) {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Poll::Ready(Some(ev)) = Pin::new(&mut this.rx).poll_next(cx) {
             return Poll::Ready(Some(ev));
         }
 
-        if let Some(driver) = self.driver.as_mut() {
-            match driver.as_mut().poll(cx) {
-                Poll::Ready(res) => {
-                    self.driver = None;
-                    if let Err(err) = res {
-                        self.terminal_error = Some(err.to_string());
-                    }
-                    return match Pin::new(&mut self.rx).poll_next(cx) {
-                        Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
-                        Poll::Ready(None) | Poll::Pending => {
-                            Poll::Ready(self.terminal_error.take().map(KitEvent::Error))
+        if !this.driver.completed.load(Ordering::Acquire) {
+            this.driver.stream_waker.register(cx.waker());
+            let poll_res = if let Some(mut guard) = this.driver.future.try_lock() {
+                if let Some(fut) = guard.as_mut() {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(()) => {
+                            *guard = None;
+                            this.driver.completed.store(true, Ordering::Release);
+                            Some(Poll::Ready(()))
                         }
+                        Poll::Pending => Some(Poll::Pending),
+                    }
+                } else {
+                    Some(Poll::Ready(()))
+                }
+            } else {
+                None
+            };
+
+            match poll_res {
+                Some(Poll::Ready(())) => {
+                    return match Pin::new(&mut this.rx).poll_next(cx) {
+                        Poll::Ready(item) => Poll::Ready(item),
+                        Poll::Pending => Poll::Ready(None),
                     };
                 }
-                Poll::Pending => {
-                    if let Poll::Ready(Some(ev)) = Pin::new(&mut self.rx).poll_next(cx) {
+                Some(Poll::Pending) => {
+                    if let Poll::Ready(Some(ev)) = Pin::new(&mut this.rx).poll_next(cx) {
                         return Poll::Ready(Some(ev));
                     }
                     return Poll::Pending;
                 }
-            }
-        }
-
-        match Pin::new(&mut self.rx).poll_next(cx) {
-            Poll::Ready(Some(ev)) => Poll::Ready(Some(ev)),
-            Poll::Ready(None) => Poll::Ready(self.terminal_error.take().map(KitEvent::Error)),
-            Poll::Pending => {
-                if let Some(err) = self.terminal_error.take() {
-                    Poll::Ready(Some(KitEvent::Error(err)))
-                } else {
-                    Poll::Pending
+                None => {
+                    if let Poll::Ready(Some(ev)) = Pin::new(&mut this.rx).poll_next(cx) {
+                        return Poll::Ready(Some(ev));
+                    }
+                    if !this.driver.completed.load(Ordering::Acquire) {
+                        return Poll::Pending;
+                    }
                 }
             }
         }
+
+        Pin::new(&mut this.rx).poll_next(cx)
     }
 }
 
@@ -324,7 +337,7 @@ impl ToolSchemaBudget {
 /// deferred tool gateway (`tool_search` + `call_tool`), optional `exec` codemode sandbox, and MCP.
 pub struct KitSession {
     provider: Arc<dyn StreamProvider>,
-    agent: Agent,
+    agent: Arc<Agent>,
     session: Arc<Mutex<SessionManager>>,
     /// Resident tools excluding `exec` so `CodemodeExecTool` never forms an `Arc` cycle.
     resident_tools: Arc<Mutex<Vec<Arc<dyn AgentTool>>>>,
@@ -332,12 +345,27 @@ pub struct KitSession {
     deferred_registry: Arc<DeferredToolRegistry>,
     skills: Arc<Mutex<SkillCatalog>>,
     skill_discovery: SkillDiscoveryConfig,
-    known_skills: Mutex<SkillContextState>,
+    known_skills: Arc<Mutex<SkillContextState>>,
     instructions: Mutex<InstructionContextState>,
     auto_defer_threshold_bytes: Option<usize>,
     pause_background_on_error: bool,
     inbox: BackgroundInbox,
     had_deferred_catalog: Mutex<bool>,
+    api_key: Option<String>,
+    get_api_key: Option<ApiKeyResolver>,
+    cache_retention: CacheRetention,
+    headers: Vec<(String, Option<String>)>,
+}
+
+#[derive(Clone)]
+struct KitRuntime {
+    provider: Arc<dyn StreamProvider>,
+    agent: Arc<Agent>,
+    session: Arc<Mutex<SessionManager>>,
+    deferred_registry: Arc<DeferredToolRegistry>,
+    skills: Arc<Mutex<SkillCatalog>>,
+    skill_discovery: SkillDiscoveryConfig,
+    known_skills: Arc<Mutex<SkillContextState>>,
     api_key: Option<String>,
     get_api_key: Option<ApiKeyResolver>,
     cache_retention: CacheRetention,
@@ -504,7 +532,7 @@ impl KitSession {
         agent_cfg.sampling_params = config.sampling_params;
         agent_cfg.initial_messages = reconstructed.messages;
 
-        let agent = Agent::new(Arc::clone(&provider), agent_cfg);
+        let agent = Arc::new(Agent::new(Arc::clone(&provider), agent_cfg));
 
         Ok(Self {
             provider,
@@ -515,7 +543,7 @@ impl KitSession {
             deferred_registry,
             skills,
             skill_discovery,
-            known_skills: Mutex::new(known_skills),
+            known_skills: Arc::new(Mutex::new(known_skills)),
             instructions: Mutex::new(instructions),
             auto_defer_threshold_bytes: config.auto_defer_threshold_bytes,
             pause_background_on_error: config.pause_background_on_error,
@@ -832,34 +860,56 @@ impl KitSession {
         }
         let discovered = client.list_tools(cancel).await?;
         let agent_tools = client.to_agent_tools(&discovered, name_prefix);
-        let names: Vec<String> = agent_tools.iter().map(|t| t.definition().name).collect();
 
         self.with_idle_mutation(|| {
+            let mut registered_names = Vec::new();
             let (resident, deferred): (Vec<_>, Vec<_>) = match mode {
-                McpToolRegistrationMode::Resident => (agent_tools, Vec::new()),
-                McpToolRegistrationMode::Deferred => (Vec::new(), agent_tools),
+                McpToolRegistrationMode::Resident => {
+                    registered_names = agent_tools.iter().map(|t| t.definition().name).collect();
+                    (agent_tools, Vec::new())
+                }
+                McpToolRegistrationMode::Deferred => {
+                    registered_names = agent_tools.iter().map(|t| t.definition().name).collect();
+                    (Vec::new(), agent_tools)
+                }
                 McpToolRegistrationMode::Auto => {
                     let definitions = self.agent.tool_definitions();
-                    let existing: std::collections::HashSet<_> =
-                        definitions.iter().map(|def| def.name.as_str()).collect();
+                    let existing: std::collections::HashSet<String> =
+                        definitions.iter().map(|def| def.name.clone()).collect();
+                    let (has_started, baseline_names) = {
+                        let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+                        let started = session.entries().iter().any(|entry| {
+                            matches!(entry.payload, SessionEntryPayload::Message { .. })
+                        });
+                        let baseline: std::collections::HashSet<String> = session
+                            .reconstruct_context()
+                            .tools
+                            .into_iter()
+                            .map(|def| def.name)
+                            .collect();
+                        (started, baseline)
+                    };
                     let mut budget =
                         ToolSchemaBudget::new(self.auto_defer_threshold_bytes, &definitions);
-                    let has_started = self
-                        .session
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entries()
-                        .iter()
-                        .any(|entry| matches!(entry.payload, SessionEntryPayload::Message { .. }));
-                    agent_tools
-                        .into_iter()
-                        .filter(|tool| !existing.contains(tool.definition().name.as_str()))
-                        .partition(|tool| {
-                            let definition = tool.definition();
-                            !has_started
+                    let mut res = Vec::new();
+                    let mut def = Vec::new();
+                    for tool in agent_tools {
+                        let definition = tool.definition();
+                        if existing.contains(&definition.name) {
+                            continue;
+                        }
+                        registered_names.push(definition.name.clone());
+                        if baseline_names.contains(&definition.name)
+                            || (!has_started
                                 && self.deferred_registry.get(&definition.name).is_none()
-                                && budget.admit(&definition)
-                        })
+                                && budget.admit(&definition))
+                        {
+                            res.push(tool);
+                        } else {
+                            def.push(tool);
+                        }
+                    }
+                    (res, def)
                 }
             };
             if !resident.is_empty() {
@@ -869,9 +919,8 @@ impl KitSession {
                 self.deferred_registry.upsert(deferred);
                 self.sync_deferred_tools_context();
             }
-            Ok(())
-        })?;
-        Ok(names)
+            Ok(registered_names)
+        })
     }
 
     fn attach_resident_tools(&self, tools: Vec<Arc<dyn AgentTool>>) -> Result<(), KitError> {
@@ -896,14 +945,33 @@ impl KitSession {
         }
         let mut full_tools = next_resident.clone();
         full_tools.extend(exec);
-        let definitions: Vec<_> = full_tools.iter().map(|tool| tool.definition()).collect();
+
         let prompt = self.agent.system_prompt();
-        self.session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_system_baseline(&prompt, definitions.clone())?;
-        self.agent.set_tools(full_tools)?;
-        self.sync_agent_leading_system_message(&prompt, &definitions)?;
+        {
+            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let baseline_tools = session.reconstruct_context().tools;
+            // Align tool order to persisted SystemBaseline when reopening so prompt-cache prefix stays byte-identical.
+            if !baseline_tools.is_empty() {
+                let order: std::collections::HashMap<&str, usize> = baseline_tools
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, def)| (def.name.as_str(), idx))
+                    .collect();
+                full_tools.sort_by_key(|t| {
+                    order
+                        .get(t.definition().name.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                });
+            }
+            let definitions: Vec<_> = full_tools.iter().map(|tool| tool.definition()).collect();
+            if baseline_tools != definitions {
+                session.append_system_baseline(&prompt, definitions.clone())?;
+            }
+            drop(session);
+            self.agent.set_tools(full_tools)?;
+            self.sync_agent_leading_system_message(&prompt, &definitions)?;
+        }
         *resident = next_resident;
         Ok(())
     }
@@ -938,14 +1006,31 @@ impl KitSession {
 
     /// Run manual compaction immediately while idle.
     pub async fn compact(&self) -> Result<Option<CompactionResult>, KitError> {
-        let _activity_guard = self.try_begin_activity(Activity::Compacting)?;
-        self.run_compaction_internal(false, None).await
+        let activity = self.try_begin_activity(Activity::Compacting)?;
+        let cancel = activity.cancel_token();
+        self.runtime()
+            .run_compaction_internal(false, None, cancel)
+            .await
     }
 
     // ---- Steering, Follow-Up, Abort ----
 
     pub fn steer(&self, id: impl Into<String>, text: impl Into<String>) {
         self.agent.steer(id, text);
+    }
+
+    pub async fn steer_parts(
+        &self,
+        id: impl Into<String>,
+        parts: Vec<ContentPart>,
+        is_meta: bool,
+    ) -> bool {
+        if is_meta {
+            self.agent.steer_meta_parts(id, parts);
+        } else {
+            self.agent.steer_with_parts(id, parts);
+        }
+        true
     }
 
     pub fn steer_meta(&self, id: impl Into<String>, text: impl Into<String>) {
@@ -980,12 +1065,26 @@ impl KitSession {
     /// Cancel any active run and await complete teardown so immediate subsequent calls never
     /// spuriously fail with `Busy`.
     pub async fn abort(&self) {
-        self.inbox.abort_prompt();
+        let (rx, driver) = self.inbox.begin_abort();
+        self.agent.abort_now();
+        if let Some(driver) = driver {
+            driver.drive().await;
+        }
         self.agent.abort().await;
+        if let Some(rx) = rx {
+            let _ = rx.await;
+        }
     }
 
     pub async fn wait_for_idle(&self) {
+        let (rx, driver) = self.inbox.begin_wait_for_idle();
+        if let Some(driver) = driver {
+            driver.drive().await;
+        }
         self.agent.wait_for_idle().await;
+        if let Some(rx) = rx {
+            let _ = rx.await;
+        }
     }
 
     // ---- Prompt Execution ----
@@ -1026,7 +1125,9 @@ impl KitSession {
         user_msg: AgentMessage,
     ) -> Result<Vec<AgentMessage>, KitError> {
         let activity = self.try_begin_activity(Activity::Prompt(KitTurnOrigin::Foreground))?;
-        self.drive_prompt(Some(user_msg), activity, None).await
+        self.runtime()
+            .drive_prompt(Some(user_msg), activity, None)
+            .await
     }
 
     pub fn background_sender(&self) -> BackgroundEventSender {
@@ -1094,6 +1195,22 @@ impl KitSession {
         Ok(self.start_prompt_stream(Some(Message::User(user).into()), origin, activity))
     }
 
+    fn runtime(&self) -> KitRuntime {
+        KitRuntime {
+            provider: Arc::clone(&self.provider),
+            agent: Arc::clone(&self.agent),
+            session: Arc::clone(&self.session),
+            deferred_registry: Arc::clone(&self.deferred_registry),
+            skills: Arc::clone(&self.skills),
+            skill_discovery: self.skill_discovery.clone(),
+            known_skills: Arc::clone(&self.known_skills),
+            api_key: self.api_key.clone(),
+            get_api_key: self.get_api_key.clone(),
+            cache_retention: self.cache_retention,
+            headers: self.headers.clone(),
+        }
+    }
+
     fn start_prompt_stream(
         &self,
         user_msg: Option<AgentMessage>,
@@ -1101,18 +1218,36 @@ impl KitSession {
         activity: ActivityGuard,
     ) -> KitEventStream<'_> {
         let (tx, rx) = mpsc::unbounded();
-        // Start and flush only once the stream is polled.
-        let driver: BoxFuture<'_, Result<(), KitError>> = Box::pin(async move {
-            self.drive_prompt(user_msg, activity, Some(&tx)).await?;
-            Ok(())
-        });
+        let runtime = self.runtime();
+        let driver = SharedKitDriver::new(Box::pin(async move {
+            if let Err(err) = runtime.drive_prompt(user_msg, activity, Some(&tx)).await {
+                let _ = tx.unbounded_send(KitEvent::Error(err.to_string()));
+            }
+        }));
+        self.inbox.attach_driver(&driver);
 
         KitEventStream {
             rx,
-            driver: Some(driver),
-            terminal_error: None,
+            driver,
             origin,
+            _session: PhantomData,
         }
+    }
+}
+
+impl KitRuntime {
+    fn session_id(&self) -> String {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_id()
+            .to_string()
+    }
+
+    fn reload_skills(&self) {
+        let mut skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let discovered = SkillCatalog::discover_with_config(&self.skill_discovery);
+        *skills = discovered;
     }
 
     async fn drive_prompt(
@@ -1125,6 +1260,7 @@ impl KitSession {
             return Ok(Vec::new());
         }
 
+        let cancel = activity.cancel_token();
         let origin = if user_msg.is_some() {
             KitTurnOrigin::Foreground
         } else {
@@ -1183,9 +1319,9 @@ impl KitSession {
             }
         }
         if !failed && !activity.aborted() {
-            self.run_compaction_internal(true, tx).await?;
+            self.run_compaction_internal(true, tx, cancel).await?;
         }
-        activity.complete(!failed);
+        activity.complete(!failed && !activity.aborted());
         Ok(new_messages)
     }
 
@@ -1217,7 +1353,11 @@ impl KitSession {
         Ok(prepare_flushed_prompt(flushed, user_msg))
     }
 
-    async fn resolve_compaction_options(&self, model: &Model) -> SimpleStreamOptions {
+    async fn resolve_compaction_options(
+        &self,
+        model: &Model,
+        cancel: CancelToken,
+    ) -> SimpleStreamOptions {
         let api_key = match &self.get_api_key {
             Some(resolver) => resolver(&model.provider)
                 .await
@@ -1235,7 +1375,7 @@ impl KitSession {
             session_id: Some(self.session_id()),
             headers: self.headers.clone(),
             sampling_params: Map::new(),
-            cancel: CancelToken::new(),
+            cancel,
         }
     }
 
@@ -1243,9 +1383,18 @@ impl KitSession {
         &self,
         auto_only: bool,
         stream_tx: Option<&mpsc::UnboundedSender<KitEvent>>,
+        cancel: CancelToken,
     ) -> Result<Option<CompactionResult>, KitError> {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
         let model = self.agent.model();
-        let options = self.resolve_compaction_options(&model).await;
+        let options = self
+            .resolve_compaction_options(&model, cancel.clone())
+            .await;
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
 
         let prepared = {
             let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -1267,7 +1416,17 @@ impl KitSession {
             }));
         }
 
-        let output = SessionManager::execute_prepared_compaction(&*self.provider, prepared).await?;
+        let output =
+            match SessionManager::execute_prepared_compaction(&*self.provider, prepared).await {
+                Ok(out) => {
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                    out
+                }
+                Err(_) if cancel.is_cancelled() => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
 
         let (maybe_result, reconstructed) = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());

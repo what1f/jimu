@@ -1927,3 +1927,97 @@ fn meta_context_is_delivered_and_persisted_without_visible_user_bubbles() {
         );
     });
 }
+
+#[test]
+fn review_batch2_abort_unpolled_stream_steer_parts_skills_move_and_instructions() {
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let root_a = dir.path().join("skills-a");
+        let root_b = dir.path().join("skills-b");
+        std::fs::create_dir_all(root_a.join("alpha")).unwrap();
+        std::fs::write(
+            root_a.join("alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: Alpha skill\n---\nBody\n",
+        )
+        .unwrap();
+
+        let http = Arc::new(FauxTransport::new());
+        http.enqueue_sse(openai_sse_text("r1", "first"));
+        http.enqueue_sse(openai_sse_text("r2", "after-abort"));
+        http.enqueue_sse(openai_sse_text("r3", "after-move"));
+        let provider: Arc<dyn pikra_ai::StreamProvider> = Arc::new(Client::new(http.clone()));
+
+        let mut cfg = KitSessionConfig::new(test_model())
+            .with_system_prompt("Base")
+            .with_skill_discovery(SkillDiscoveryConfig {
+                include_user_skills: false,
+                extra_roots: vec![root_a.clone(), root_b.clone()],
+                ..Default::default()
+            });
+        cfg.enable_deferred_gateway = false;
+        let session = KitSession::new(provider, cfg).unwrap();
+
+        // 1. Holding an unpolled KitEventStream and calling abort() + wait_for_idle() must release ActivityGuard.
+        let unpolled = session.prompt_stream("will abort").unwrap();
+        session.abort().await;
+        session.wait_for_idle().await;
+        // Next prompt must succeed without KitError::Busy even while `unpolled` is still in scope.
+        let reply = session.prompt("hello").await.unwrap();
+        assert!(!reply.is_empty());
+        drop(unpolled);
+
+        // 2. Multimodal steer_parts delegates cleanly.
+        assert!(
+            session
+                .steer_parts(
+                    "s-img",
+                    vec![ContentPart::Text(pikra_ai::TextContent::plain(
+                        "steered-part"
+                    ))],
+                    false,
+                )
+                .await
+        );
+        assert_eq!(session.drain_steering().len(), 1);
+        let _ = session.prompt("second").await.unwrap();
+
+        // 3. Moving a skill directory while keeping the same name emits `# Skills changed` with new path.
+        std::fs::remove_dir_all(root_a.join("alpha")).unwrap();
+        std::fs::create_dir_all(root_b.join("alpha-moved")).unwrap();
+        std::fs::write(
+            root_b.join("alpha-moved/SKILL.md"),
+            "---\nname: alpha\ndescription: Alpha skill\n---\nBody\n",
+        )
+        .unwrap();
+        session.reload_skills();
+        let _ = session.prompt("after move").await.unwrap();
+        let last_req = http.requests().last().unwrap().body_json.to_string();
+        assert!(last_req.contains("# Skills changed"), "{last_req}");
+        assert!(last_req.contains("alpha-moved"), "{last_req}");
+
+        // 4. InstructionCatalog budget boundary: exact fit + extra non-empty file sets truncated=true and no empty entry.
+        let inst_dir = dir.path().join("inst");
+        let sub_dir = inst_dir.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(inst_dir.join(".git"), "").unwrap();
+        std::fs::write(inst_dir.join("AGENTS.md"), "12345").unwrap();
+        std::fs::write(sub_dir.join("AGENTS.md"), "extra").unwrap();
+        let mut icfg = InstructionDiscoveryConfig {
+            cwd: Some(sub_dir.clone()),
+            include_user_instructions: false,
+            max_bytes: Some(5),
+            ..Default::default()
+        };
+        let cat = InstructionCatalog::discover(&icfg);
+        assert!(cat.truncated());
+        assert_eq!(cat.entries().len(), 1);
+        assert_eq!(cat.entries()[0].content, "12345");
+
+        // Multi-byte char exceeding remaining bytes must not push an empty entry.
+        std::fs::write(inst_dir.join("AGENTS.md"), "你好").unwrap();
+        icfg.max_bytes = Some(2);
+        let mb = InstructionCatalog::discover(&icfg);
+        assert!(mb.truncated());
+        assert!(mb.entries().is_empty());
+    });
+}

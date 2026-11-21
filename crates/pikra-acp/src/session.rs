@@ -5,7 +5,7 @@ use crate::{
     schema::v1 as acp,
     server::Connection,
     tools_bridge::Bridge,
-    turn::{Compaction, ModelStream, Steers, TurnSlot},
+    turn::{Compaction, ModelStream, TurnSlot},
 };
 use pikra_agent::AgentMiddleware;
 use pikra_ai::{ApiKind, CancelToken, ThinkingLevel};
@@ -25,7 +25,7 @@ use pikra_tools::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File, TryLockError},
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -324,13 +324,34 @@ pub(crate) struct Sessions {
     leased: Mutex<HashSet<String>>,
 }
 
-pub(crate) struct Lease {
+struct LeaseInner {
     server: Arc<AcpServer>,
     id: String,
+    _file_lock: Option<File>,
 }
+
+pub(crate) struct Lease {
+    inner: Mutex<Option<LeaseInner>>,
+}
+
+impl Lease {
+    pub(crate) fn release(&self) {
+        if let Some(inner) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            drop(inner._file_lock);
+            inner
+                .server
+                .sessions
+                .leased
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&inner.id);
+        }
+    }
+}
+
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.server.sessions.leased.lock().unwrap().remove(&self.id);
+        self.release();
     }
 }
 
@@ -371,18 +392,74 @@ impl Sessions {
         })
     }
 
+    fn lock_path(&self, id: &str) -> Option<PathBuf> {
+        self.directory
+            .as_ref()
+            .map(|dir| dir.join(format!("{id}.lock")))
+    }
+
+    pub(crate) fn try_lock_file(&self, id: &str) -> Result<Option<File>> {
+        let Some(path) = self.lock_path(id) else {
+            return Ok(None);
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|_| failed("Could not open the session directory."))?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|_| failed("Could not lock the session."))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => {
+                Err(failed("This session is open in another connection."))
+            }
+            Err(_) => Err(failed("Could not lock the session.")),
+        }
+    }
+
     pub(crate) fn claim(server: &Arc<AcpServer>, id: &str) -> Result<Lease> {
-        if !server.sessions.leased.lock().unwrap().insert(id.into()) {
+        if !server
+            .sessions
+            .leased
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.into())
+        {
             return Err(failed("This session is open in another connection."));
         }
+        let file_lock = match server.sessions.try_lock_file(id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                server
+                    .sessions
+                    .leased
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id);
+                return Err(error);
+            }
+        };
         Ok(Lease {
-            server: server.clone(),
-            id: id.into(),
+            inner: Mutex::new(Some(LeaseInner {
+                server: server.clone(),
+                id: id.into(),
+                _file_lock: file_lock,
+            })),
         })
     }
 
     pub(crate) fn is_open(&self, id: &str) -> bool {
-        self.leased.lock().unwrap().contains(id)
+        self.leased
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
     }
 
     pub(crate) fn get(&self, id: &str) -> Result<Arc<Record>> {
@@ -489,10 +566,13 @@ impl Sessions {
             let _ = fs::remove_file(meta);
             let _ = fs::remove_file(log);
         }
+        if let Some(lock) = self.lock_path(id) {
+            let _ = fs::remove_file(lock);
+        }
     }
 
     pub(crate) fn delete(&self, id: &str) -> Result<()> {
-        let mut records = self.records.lock().unwrap();
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         if !records.contains_key(id) {
             return Err(invalid("Unknown session."));
         }
@@ -505,6 +585,9 @@ impl Sessions {
                 records.remove(id);
                 return Err(failed("The session history file could not be removed."));
             }
+        }
+        if let Some(lock) = self.lock_path(id) {
+            let _ = fs::remove_file(lock);
         }
         records.remove(id);
         Ok(())
@@ -543,7 +626,6 @@ pub(crate) struct Session {
     pub(crate) kit: KitSession,
     pub(crate) bridge: Arc<Bridge>,
     pub(crate) turn: Arc<TurnSlot>,
-    pub(crate) steers: Arc<Steers>,
     pub(crate) compaction: Arc<Compaction>,
     pub(crate) steering: tokio::sync::Mutex<()>,
     last_steer: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -554,7 +636,7 @@ pub(crate) struct Session {
         pikra_tools::ProcessSessionManager,
         pikra_tools::MonitorManager,
     )>,
-    _lease: Arc<Lease>,
+    lease: Arc<Lease>,
 }
 
 impl Session {
@@ -577,14 +659,13 @@ impl Session {
             capabilities,
             connection.peer.clone(),
         ));
-        let steers = Arc::new(Steers::default());
         let turn = Arc::new(TurnSlot::default());
         let compaction = Arc::new(Compaction::new(bridge.clone(), turn.clone()));
         let mut model = server.auth.model(&meta.provider, &meta.model_id);
         model.api.clone_from(&meta.api);
         model.base_url.clone_from(&meta.base_url);
         let mut opts = KitSessionConfig::new(model);
-        opts.store = Some(steers.store(record.store.clone()));
+        opts.store = Some(record.store.clone());
         opts.cwd = Some(meta.cwd.to_string_lossy().into_owned());
         opts.system_prompt = cfg.system_prompt.clone().unwrap_or_default();
         opts.thinking_level = meta.thinking_level;
@@ -620,24 +701,74 @@ impl Session {
         opts.compaction_strategy = Some(compaction.clone());
         #[cfg(all(unix, not(target_os = "ios")))]
         let mut local_processes = None;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        let bg_sender: Arc<std::sync::OnceLock<pikra_kit::BackgroundEventSender>> =
+            Arc::new(std::sync::OnceLock::new());
         if cfg.enable_tools {
-            let workspace =
-                WorkspaceToolsConfig::new(&meta.cwd).with_enabled_tools(BuiltinToolSet::all());
+            let workspace = WorkspaceToolsConfig::new(&meta.cwd)
+                .with_enabled_tools(BuiltinToolSet::all())
+                .with_env_provider(Arc::new(|| {
+                    Box::pin(async {
+                        if std::env::var_os("AI_AGENT").is_none() {
+                            vec![("AI_AGENT".to_string(), "pikra".to_string())]
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                }));
             let gate = WakeGate::new();
             let mut tools = WorkspaceTools::build(workspace.clone());
             #[cfg(all(unix, not(target_os = "ios")))]
             {
                 use pikra_tools::{
-                    ExecCommandTool, MonitorManager, MonitorTool, ProcessSessionManager,
-                    WriteStdinTool,
+                    BackgroundEventCallback, BackgroundToolEvent, ExecCommandTool, MonitorManager,
+                    MonitorTool, ProcessSessionManager, WriteStdinTool,
+                    format_background_events_xml,
                 };
+                let bg_slot = Arc::clone(&bg_sender);
+                let bg_callback: BackgroundEventCallback = Arc::new(move |event| {
+                    let Some(sender) = bg_slot.get() else {
+                        return;
+                    };
+                    let (source_id, kind, summary) = match &event {
+                        BackgroundToolEvent::MonitorLines { id, name, .. } => (
+                            id.clone(),
+                            "monitor_lines".to_string(),
+                            format!("Monitor {name} produced output"),
+                        ),
+                        BackgroundToolEvent::MonitorExited { id, name, .. } => (
+                            id.clone(),
+                            "monitor_exited".to_string(),
+                            format!("Monitor {name} exited"),
+                        ),
+                        BackgroundToolEvent::ShellExited {
+                            session_id,
+                            command,
+                            ..
+                        } => (
+                            session_id.to_string(),
+                            "shell_exited".to_string(),
+                            format!("Shell command exited: {command}"),
+                        ),
+                    };
+                    let xml_payload = format_background_events_xml(&[event]);
+                    sender.send(pikra_kit::BackgroundNotification {
+                        source_id,
+                        kind,
+                        summary,
+                        xml_payload,
+                        timestamp_ms: now_ms(),
+                    });
+                });
                 let workspace = Arc::new(workspace);
-                let processes = ProcessSessionManager::new(workspace.clone(), gate.clone(), None);
-                let monitors = MonitorManager::new(workspace, gate.clone(), None);
+                let processes = ProcessSessionManager::new(
+                    workspace.clone(),
+                    gate.clone(),
+                    Some(bg_callback.clone()),
+                );
+                let monitors = MonitorManager::new(workspace, gate.clone(), Some(bg_callback));
                 tools.push(Arc::new(ExecCommandTool::new(processes.clone())));
-                if !bridge.capabilities.terminal {
-                    tools.push(Arc::new(WriteStdinTool::new(processes.clone())));
-                }
+                tools.push(Arc::new(WriteStdinTool::new(processes.clone())));
                 tools.push(Arc::new(MonitorTool::new(monitors.clone())));
                 local_processes = Some((processes, monitors));
             }
@@ -683,17 +814,17 @@ impl Session {
             server,
             &bridge,
             turn.clone(),
-            steers.clone(),
             compaction.clone(),
         ));
         let kit = KitSession::new(model_stream, opts)
             .map_err(|_| failed("Could not open the session."))?;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        let _ = bg_sender.set(kit.background_sender());
         let mut session = Self {
             record,
             kit,
             bridge,
             turn,
-            steers,
             compaction,
             steering: tokio::sync::Mutex::new(()),
             last_steer: Mutex::default(),
@@ -701,25 +832,29 @@ impl Session {
             mcp: Vec::new(),
             #[cfg(all(unix, not(target_os = "ios")))]
             local_processes,
-            _lease: lease,
+            lease,
         };
-        let mut names = HashSet::new();
-        let result = session.attach_mcp(server, &mut names, cancel).await;
-        if let Err(error) = result {
+        let setup = async {
+            let mut names = HashSet::new();
+            session.attach_mcp(server, &mut names, cancel).await?;
+            if session.kit.thinking_level() != meta.thinking_level {
+                session
+                    .kit
+                    .set_thinking_level(meta.thinking_level)
+                    .map_err(|_| failed("Could not set the thinking level."))?;
+            }
+            if session.kit.fast() != meta.fast {
+                session
+                    .kit
+                    .set_fast(meta.fast)
+                    .map_err(|_| failed("Could not set the speed."))?;
+            }
+            Ok::<(), acp::Error>(())
+        }
+        .await;
+        if let Err(error) = setup {
             session.shutdown().await;
             return Err(error);
-        }
-        if session.kit.thinking_level() != meta.thinking_level {
-            session
-                .kit
-                .set_thinking_level(meta.thinking_level)
-                .map_err(|_| failed("Could not set the thinking level."))?;
-        }
-        if session.kit.fast() != meta.fast {
-            session
-                .kit
-                .set_fast(meta.fast)
-                .map_err(|_| failed("Could not set the speed."))?;
         }
         Ok(session)
     }
@@ -730,34 +865,18 @@ impl Session {
         names: &mut HashSet<String>,
         cancel: &CancelToken,
     ) -> Result<()> {
+        // Pre-validate all descriptors and normalized prefixes BEFORE spawning any stdio child processes.
+        let mut validated = Vec::with_capacity(self.mcp_config.len());
         for descriptor in &self.mcp_config {
-            if cancel.is_cancelled() || self.bridge.peer.closed.is_cancelled() {
-                return Err(acp::Error::request_cancelled());
-            }
-            let (client, name) = match descriptor {
+            let name = match descriptor {
                 acp::McpServer::Stdio(spec) => {
-                    let mut config = StdioMcpConfig::new(
-                        spec.command
-                            .to_str()
-                            .ok_or_else(|| invalid("Invalid MCP command path."))?,
-                    );
-                    config.args.clone_from(&spec.args);
-                    config.env = spec
-                        .env
-                        .iter()
-                        .map(|env| (env.name.clone(), env.value.clone()))
-                        .collect();
-                    config.cwd = Some(self.bridge.cwd.clone());
-                    (
-                        McpClient::new(Arc::new(
-                            StdioMcpTransport::spawn(config)
-                                .map_err(|_| failed("Could not start an MCP server."))?,
-                        )),
-                        &spec.name,
-                    )
+                    if spec.command.to_str().is_none() {
+                        return Err(invalid("Invalid MCP command path."));
+                    }
+                    &spec.name
                 }
                 acp::McpServer::Http(spec) => {
-                    let url = url::Url::parse(&spec.url)
+                    url::Url::parse(&spec.url)
                         .ok()
                         .filter(|url| {
                             matches!(url.scheme(), "http" | "https")
@@ -766,15 +885,7 @@ impl Session {
                                 && url.password().is_none()
                         })
                         .ok_or_else(|| invalid("Invalid MCP server URL."))?;
-                    let headers = spec
-                        .headers
-                        .iter()
-                        .map(|header| (header.name.clone(), header.value.clone()))
-                        .collect();
-                    (
-                        McpClient::with_http(server.transport.clone(), url.as_str(), headers),
-                        &spec.name,
-                    )
+                    &spec.name
                 }
                 _ => return Err(invalid("Unsupported MCP transport.")),
             };
@@ -791,6 +902,42 @@ impl Session {
             if prefix.is_empty() || !names.insert(prefix.clone()) {
                 return Err(invalid("MCP server names must be unique."));
             }
+            validated.push((descriptor.clone(), prefix));
+        }
+
+        for (descriptor, prefix) in validated {
+            if cancel.is_cancelled() || self.bridge.peer.closed.is_cancelled() {
+                return Err(acp::Error::request_cancelled());
+            }
+            let client = match &descriptor {
+                acp::McpServer::Stdio(spec) => {
+                    let mut config = StdioMcpConfig::new(
+                        spec.command
+                            .to_str()
+                            .ok_or_else(|| invalid("Invalid MCP command path."))?,
+                    );
+                    config.args.clone_from(&spec.args);
+                    config.env = spec
+                        .env
+                        .iter()
+                        .map(|env| (env.name.clone(), env.value.clone()))
+                        .collect();
+                    config.cwd = Some(self.bridge.cwd.clone());
+                    McpClient::new(Arc::new(
+                        StdioMcpTransport::spawn(config)
+                            .map_err(|_| failed("Could not start an MCP server."))?,
+                    ))
+                }
+                acp::McpServer::Http(spec) => {
+                    let headers = spec
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect();
+                    McpClient::with_http(server.transport.clone(), spec.url.as_str(), headers)
+                }
+                _ => return Err(invalid("Unsupported MCP transport.")),
+            };
             let client = Arc::new(client);
             self.mcp.push(client.clone());
             let setup = async {
@@ -822,16 +969,24 @@ impl Session {
 
     pub(crate) fn order_steering(&self) -> SteeringOrder {
         let (done, next) = tokio::sync::oneshot::channel();
-        let previous = self.last_steer.lock().unwrap().replace(next);
+        let previous = self
+            .last_steer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(next);
         (previous, done)
     }
 
     pub(crate) fn metadata(&self) -> Metadata {
-        self.record.metadata.lock().unwrap().clone()
+        self.record
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn lease(&self) -> Arc<Lease> {
-        self._lease.clone()
+        self.lease.clone()
     }
 
     pub(crate) fn cancel(&self) {
@@ -851,6 +1006,11 @@ impl Session {
         for client in &self.mcp {
             let _ = client.close().await;
         }
+    }
+
+    pub(crate) async fn close(&self) {
+        self.shutdown().await;
+        self.lease.release();
     }
 
     pub(crate) fn apply_metadata(&self, server: &AcpServer, next: &Metadata) -> Result<()> {
@@ -900,24 +1060,38 @@ impl Session {
         base: Option<&str>,
     ) -> Result<()> {
         let Some(prompt) = prompt else { return Ok(()) };
-        let mut text = String::new();
-        if prompt.mode == acp::SystemPromptMode::Append {
-            text.push_str(base.unwrap_or_default());
-        } else if prompt.mode != acp::SystemPromptMode::Override {
+        if !matches!(
+            prompt.mode,
+            acp::SystemPromptMode::Append | acp::SystemPromptMode::Override
+        ) {
             return Err(invalid("Unsupported system prompt mode."));
         }
+        let mut extra = String::new();
         for item in prompt.content {
             let acp::ContentBlock::Text(part) = item else {
                 return Err(invalid("System instructions must be text."));
             };
-            if !text.is_empty() {
-                text.push_str("\n\n");
+            if !extra.is_empty() {
+                extra.push_str("\n\n");
             }
-            text.push_str(&part.text);
+            extra.push_str(&part.text);
         }
-        if text != self.kit.system_prompt() {
+        let full = if prompt.mode == acp::SystemPromptMode::Append {
+            let base_text = base.unwrap_or_default();
+            if base_text.is_empty() {
+                extra.clone()
+            } else if extra.is_empty() {
+                base_text.to_string()
+            } else {
+                format!("{base_text}\n\n{extra}")
+            }
+        } else {
+            extra.clone()
+        };
+        if full != self.kit.system_prompt() {
             // A newly opened session can set its baseline. Later append instructions stay at
-            // the tail so a load never rewrites the established model request prefix.
+            // the tail so a load/fork never rewrites the established model request prefix or
+            // duplicates the base prompt.
             if self.kit.entries().iter().any(|entry| {
                 matches!(
                     entry.payload,
@@ -929,10 +1103,12 @@ impl Session {
                         "Start a new session to replace its system instructions.",
                     ));
                 }
-                self.kit.set_context("client_instructions", text);
+                if !extra.is_empty() {
+                    self.kit.set_context("client_instructions", extra);
+                }
             } else {
                 self.kit
-                    .set_system_prompt(text)
+                    .set_system_prompt(full)
                     .map_err(|_| failed("Could not apply the system instructions."))?;
             }
         }

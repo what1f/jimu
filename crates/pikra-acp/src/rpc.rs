@@ -77,7 +77,10 @@ impl Peer {
         }
         let id = json!(format!("pikra-{}", Uuid::new_v4()));
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id.clone(), tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), tx);
         let _pending = PendingRequest {
             peer: self,
             id: id.clone(),
@@ -85,9 +88,9 @@ impl Peer {
         self.send(json!({"jsonrpc":"2.0", "id":id, "method":method, "params":payload}));
         let response = tokio::select! {
             biased;
-            response = rx => response.map_err(|_| acp::Error::request_cancelled())?,
             () = self.closed.cancelled() => Err(acp::Error::request_cancelled()),
             () = cancel.cancelled() => Err(acp::Error::request_cancelled()),
+            response = rx => response.map_err(|_| acp::Error::request_cancelled())?,
             () = tokio::time::sleep(timeout) => Err(acp::Error::new(CLIENT_TIMEOUT, "The client did not respond in time.")),
         }?;
         params(response)
@@ -102,7 +105,12 @@ impl Peer {
 
     fn response(&self, value: &Value) {
         let Some(id) = value.get("id") else { return };
-        if let Some(tx) = self.pending.lock().unwrap().remove(id) {
+        if let Some(tx) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
             let result = match (value.get("result"), value.get("error")) {
                 (Some(result), None) => Ok(result.clone()),
                 (None, Some(error)) => {
@@ -128,7 +136,13 @@ struct PendingRequest<'a> {
 }
 impl Drop for PendingRequest<'_> {
     fn drop(&mut self) {
-        if self.peer.pending.lock().unwrap().remove(&self.id).is_some()
+        if self
+            .peer
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id)
+            .is_some()
             && !self.peer.closed.is_cancelled()
         {
             self.peer
@@ -195,14 +209,17 @@ fn classify(conn: &Connection, requests: &Requests, value: Value) -> Option<Job>
         match method {
             "$/cancel_request" => {
                 if let Some(target) = payload.get("requestId").or_else(|| payload.get("id"))
-                    && let Some(request) = requests.lock().unwrap().get(target)
+                    && let Some(request) = requests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(target)
                 {
                     request.cancel.cancel();
                 }
             }
             "session/cancel" => {
                 if let Some(session) = payload.get("sessionId").and_then(Value::as_str) {
-                    for request in requests.lock().unwrap().values() {
+                    for request in requests.lock().unwrap_or_else(|e| e.into_inner()).values() {
                         if request.prompt_session.as_deref() == Some(session) {
                             request.session_cancel.cancel();
                         }
@@ -222,7 +239,7 @@ fn classify(conn: &Connection, requests: &Requests, value: Value) -> Option<Job>
             .flatten(),
     });
     {
-        let mut requests = requests.lock().unwrap();
+        let mut requests = requests.lock().unwrap_or_else(|e| e.into_inner());
         if requests.contains_key(id) {
             return error();
         }
@@ -279,12 +296,15 @@ async fn execute(
             .await
     };
     let mut result = {
-        let mut requests = requests.lock().unwrap();
+        let mut requests = requests.lock().unwrap_or_else(|e| e.into_inner());
         requests.remove(&id);
-        if request.cancel.is_cancelled() {
-            Err(acp::Error::request_cancelled())
-        } else {
-            result
+        match result {
+            // Never overwrite an already-completed Ok response (e.g. session/new or session/fork)
+            // with request_cancelled, or the client would never receive the sessionId while the
+            // server leaks the live session and MCP child processes.
+            Ok(value) => Ok(value),
+            Err(_) if request.cancel.is_cancelled() => Err(acp::Error::request_cancelled()),
+            Err(error) => Err(error),
         }
     };
     let after = result

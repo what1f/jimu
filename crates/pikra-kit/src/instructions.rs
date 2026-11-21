@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 pub const INSTRUCTIONS_CONTEXT_NAME: &str = "instructions";
 pub const DEFAULT_INSTRUCTION_MAX_BYTES: usize = 32 * 1024;
+const UNBOUNDED_FILE_READ_CAP: usize = 16 * 1024 * 1024;
+const BOUNDED_FILE_READ_CAP: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,7 +182,28 @@ impl InstructionCatalog {
             if !seen_paths.insert(canonical_or_self(&path)) {
                 continue;
             }
-            let Ok(bytes) = fs::read(&path) else { continue };
+            let read_cap = match remaining {
+                Some(limit) => limit
+                    .saturating_mul(2)
+                    .saturating_add(4096)
+                    .min(BOUNDED_FILE_READ_CAP),
+                None => UNBOUNDED_FILE_READ_CAP,
+            };
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if file
+                .take(read_cap.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                continue;
+            }
+            let read_truncated = bytes.len() > read_cap;
+            if read_truncated {
+                bytes.truncate(read_cap);
+            }
             let text = String::from_utf8_lossy(&bytes);
             let mut content = text
                 .strip_prefix('\u{feff}')
@@ -187,17 +211,28 @@ impl InstructionCatalog {
                 .replace("\r\n", "\n");
             let trimmed = content.trim();
             if trimmed.is_empty()
-                || (config.deduplicate_identical_content
+                || (!read_truncated
+                    && config.deduplicate_identical_content
                     && !seen_content.insert(trimmed.to_owned()))
             {
                 continue;
             }
 
-            let truncated = remaining.is_some_and(|limit| content.len() > limit);
+            if remaining == Some(0) {
+                catalog.truncated = true;
+                break;
+            }
+
+            let truncated = read_truncated || remaining.is_some_and(|limit| content.len() > limit);
             if let Some(limit) = &mut remaining {
                 if truncated {
-                    content.truncate(content.floor_char_boundary(*limit));
+                    let cut = content.floor_char_boundary(*limit);
+                    content.truncate(cut);
                     *limit = 0;
+                    if content.is_empty() {
+                        catalog.truncated = true;
+                        break;
+                    }
                 } else {
                     *limit -= content.len();
                 }
@@ -209,9 +244,6 @@ impl InstructionCatalog {
                 truncated,
             });
             catalog.truncated |= truncated;
-            if remaining == Some(0) {
-                break;
-            }
         }
         catalog
     }
@@ -306,7 +338,7 @@ impl InstructionContextState {
         if self.config.is_none() {
             return;
         }
-        self.had_instructions_context |= branch
+        self.had_instructions_context = branch
             .all_branch_context_blocks
             .contains_key(INSTRUCTIONS_CONTEXT_NAME);
         self.sync_context(session);

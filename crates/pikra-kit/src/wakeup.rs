@@ -1,5 +1,43 @@
-use futures_channel::mpsc;
-use std::sync::{Arc, Mutex};
+use futures_channel::{mpsc, oneshot};
+use futures_util::lock::Mutex as AsyncMutex;
+use futures_util::task::AtomicWaker;
+use pikra_ai::{BoxFuture, CancelToken};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+
+pub(crate) struct SharedKitDriver {
+    pub(crate) future: AsyncMutex<Option<BoxFuture<'static, ()>>>,
+    pub(crate) stream_waker: AtomicWaker,
+    pub(crate) completed: AtomicBool,
+}
+
+struct WakeOnDrop<'a>(&'a AtomicWaker);
+
+impl Drop for WakeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.wake();
+    }
+}
+
+impl SharedKitDriver {
+    pub(crate) fn new(future: BoxFuture<'static, ()>) -> Arc<Self> {
+        Arc::new(Self {
+            future: AsyncMutex::new(Some(future)),
+            stream_waker: AtomicWaker::new(),
+            completed: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) async fn drive(&self) {
+        let _wake = WakeOnDrop(&self.stream_waker);
+        let mut guard = self.future.lock().await;
+        if let Some(fut) = guard.as_mut() {
+            fut.as_mut().await;
+            *guard = None;
+            self.completed.store(true, Ordering::Release);
+        }
+    }
+}
 
 /// A background event supplied by the host. The XML payload is sent as provided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +66,9 @@ pub(crate) enum Activity {
 struct InboxState {
     active: Option<Activity>,
     aborted: bool,
+    active_cancel: Option<CancelToken>,
+    active_driver: Option<Weak<SharedKitDriver>>,
+    idle_waiters: Vec<oneshot::Sender<()>>,
     paused: bool,
     pending: Vec<BackgroundNotification>,
     subscribers: Vec<mpsc::UnboundedSender<()>>,
@@ -135,10 +176,14 @@ impl BackgroundInbox {
         if activity == Activity::Prompt(KitTurnOrigin::Background) && !state.ready() {
             return Ok(None);
         }
+        let cancel = CancelToken::new();
         state.active = Some(activity);
         state.aborted = false;
+        state.active_cancel = Some(cancel.clone());
+        state.active_driver = None;
         Ok(Some(ActivityGuard {
             state: Arc::clone(&self.state),
+            cancel,
             pause_on_error,
             outcome: None,
             started: false,
@@ -146,16 +191,59 @@ impl BackgroundInbox {
         }))
     }
 
+    pub(crate) fn attach_driver(&self, driver: &Arc<SharedKitDriver>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.active.is_some() {
+            state.active_driver = Some(Arc::downgrade(driver));
+        }
+    }
+
     pub(crate) fn abort_prompt(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(state.active, Some(Activity::Prompt(_))) {
+        if state.active.is_some() {
             state.aborted = true;
+            if let Some(cancel) = &state.active_cancel {
+                cancel.cancel();
+            }
+        }
+    }
+
+    pub(crate) fn begin_abort(
+        &self,
+    ) -> (Option<oneshot::Receiver<()>>, Option<Arc<SharedKitDriver>>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.active.is_some() {
+            state.aborted = true;
+            if let Some(cancel) = &state.active_cancel {
+                cancel.cancel();
+            }
+            let (tx, rx) = oneshot::channel();
+            state.idle_waiters.push(tx);
+            let driver = state.active_driver.as_ref().and_then(Weak::upgrade);
+            (Some(rx), driver)
+        } else {
+            (None, None)
+        }
+    }
+
+    pub(crate) fn begin_wait_for_idle(
+        &self,
+    ) -> (Option<oneshot::Receiver<()>>, Option<Arc<SharedKitDriver>>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.active.is_some() {
+            let (tx, rx) = oneshot::channel();
+            state.idle_waiters.push(tx);
+            let driver = state.active_driver.as_ref().and_then(Weak::upgrade);
+            (Some(rx), driver)
+        } else {
+            (None, None)
         }
     }
 }
 
 pub(crate) struct ActivityGuard {
     state: Arc<Mutex<InboxState>>,
+    cancel: CancelToken,
     pause_on_error: bool,
     outcome: Option<bool>,
     started: bool,
@@ -174,8 +262,12 @@ impl ActivityGuard {
         None
     }
 
+    pub(crate) fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
     pub(crate) fn aborted(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).aborted
+        self.cancel.is_cancelled() || self.state.lock().unwrap_or_else(|e| e.into_inner()).aborted
     }
 
     pub(crate) fn delivered(&mut self) {
@@ -189,22 +281,30 @@ impl ActivityGuard {
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.batch.is_empty() {
-            self.batch.append(&mut state.pending);
-            state.pending = std::mem::take(&mut self.batch);
-        }
-        if matches!(state.active, Some(Activity::Prompt(_))) {
-            if self.pause_on_error
-                && (state.aborted || (self.started && self.outcome != Some(true)))
-            {
-                state.paused = true;
-            } else if self.outcome == Some(true) {
-                state.paused = false;
+        let waiters = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.batch.is_empty() {
+                self.batch.append(&mut state.pending);
+                state.pending = std::mem::take(&mut self.batch);
             }
+            if matches!(state.active, Some(Activity::Prompt(_))) {
+                if self.pause_on_error
+                    && (state.aborted || (self.started && self.outcome != Some(true)))
+                {
+                    state.paused = true;
+                } else if self.outcome == Some(true) {
+                    state.paused = false;
+                }
+            }
+            state.active = None;
+            state.active_cancel = None;
+            state.active_driver = None;
+            state.notify_if_ready(false);
+            std::mem::take(&mut state.idle_waiters)
+        };
+        for tx in waiters {
+            let _ = tx.send(());
         }
-        state.active = None;
-        state.notify_if_ready(false);
     }
 }
 

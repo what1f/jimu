@@ -658,3 +658,65 @@ fn review_regressions_baseline_update_flush_retry_output_tokens_and_oversized_tu
         prepared.input.first_kept_entry_id
     );
 }
+
+#[test]
+fn review_batch2_named_context_dedup_and_ephemeral_ordering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("batch2.jsonl");
+    let store = Arc::new(JsonlSessionStore::new(&path));
+    let mut mgr = SessionManager::open(store.clone(), SessionConfig::new("Base", vec![])).unwrap();
+
+    // Persistent set_context("context", ...) must deduplicate across flush, reopen, and fork.
+    assert!(mgr.set_context("context", "persistent-v1"));
+    mgr.append_meta("meta-A");
+    mgr.append_named_context("note", "ctx-B");
+    mgr.append_meta("meta-C");
+
+    let flushed = mgr.flush_pending_context().unwrap();
+    assert_eq!(flushed.len(), 4);
+    assert!(matches!(
+        &flushed[0].payload,
+        SessionEntryPayload::ContextBlock { name, text, ephemeral: false }
+            if name == "context" && text == "persistent-v1"
+    ));
+    let user_text = |u: &UserMessage| -> String {
+        u.content
+            .iter()
+            .filter_map(|p| match p {
+                pikra_ai::ContentPart::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    assert!(matches!(
+        &flushed[1].payload,
+        SessionEntryPayload::Message { message: AgentMessage::Llm(Message::User(u)) }
+            if u.is_meta && user_text(u) == "meta-A"
+    ));
+    assert!(matches!(
+        &flushed[2].payload,
+        SessionEntryPayload::ContextBlock { name, text, ephemeral: true }
+            if name == "note" && text == "ctx-B"
+    ));
+    assert!(matches!(
+        &flushed[3].payload,
+        SessionEntryPayload::Message { message: AgentMessage::Llm(Message::User(u)) }
+            if u.is_meta && user_text(u) == "meta-C"
+    ));
+
+    // Reopen: persistent "context" must be recognized as already active and deduplicated.
+    let mut reopened = SessionManager::open(store, SessionConfig::new("Base", vec![])).unwrap();
+    assert!(
+        !reopened.set_context("context", "persistent-v1"),
+        "reopened persistent 'context' must deduplicate"
+    );
+    assert!(reopened.set_context("context", "persistent-v2"));
+    let second = reopened.flush_pending_context().unwrap();
+    assert_eq!(second.len(), 1);
+    reopened.fork(&flushed[0].id).unwrap();
+    assert!(
+        !reopened.set_context("context", "persistent-v1"),
+        "forked branch with persistent 'context' must deduplicate"
+    );
+}

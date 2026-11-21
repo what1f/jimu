@@ -186,7 +186,16 @@ pub(crate) async fn apply(
     }
     let mut applied: Vec<&Change> = Vec::new();
     for change in changes {
-        if let Err(error) = write_change(bridge, change, change.after.as_deref(), cancel).await {
+        let step_result = if cancel.is_cancelled() {
+            Err("Operation cancelled.".into())
+        } else if write_target(&change.path) != change.target
+            || original(bridge, &change.path, cancel).await? != change.before
+        {
+            Err("The file changed while the edit was pending. Read it and try again.".into())
+        } else {
+            write_change(bridge, change, change.after.as_deref(), cancel).await
+        };
+        if let Err(error) = step_result {
             let undo = CancelToken::new();
             let mut restored = true;
             for prior in applied.into_iter().rev() {
@@ -264,8 +273,13 @@ async fn original(
     path: &Path,
     cancel: &CancelToken,
 ) -> Result<Option<String>, String> {
-    if let Some(text) = bridge.read_ide(path, None, None, cancel).await {
-        return Ok(Some(text));
+    if let Some(result) = bridge.read_ide(path, None, None, cancel).await {
+        return match result {
+            Ok(text) => Ok(Some(text)),
+            Err(err) if err.code == acp::ErrorCode::ResourceNotFound => Ok(None),
+            Err(_) if cancel.is_cancelled() => Err("Operation cancelled.".into()),
+            Err(err) => Err(err.message),
+        };
     }
     let target = write_target(path);
     read_disk(target.as_deref().unwrap_or(path)).await

@@ -1265,3 +1265,81 @@ fn durable_meta_survives_restart_and_preserves_context_deduplication() {
         assert!(!body.contains("is_meta") && !body.contains("isMeta"));
     });
 }
+
+#[test]
+fn review_batch2_compaction_preserves_persistent_named_context_only() {
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("durable_compact_ctx.sqlite");
+        let http = Arc::new(FauxTransport::new());
+        http.enqueue_sse(sse_text_response("r1", "ok 1", 40, 10));
+        http.enqueue_sse(sse_text_response("r2", "ok 2", 40, 10));
+        http.enqueue_sse(sse_text_response("r3", "Compacted summary.", 40, 10));
+        http.enqueue_sse(sse_text_response("r4", "post-compact ok", 40, 10));
+
+        let store = Arc::new(SqliteDurableStore::open(&path).unwrap());
+        let compaction = CompactionConfig {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        let engine =
+            DurableEngine::new(store, provider_for(http.clone())).with_compaction(compaction);
+        engine
+            .create_conversation("compact-ctx", test_model(128_000, 4_096), "System")
+            .unwrap();
+
+        assert!(
+            engine
+                .set_context("compact-ctx", "env", "persist-env-v1")
+                .await
+                .unwrap()
+        );
+        engine
+            .append_context("compact-ctx", "oneoff", "ephemeral-only")
+            .await
+            .unwrap();
+        engine.submit("compact-ctx", "s1", "turn 1").await.unwrap();
+        engine
+            .submit("compact-ctx", "s2", "x".repeat(4000))
+            .await
+            .unwrap();
+
+        let compacted = engine.compact("compact-ctx").await.unwrap();
+        assert!(compacted.is_some());
+
+        let recon = engine.reconstruct_context("compact-ctx").unwrap();
+        assert_eq!(
+            recon.visible_context_blocks.get("env").map(String::as_str),
+            Some("persist-env-v1"),
+            "persistent named context must be restored right after compaction"
+        );
+        assert!(
+            !recon.visible_context_blocks.contains_key("oneoff"),
+            "ephemeral context must not be replayed across compaction"
+        );
+        let texts: Vec<String> = recon
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                pikra_agent::AgentMessage::Llm(Message::User(u)) => Some(
+                    u.content
+                        .iter()
+                        .filter_map(|p| match p {
+                            pikra_ai::ContentPart::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("persist-env-v1")));
+        assert!(!texts.iter().any(|t| t.contains("ephemeral-only")));
+
+        engine.submit("compact-ctx", "s3", "turn 3").await.unwrap();
+        let last_req = http.requests().last().unwrap().body_json.to_string();
+        assert!(last_req.contains("persist-env-v1"));
+        assert!(!last_req.contains("ephemeral-only"));
+    });
+}

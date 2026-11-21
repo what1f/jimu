@@ -18,20 +18,22 @@ use pikra_codemode::CodemodeSandboxOptions;
 use pikra_http::ReqwestTransport;
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
-    CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool, DeferredToolRegistry, InstructionContextState,
-    InstructionDiscoveryConfig, SkillCatalog, SkillDiscoveryConfig,
+    BackgroundInbox, BackgroundNotification, CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool,
+    DeferredToolRegistry, InstructionContextState, InstructionDiscoveryConfig, SKILL_SEARCH_NAME,
+    SkillCatalog, SkillDiscoveryConfig, SkillSearchTool,
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
     SessionEntryPayload, SessionEvent, SessionManager, SessionStore, prepare_flushed_prompt,
 };
+#[cfg(all(unix, not(target_os = "ios")))]
+use pikra_tools::{
+    BackgroundEventCallback, BackgroundToolEvent, ExecCommandTool, MonitorManager, MonitorTool,
+    ProcessSessionManager, WriteStdinTool, format_background_events_xml,
+};
 use pikra_tools::{
     BuiltinToolSet, SleepTool, WakeGate, WebFetchConfig, WebFetchTool, WorkspaceTools,
     WorkspaceToolsConfig,
-};
-#[cfg(all(unix, not(target_os = "ios")))]
-use pikra_tools::{
-    ExecCommandTool, MonitorManager, MonitorTool, ProcessSessionManager, WriteStdinTool,
 };
 use serde_json::{Map, json};
 use std::collections::VecDeque;
@@ -265,22 +267,26 @@ struct SessionRuntimeState {
     instructions: InstructionContextState,
     session: Arc<Mutex<SessionManager>>,
     agent: Arc<Agent>,
+    inbox: Arc<BackgroundInbox>,
     session_file: Option<PathBuf>,
 }
 
 pub struct RpcRuntime {
+    transport: Arc<ReqwestTransport>,
     provider: Arc<dyn StreamProvider>,
     api_key_resolver: ApiKeyResolver,
     models: Mutex<Vec<Model>>,
     cwd: PathBuf,
     base_system_prompt: String,
+    no_tools: bool,
+    enable_codemode: bool,
     resident_tools: Arc<Mutex<Vec<Arc<dyn AgentTool>>>>,
     deferred_registry: Arc<DeferredToolRegistry>,
     js_runtime: Option<Arc<JsExtensionRuntime>>,
     skill_discovery: SkillDiscoveryConfig,
     instruction_discovery: InstructionDiscoveryConfig,
     #[cfg(all(unix, not(target_os = "ios")))]
-    background_tools: Option<(ProcessSessionManager, MonitorManager)>,
+    background_tools: Mutex<Option<(ProcessSessionManager, MonitorManager)>>,
     no_session: bool,
     compaction_config: Mutex<CompactionConfig>,
     state: Mutex<SessionRuntimeState>,
@@ -291,6 +297,136 @@ pub struct RpcRuntime {
     is_compacting: Arc<AtomicBool>,
     compaction_cancel: Arc<Mutex<Option<CancelToken>>>,
     writer: JsonlWriter,
+}
+
+struct BuiltSessionTools {
+    resident: Vec<Arc<dyn AgentTool>>,
+    #[cfg(all(unix, not(target_os = "ios")))]
+    background_tools: Option<(ProcessSessionManager, MonitorManager)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_session_tools(
+    cwd: &PathBuf,
+    transport: &Arc<ReqwestTransport>,
+    no_tools: bool,
+    enable_codemode: bool,
+    js_runtime: Option<&Arc<JsExtensionRuntime>>,
+    deferred_registry: &Arc<DeferredToolRegistry>,
+    skills: &Arc<Mutex<SkillCatalog>>,
+    skill_discovery: &SkillDiscoveryConfig,
+    inbox: &BackgroundInbox,
+) -> BuiltSessionTools {
+    let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
+    #[cfg(all(unix, not(target_os = "ios")))]
+    let mut background_tools = None;
+
+    if !no_tools {
+        let workspace = WorkspaceToolsConfig::new(cwd)
+            .with_enabled_tools(BuiltinToolSet::all())
+            .with_env_provider(Arc::new(|| {
+                Box::pin(async {
+                    if std::env::var_os("AI_AGENT").is_none() {
+                        vec![("AI_AGENT".to_string(), "pikra".to_string())]
+                    } else {
+                        Vec::new()
+                    }
+                })
+            }));
+        let wake_gate = WakeGate::new();
+        resident.extend(WorkspaceTools::build(workspace.clone()));
+        #[cfg(all(unix, not(target_os = "ios")))]
+        {
+            let sender = inbox.sender();
+            let bg_callback: BackgroundEventCallback = Arc::new(move |event| {
+                let (source_id, kind, summary) = match &event {
+                    BackgroundToolEvent::MonitorLines { id, name, .. } => (
+                        id.clone(),
+                        "monitor_lines".to_string(),
+                        format!("Monitor {name} produced output"),
+                    ),
+                    BackgroundToolEvent::MonitorExited { id, name, .. } => (
+                        id.clone(),
+                        "monitor_exited".to_string(),
+                        format!("Monitor {name} exited"),
+                    ),
+                    BackgroundToolEvent::ShellExited {
+                        session_id,
+                        command,
+                        ..
+                    } => (
+                        session_id.to_string(),
+                        "shell_exited".to_string(),
+                        format!("Shell command exited: {command}"),
+                    ),
+                };
+                let xml_payload = format_background_events_xml(&[event]);
+                sender.send(BackgroundNotification {
+                    source_id,
+                    kind,
+                    summary,
+                    xml_payload,
+                    timestamp_ms: now_ms(),
+                });
+            });
+            let workspace = Arc::new(workspace);
+            let processes = ProcessSessionManager::new(
+                workspace.clone(),
+                wake_gate.clone(),
+                Some(bg_callback.clone()),
+            );
+            let monitors = MonitorManager::new(workspace, wake_gate.clone(), Some(bg_callback));
+            resident.push(Arc::new(ExecCommandTool::new(processes.clone())));
+            resident.push(Arc::new(WriteStdinTool::new(processes.clone())));
+            resident.push(Arc::new(MonitorTool::new(monitors.clone())));
+            background_tools = Some((processes, monitors));
+        }
+        resident.push(Arc::new(SleepTool::new(wake_gate)));
+        resident.push(Arc::new(WebFetchTool::new(
+            Arc::clone(transport) as Arc<dyn pikra_ai::HttpTransport>,
+            WebFetchConfig::default(),
+        )));
+    }
+
+    let has_skills = skills
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .format_for_context()
+        .is_some()
+        || !skill_discovery.extra_roots.is_empty();
+    if (!no_tools || has_skills)
+        && !resident
+            .iter()
+            .any(|tool| tool.definition().name == SKILL_SEARCH_NAME)
+    {
+        resident.push(Arc::new(SkillSearchTool::shared(Arc::clone(skills))));
+    }
+
+    if let Some(rt) = js_runtime {
+        resident.extend(rt.tools());
+    }
+
+    if enable_codemode
+        && !resident
+            .iter()
+            .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
+    {
+        // Snapshot resident tools BEFORE pushing `exec` so `CodemodeExecTool` never holds
+        // a strong Arc cycle back to itself.
+        let codemode_resident_handle = Arc::new(Mutex::new(resident.clone()));
+        let exec_tool: Arc<dyn AgentTool> = Arc::new(CodemodeExecTool::new(
+            codemode_resident_handle,
+            Arc::clone(deferred_registry),
+            CodemodeSandboxOptions::default(),
+        ));
+        resident.push(exec_tool);
+    }
+
+    BuiltSessionTools {
+        resident,
+        #[cfg(all(unix, not(target_os = "ios")))]
+        background_tools,
+    }
 }
 
 impl RpcRuntime {
@@ -331,33 +467,6 @@ impl RpcRuntime {
         );
 
         let deferred_registry = Arc::new(DeferredToolRegistry::new());
-        let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
-
-        #[cfg(all(unix, not(target_os = "ios")))]
-        let mut background_tools = None;
-        if !args.no_tools {
-            let workspace =
-                WorkspaceToolsConfig::new(&args.cwd).with_enabled_tools(BuiltinToolSet::all());
-            let wake_gate = WakeGate::new();
-            resident.extend(WorkspaceTools::build(workspace.clone()));
-            #[cfg(all(unix, not(target_os = "ios")))]
-            {
-                let workspace = Arc::new(workspace);
-                let processes =
-                    ProcessSessionManager::new(workspace.clone(), wake_gate.clone(), None);
-                let monitors = MonitorManager::new(workspace, wake_gate.clone(), None);
-                resident.push(Arc::new(ExecCommandTool::new(processes.clone())));
-                resident.push(Arc::new(WriteStdinTool::new(processes.clone())));
-                resident.push(Arc::new(MonitorTool::new(monitors.clone())));
-                background_tools = Some((processes, monitors));
-            }
-            resident.push(Arc::new(SleepTool::new(wake_gate)));
-            resident.push(Arc::new(WebFetchTool::new(
-                transport,
-                WebFetchConfig::default(),
-            )));
-        }
-
         let pikra_home = args
             .pikra_home
             .clone()
@@ -382,26 +491,26 @@ impl RpcRuntime {
             }
             let rt = JsExtensionRuntime::new(js_cfg)
                 .map_err(|err| format!("failed to load JS extensions: {err}"))?;
-            let rt = Arc::new(rt);
-            resident.extend(rt.tools());
-            Some(rt)
+            Some(Arc::new(rt))
         };
 
-        if args.enable_codemode
-            && !resident
-                .iter()
-                .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
-        {
-            // Snapshot resident tools BEFORE pushing `exec` so `CodemodeExecTool` never holds
-            // a strong Arc cycle back to itself.
-            let codemode_resident_handle = Arc::new(Mutex::new(resident.clone()));
-            let exec_tool: Arc<dyn AgentTool> = Arc::new(CodemodeExecTool::new(
-                codemode_resident_handle,
-                Arc::clone(&deferred_registry),
-                CodemodeSandboxOptions::default(),
-            ));
-            resident.push(exec_tool);
-        }
+        let skills_catalog = SkillCatalog::discover_with_config(&skill_discovery);
+        let skills_handle = Arc::new(Mutex::new(skills_catalog.clone()));
+        let inbox = Arc::new(BackgroundInbox::default());
+        let built_tools = build_session_tools(
+            &args.cwd,
+            &transport,
+            args.no_tools,
+            args.enable_codemode,
+            js_runtime.as_ref(),
+            &deferred_registry,
+            &skills_handle,
+            &skill_discovery,
+            &inbox,
+        );
+        let resident = built_tools.resident;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        let background_tools = built_tools.background_tools;
         let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
 
         let mut compaction = CompactionConfig::default();
@@ -431,7 +540,7 @@ impl RpcRuntime {
             &base_system_prompt,
             &resident,
             js_runtime.as_ref(),
-            &skill_discovery,
+            &skills_catalog,
             &instruction_discovery,
             compaction.clone(),
             initial_model,
@@ -449,24 +558,28 @@ impl RpcRuntime {
         let effective_model = agent.model();
 
         Ok(Self {
+            transport,
             provider,
             api_key_resolver,
             models: Mutex::new(vec![effective_model]),
             cwd: args.cwd.clone(),
             base_system_prompt,
+            no_tools: args.no_tools,
+            enable_codemode: args.enable_codemode,
             resident_tools: resident_tools_handle,
             deferred_registry,
             js_runtime,
             skill_discovery,
             instruction_discovery,
             #[cfg(all(unix, not(target_os = "ios")))]
-            background_tools,
+            background_tools: Mutex::new(background_tools),
             no_session: args.no_session,
             compaction_config: Mutex::new(compaction),
             state: Mutex::new(SessionRuntimeState {
                 instructions,
                 session: Arc::new(Mutex::new(session_manager)),
                 agent: Arc::new(agent),
+                inbox,
                 session_file,
             }),
             queued_steering: Arc::new(Mutex::new(VecDeque::new())),
@@ -766,7 +879,7 @@ impl RpcRuntime {
                     ));
                     return;
                 }
-                let res = self.handle_new_session(session_path, parent_session);
+                let res = self.handle_new_session(session_path, parent_session).await;
                 self.send_result(id, command_name, res);
             }
             RpcCommand::SwitchSession { session_path } => {
@@ -778,7 +891,7 @@ impl RpcRuntime {
                     ));
                     return;
                 }
-                let res = self.handle_switch_session(session_path);
+                let res = self.handle_switch_session(session_path).await;
                 self.send_result(id, command_name, res);
             }
             RpcCommand::Fork { entry_id } => {
@@ -893,13 +1006,13 @@ impl RpcRuntime {
         let agent = self.current_agent();
         let queue_id = Uuid::now_v7().to_string();
         let parts = build_content_parts(message.clone(), images);
-        self.queued_follow_up
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back((queue_id.clone(), message));
         if is_meta {
             agent.follow_up_meta_parts(queue_id, parts);
         } else {
+            self.queued_follow_up
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((queue_id.clone(), message));
             agent.follow_up_with_parts(queue_id, parts);
         }
     }
@@ -961,11 +1074,20 @@ impl RpcRuntime {
         let user_msg =
             Message::User(UserMessage::parts(content, now_ms()).with_meta(is_meta)).into();
 
-        let session = self.current_session();
-        let agent = self.current_agent();
+        let (session, agent, inbox) = {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                Arc::clone(&guard.session),
+                Arc::clone(&guard.agent),
+                Arc::clone(&guard.inbox),
+            )
+        };
 
         let (prompt_messages, flushed_count, flushed_events) = {
             let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(bg_prompt) = inbox.drain_prompt() {
+                sess.append_meta(bg_prompt);
+            }
             let flushed = match sess.flush_pending_context() {
                 Ok(f) => f,
                 Err(err) => {
@@ -1207,7 +1329,13 @@ impl RpcRuntime {
 
     pub async fn shutdown_tools(&self) {
         #[cfg(all(unix, not(target_os = "ios")))]
-        if let Some((processes, monitors)) = &self.background_tools {
+        let tools = self
+            .background_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        #[cfg(all(unix, not(target_os = "ios")))]
+        if let Some((processes, monitors)) = tools {
             tokio::join!(processes.shutdown(), monitors.shutdown());
         }
     }
@@ -1440,7 +1568,7 @@ impl RpcRuntime {
         });
     }
 
-    fn handle_new_session(
+    async fn handle_new_session(
         &self,
         session_path: Option<String>,
         parent_session: Option<String>,
@@ -1474,16 +1602,29 @@ impl RpcRuntime {
                 (Arc::new(MemorySessionStore::new()), None)
             };
 
-        let tools = self
-            .resident_tools
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let compaction = self
             .compaction_config
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+
+        let skills_catalog = SkillCatalog::discover_with_config(&self.skill_discovery);
+        let skills_handle = Arc::new(Mutex::new(skills_catalog.clone()));
+        let fresh_inbox = Arc::new(BackgroundInbox::default());
+        let built_tools = build_session_tools(
+            &self.cwd,
+            &self.transport,
+            self.no_tools,
+            self.enable_codemode,
+            self.js_runtime.as_ref(),
+            &self.deferred_registry,
+            &skills_handle,
+            &self.skill_discovery,
+            &fresh_inbox,
+        );
+        let tools = built_tools.resident;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        let fresh_bg_tools = built_tools.background_tools;
 
         let (session_manager, agent, instructions) = build_session_and_agent(
             Arc::clone(&self.provider),
@@ -1493,7 +1634,7 @@ impl RpcRuntime {
             &self.base_system_prompt,
             &tools,
             self.js_runtime.as_ref(),
-            &self.skill_discovery,
+            &skills_catalog,
             &self.instruction_discovery,
             compaction,
             current_model,
@@ -1509,6 +1650,8 @@ impl RpcRuntime {
             parent_session,
         )?;
 
+        self.shutdown_tools().await;
+
         let session_id = session_manager.session_id().to_string();
         self.deferred_registry.clear_seen_schemas();
         self.queued_steering
@@ -1519,12 +1662,24 @@ impl RpcRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *self
+            .resident_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = tools;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        {
+            *self
+                .background_tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = fresh_bg_tools;
+        }
 
         {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.session = Arc::new(Mutex::new(session_manager));
             guard.agent = Arc::new(agent);
             guard.instructions = instructions;
+            guard.inbox = fresh_inbox;
             guard.session_file = new_file.clone();
         }
 
@@ -1535,7 +1690,10 @@ impl RpcRuntime {
         }))
     }
 
-    fn handle_switch_session(&self, session_path: String) -> Result<serde_json::Value, String> {
+    async fn handle_switch_session(
+        &self,
+        session_path: String,
+    ) -> Result<serde_json::Value, String> {
         let path = PathBuf::from(&session_path);
         let store: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(path.clone()));
 
@@ -1550,11 +1708,6 @@ impl RpcRuntime {
             )
         };
 
-        let tools = self
-            .resident_tools
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let compaction = self
             .compaction_config
             .lock()
@@ -1567,6 +1720,24 @@ impl RpcRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        let skills_catalog = SkillCatalog::discover_with_config(&self.skill_discovery);
+        let skills_handle = Arc::new(Mutex::new(skills_catalog.clone()));
+        let fresh_inbox = Arc::new(BackgroundInbox::default());
+        let built_tools = build_session_tools(
+            &self.cwd,
+            &self.transport,
+            self.no_tools,
+            self.enable_codemode,
+            self.js_runtime.as_ref(),
+            &self.deferred_registry,
+            &skills_handle,
+            &self.skill_discovery,
+            &fresh_inbox,
+        );
+        let tools = built_tools.resident;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        let fresh_bg_tools = built_tools.background_tools;
+
         let (session_manager, agent, instructions) = build_session_and_agent(
             Arc::clone(&self.provider),
             self.api_key_resolver.clone(),
@@ -1575,7 +1746,7 @@ impl RpcRuntime {
             &self.base_system_prompt,
             &tools,
             self.js_runtime.as_ref(),
-            &self.skill_discovery,
+            &skills_catalog,
             &self.instruction_discovery,
             compaction,
             current_model,
@@ -1590,6 +1761,8 @@ impl RpcRuntime {
             follow_mode,
             None,
         )?;
+
+        self.shutdown_tools().await;
 
         let restored_model = agent.model();
         {
@@ -1616,12 +1789,24 @@ impl RpcRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *self
+            .resident_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = tools;
+        #[cfg(all(unix, not(target_os = "ios")))]
+        {
+            *self
+                .background_tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = fresh_bg_tools;
+        }
 
         {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.session = Arc::new(Mutex::new(session_manager));
             guard.agent = Arc::new(agent);
             guard.instructions = instructions;
+            guard.inbox = fresh_inbox;
             guard.session_file = Some(path.clone());
         }
 
@@ -1905,7 +2090,7 @@ fn build_session_and_agent(
     base_system_prompt: &str,
     resident_tools: &[Arc<dyn AgentTool>],
     js_runtime: Option<&Arc<JsExtensionRuntime>>,
-    skill_discovery: &SkillDiscoveryConfig,
+    skills: &SkillCatalog,
     instruction_discovery: &InstructionDiscoveryConfig,
     compaction: CompactionConfig,
     fallback_model: Model,
@@ -1964,7 +2149,6 @@ fn build_session_and_agent(
         .unwrap_or(thinking_level);
     let effective_fast = reconstructed.thinking.map(|(_, f)| f).unwrap_or(fast);
 
-    let skills = SkillCatalog::discover_with_config(skill_discovery);
     if let Some(skills_xml) = skills.format_for_context() {
         session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
     }

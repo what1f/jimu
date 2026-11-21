@@ -87,6 +87,12 @@ impl SessionConfig {
 
 /// Append-only session tree manager with branching (`fork`), deduplicated `<system-reminder>`
 /// context blocks, and prefix-cache-preserving compaction.
+#[derive(Clone)]
+enum PendingEphemeral {
+    NamedContext { name: String, text: String },
+    Meta(Vec<ContentPart>),
+}
+
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     header: SessionHeader,
@@ -101,9 +107,8 @@ pub struct SessionManager {
     active_context_hashes: HashMap<String, [u8; 32]>,
     /// Named context blocks waiting to be flushed before the next user prompt.
     pending_context: Vec<(String, String)>,
-    /// One-off context blocks and raw meta messages queued for the next turn.
-    pending_ephemeral_context: Vec<(String, String)>,
-    pending_ephemeral_meta: Vec<Vec<ContentPart>>,
+    /// One-off context blocks and raw meta messages queued for the next turn in exact call order.
+    pending_ephemeral: Vec<PendingEphemeral>,
 
     compaction_config: CompactionConfig,
     compaction_strategy: Arc<dyn CompactionStrategy>,
@@ -157,8 +162,7 @@ impl SessionManager {
             desired_context: Vec::new(),
             active_context_hashes: HashMap::new(),
             pending_context: Vec::new(),
-            pending_ephemeral_context: Vec::new(),
-            pending_ephemeral_meta: Vec::new(),
+            pending_ephemeral: Vec::new(),
             compaction_config: config.compaction,
             compaction_strategy: strategy,
             listeners: Vec::new(),
@@ -342,8 +346,10 @@ impl SessionManager {
 
     /// Queue a one-off context block without changing the state set by `set_context`.
     pub fn append_named_context(&mut self, name: impl Into<String>, text: impl Into<String>) {
-        self.pending_ephemeral_context
-            .push((name.into(), text.into()));
+        self.pending_ephemeral.push(PendingEphemeral::NamedContext {
+            name: name.into(),
+            text: text.into(),
+        });
     }
 
     /// Queue a raw meta message for the next turn.
@@ -353,14 +359,12 @@ impl SessionManager {
 
     /// Queue a raw multimodal meta message for the next turn.
     pub fn append_meta_parts(&mut self, content: Vec<ContentPart>) {
-        self.pending_ephemeral_meta.push(content);
+        self.pending_ephemeral.push(PendingEphemeral::Meta(content));
     }
 
     /// Returns `true` if there is queued context or meta input waiting for the next turn.
     pub fn has_pending_context(&self) -> bool {
-        !self.pending_context.is_empty()
-            || !self.pending_ephemeral_context.is_empty()
-            || !self.pending_ephemeral_meta.is_empty()
+        !self.pending_context.is_empty() || !self.pending_ephemeral.is_empty()
     }
 
     /// Flush all pending context and meta messages into the append-only session log,
@@ -368,11 +372,8 @@ impl SessionManager {
     ///
     /// Returns the appended context blocks and messages in transcript order.
     pub fn flush_pending_context(&mut self) -> Result<Vec<SessionEntry>, SessionError> {
-        let mut appended = Vec::with_capacity(
-            self.pending_context.len()
-                + self.pending_ephemeral_context.len()
-                + self.pending_ephemeral_meta.len(),
-        );
+        let mut appended =
+            Vec::with_capacity(self.pending_context.len() + self.pending_ephemeral.len());
 
         while let Some((name, text)) = self.pending_context.first().cloned() {
             let hash = sha256_bytes(&text);
@@ -391,21 +392,24 @@ impl SessionManager {
             appended.push(entry);
         }
 
-        while let Some((name, text)) = self.pending_ephemeral_context.first().cloned() {
-            let entry = self.append_payload(SessionEntryPayload::ContextBlock {
-                name: name.clone(),
-                text: text.clone(),
-                ephemeral: true,
-            })?;
-            self.pending_ephemeral_context.remove(0);
-            self.emit(SessionEvent::ContextAppended { name, text });
-            appended.push(entry);
-        }
-
-        while let Some(parts) = self.pending_ephemeral_meta.first().cloned() {
-            let message = Message::User(UserMessage::meta_parts(parts, now_ms())).into();
-            appended.push(self.append_message(message)?);
-            self.pending_ephemeral_meta.remove(0);
+        while let Some(item) = self.pending_ephemeral.first().cloned() {
+            match item {
+                PendingEphemeral::NamedContext { name, text } => {
+                    let entry = self.append_payload(SessionEntryPayload::ContextBlock {
+                        name: name.clone(),
+                        text: text.clone(),
+                        ephemeral: true,
+                    })?;
+                    self.pending_ephemeral.remove(0);
+                    self.emit(SessionEvent::ContextAppended { name, text });
+                    appended.push(entry);
+                }
+                PendingEphemeral::Meta(parts) => {
+                    let message = Message::User(UserMessage::meta_parts(parts, now_ms())).into();
+                    appended.push(self.append_message(message)?);
+                    self.pending_ephemeral.remove(0);
+                }
+            }
         }
 
         Ok(appended)
@@ -804,12 +808,8 @@ impl SessionManager {
     fn rebuild_context_tracking_from_branch(&mut self) {
         let reconstructed = self.reconstruct_context();
 
-        // Preserve any host-set desired_context, merging in branch-known named context blocks
-        // (ignoring ephemeral "context" entries).
+        // Preserve any host-set desired_context, merging in branch-known persistent named context blocks.
         for (name, text) in &reconstructed.all_branch_context_blocks {
-            if name == "context" {
-                continue;
-            }
             if !self.desired_context.iter().any(|(k, _)| k == name) {
                 self.desired_context.push((name.clone(), text.clone()));
             }
@@ -817,9 +817,6 @@ impl SessionManager {
 
         self.active_context_hashes.clear();
         for (name, text) in &reconstructed.visible_context_blocks {
-            if name == "context" {
-                continue;
-            }
             self.active_context_hashes
                 .insert(name.clone(), sha256_bytes(text));
         }
@@ -838,9 +835,6 @@ impl SessionManager {
         let reconstructed = self.reconstruct_context();
         self.active_context_hashes.clear();
         for (name, text) in &reconstructed.visible_context_blocks {
-            if name == "context" {
-                continue;
-            }
             self.active_context_hashes
                 .insert(name.clone(), sha256_bytes(text));
         }

@@ -204,14 +204,31 @@ fn codex_fallback() -> Option<CodexCredentials> {
 }
 
 fn usable_codex(secrets: &Secrets) -> Option<CodexCredentials> {
-    secrets
-        .codex
-        .clone()
-        .or_else(|| (!secrets.codex_signed_out).then(codex_fallback).flatten())
-        .filter(|creds| {
-            !creds.access_token.is_empty()
-                && (!creds.is_expiring_within(now_ms(), 0) || creds.refresh_token.is_some())
-        })
+    if let Some(creds) = &secrets.codex {
+        return (!creds.access_token.is_empty()
+            && (!creds.is_expiring_within(now_ms(), 0) || creds.refresh_token.is_some()))
+        .then(|| creds.clone());
+    }
+    (!secrets.codex_signed_out)
+        .then(codex_fallback)
+        .flatten()
+        .filter(|creds| !creds.access_token.is_empty() && !creds.is_expiring_within(now_ms(), 0))
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "authorization" | "proxy-authorization" | "x-api-key" | "api-key"
+    ) || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("key")
+        || lower.contains("auth")
+        || lower.contains("cookie")
+}
+
+fn is_auth_scheme_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("proxy-authorization")
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -328,17 +345,15 @@ impl Auth {
 
     pub(crate) fn authenticated_for(&self, model: &Model) -> bool {
         if self.config.provider_override.is_some() {
-            return true;
+            return !self
+                .routes()
+                .get(&model.provider)
+                .is_some_and(|route| route.disabled);
         }
-        let route = self.routed_model(model);
-        let routes = self.routes();
-        if routes
-            .get(&route.provider)
-            .is_some_and(|route| route.disabled)
-        {
+        let Ok((route, headers)) = self.resolve_call(model, false) else {
             return false;
-        }
-        if self.headers(&route).values().any(|value| !value.is_empty()) {
+        };
+        if headers.values().any(|value| !value.is_empty()) {
             return true;
         }
         (self.trusted_key_origin(&route.provider, &route.base_url)
@@ -389,17 +404,23 @@ impl Auth {
             values.extend(creds.refresh_token);
             values.extend(creds.id_token);
         }
-        for text in secrets
+        for (name, text) in secrets
             .headers
             .values()
-            .flat_map(|secret| secret.headers.values())
+            .flat_map(|secret| secret.headers.iter())
         {
+            if !is_sensitive_header(name) {
+                continue;
+            }
             values.push(text.clone());
-            if let Some((_, key)) = text.split_once(' ') {
+            if is_auth_scheme_header(name)
+                && let Some((_, key)) = text.split_once(' ')
+                && key.len() >= 8
+            {
                 values.push(key.into());
             }
         }
-        let mut remembered = self.redactions.write().unwrap();
+        let mut remembered = self.redactions.write().unwrap_or_else(|e| e.into_inner());
         for value in values {
             if !value.is_empty() && !remembered.contains(&value) {
                 remembered.push(value);
@@ -487,12 +508,17 @@ impl Auth {
         bare.next().is_none().then_some(candidate)
     }
 
-    pub(crate) fn model(&self, provider: &str, id: &str) -> Model {
-        let entry = builtin(provider).unwrap_or(&BUILTINS[1]);
-        let routes = self.routes();
-        let route = routes.get(provider).filter(|route| !route.disabled);
-        let api = route.map_or_else(|| entry.api.clone(), |route| route.api.clone());
-        let url = route.map_or(entry.url, |route| &route.base_url);
+    fn build_model(
+        &self,
+        provider: &str,
+        id: &str,
+        entry: Option<&Builtin>,
+        route: Option<&Route>,
+    ) -> Model {
+        let fallback_api = entry.map_or(ApiKind::OpenaiResponses, |e| e.api.clone());
+        let fallback_url = entry.map_or("", |e| e.url);
+        let api = route.map_or_else(|| fallback_api.clone(), |route| route.api.clone());
+        let url = route.map_or(fallback_url, |route| route.base_url.as_str());
         let (api, url) = if route.is_none() && provider == self.cli_provider() {
             (
                 self.config.api.clone().unwrap_or(api),
@@ -502,9 +528,12 @@ impl Auth {
             (api, url)
         };
         let mut model = Model::new(id, provider, api, url);
-        model.supports_images = entry.images;
+        model.supports_images = entry.is_none_or(|e| e.images);
         model.supports_reasoning = true;
-        model.context_window = self.config.context_window.unwrap_or(entry.context);
+        model.context_window = self
+            .config
+            .context_window
+            .unwrap_or_else(|| entry.map_or(272_000, |e| e.context));
         model.cost = match id {
             "gpt-5.4" if provider == "openai" => ModelCost {
                 input: 2.5,
@@ -540,29 +569,57 @@ impl Auth {
         model
     }
 
-    pub(crate) fn headers(&self, model: &Model) -> Headers {
+    pub(crate) fn model(&self, provider: &str, id: &str) -> Model {
+        let entry = builtin(provider);
         let routes = self.routes();
+        let route = routes.get(provider).filter(|route| !route.disabled);
+        self.build_model(provider, id, entry, route)
+    }
+
+    pub(crate) fn resolve_call(
+        &self,
+        model: &Model,
+        allow_override: bool,
+    ) -> std::result::Result<(Model, Headers), String> {
+        let routes = self.routes();
+        let secrets = self.secrets();
+        self.remember_secrets(&routes, &secrets);
         if routes
             .get(&model.provider)
-            .is_some_and(|route| !route.disabled && same_origin(&model.base_url, &route.base_url))
+            .is_some_and(|route| route.disabled)
         {
-            return self
-                .secrets()
-                .headers
-                .remove(&model.provider)
-                .filter(|secret| same_origin(&secret.origin, &model.base_url))
-                .map(|secret| secret.headers)
-                .unwrap_or_default();
+            return Err(format!("Provider '{}' is disabled.", model.provider));
         }
-        Headers::new()
+        let entry = builtin(&model.provider);
+        let route = routes.get(&model.provider);
+        let cli_configured =
+            model.provider == self.cli_provider() && self.config.base_url.is_some();
+        if route.is_none() && entry.is_none() && !cli_configured {
+            if allow_override {
+                return Ok((model.clone(), Headers::new()));
+            }
+            return Err(format!("Provider '{}' is not configured.", model.provider));
+        }
+        let resolved = self.build_model(&model.provider, &model.id, entry, route);
+        let headers = if let Some(route) = route
+            && same_origin(&resolved.base_url, &route.base_url)
+        {
+            secrets
+                .headers
+                .get(&model.provider)
+                .filter(|secret| same_origin(&secret.origin, &resolved.base_url))
+                .map(|secret| secret.headers.clone())
+                .unwrap_or_default()
+        } else {
+            Headers::new()
+        };
+        Ok((resolved, headers))
     }
 
     pub(crate) fn routed_model(&self, model: &Model) -> Model {
-        // Active sessions look up routing again on every model request.
-        if self.routes().contains_key(&model.provider) {
-            return self.model(&model.provider, &model.id);
-        }
-        model.clone()
+        self.resolve_call(model, true)
+            .map(|(resolved, _)| resolved)
+            .unwrap_or_else(|_| model.clone())
     }
 
     pub(crate) async fn api_key(
@@ -573,7 +630,8 @@ impl Auth {
     ) -> Option<String> {
         let provider = model.provider.as_str();
         let routes = self.routes();
-        self.remember_secrets(&routes, &self.secrets());
+        let secrets = self.secrets();
+        self.remember_secrets(&routes, &secrets);
         if routes.get(provider).is_some_and(|route| route.disabled) {
             return None;
         }
@@ -587,12 +645,30 @@ impl Auth {
         if !same_origin(&model.base_url, oauth::CODEX_DEFAULT_BASE_URL) {
             return None;
         }
+        // Only Pikra's own persisted Codex login may be refreshed; external ~/.codex/auth.json
+        // tokens are used read-only while unexpired so we never rotate/clobber external CLI state.
+        if secrets.codex.is_none() {
+            return usable_codex(&secrets).map(|creds| creds.access_token);
+        }
         let _refresh = tokio::select! {
             guard = self.refresh.lock() => guard,
             () = cancel.cancelled() => return None,
         };
-        let creds = usable_codex(&self.secrets())?;
+        let home = self.config.pikra_home.clone();
+        let lock_task = tokio::task::spawn_blocking(move || lock_credentials(&home));
+        let _updates = tokio::select! {
+            res = lock_task => res.ok()?.ok()?,
+            () = cancel.cancelled() => return None,
+        };
+        let mut current: Secrets = read_optional(&self.auth_path()).ok()?.unwrap_or_default();
+        let Some(creds) = current.codex.clone().filter(|creds| {
+            !creds.access_token.is_empty()
+                && (!creds.is_expiring_within(now_ms(), 0) || creds.refresh_token.is_some())
+        }) else {
+            return usable_codex(&current).map(|creds| creds.access_token);
+        };
         if !creds.is_expiring_within(now_ms(), 60_000) || creds.refresh_token.is_none() {
+            self.remember_secrets(&routes, &current);
             return Some(creds.access_token);
         }
         let refreshed = tokio::time::timeout(
@@ -602,11 +678,6 @@ impl Auth {
         .await
         .ok()?
         .ok()?;
-        let _updates = lock_credentials(&self.config.pikra_home).ok()?;
-        let mut current: Secrets = read_optional(&self.auth_path()).ok()?.unwrap_or_default();
-        if usable_codex(&current).as_ref() != Some(&creds) {
-            return usable_codex(&current).map(|other| other.access_token);
-        }
         let access = refreshed.access_token.clone();
         current.codex = Some(refreshed);
         save(&self.auth_path(), &current).ok()?;
@@ -630,8 +701,9 @@ impl Auth {
         let routes = self.routes();
         let mut items = Vec::new();
         for id in self.ids(&routes) {
-            let model = self.model(&id, "");
-            let active = !routes.get(&id).is_some_and(|route| route.disabled);
+            let route = routes.get(&id);
+            let active = !route.is_some_and(|route| route.disabled);
+            let model = self.build_model(&id, "", builtin(&id), route);
             let protocol = llm_protocol(&model.api);
             let supported = vec![
                 protocol.clone(),
