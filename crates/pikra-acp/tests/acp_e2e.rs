@@ -1123,3 +1123,210 @@ async fn acp_replays_visible_turns_and_sends_hidden_history_to_the_model() {
         assert!(!body.contains("is_meta") && !body.contains("isMeta"));
     }
 }
+
+#[tokio::test]
+async fn review_batch2_acp_security_capabilities_fs_denial_and_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("restricted.txt");
+    std::fs::write(&secret_file, "TOP_SECRET_DISK_CONTENT").unwrap();
+
+    // Turn 1: model tries to read restricted.txt (editor denies fs/read_text_file -> must NOT fallback to disk!),
+    // then replies mentioning "App" and the bearer token (X-Title: My App must NOT redact "App", Bearer token MUST be redacted).
+    let model = ModelFixture::start(vec![
+        tool("r1", "read", json!({"path": "restricted.txt"})),
+        text("My App leaks secret-token-12345678"),
+    ])
+    .await;
+
+    let updates: Updates = Arc::default();
+    let client_updates = updates.clone();
+    let cwd = dir.path().to_path_buf();
+
+    // 1. Initialize WITHOUT auth.terminal -> must NOT advertise codex-oauth; WITH fs.read_text_file returning denial.
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(env!("CARGO_BIN_EXE_pikra-acp"))
+            .args([
+                "--pikra-home",
+                home.path().to_str().unwrap(),
+                "--system-prompt",
+                "BASE_PROMPT",
+            ])
+            .env("HOME", home.path().to_str().unwrap())
+            .env("CODEX_HOME", home.path().join("codex").to_str().unwrap())
+            .env("NO_PROXY", "127.0.0.1"),
+    );
+
+    Client
+        .v1()
+        .on_receive_notification(
+            async move |notification: SessionNotification, _cx| {
+                client_updates.lock().unwrap().push(notification);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async |_req: ReadTextFileRequest, responder, _cx| {
+                responder.respond_with_error(agent_client_protocol::Error::new(
+                    -32000,
+                    "Editor denied file read.",
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent, async |cx: ConnectionTo<Agent>| {
+            // Default caps: auth.terminal is false -> codex-oauth must be omitted.
+            let caps =
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true));
+            let init = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(caps))
+                .block_task()
+                .await?;
+            assert!(
+                !init
+                    .auth_methods
+                    .iter()
+                    .any(|m| m.id().0.as_ref() == "codex-oauth"),
+                "codex-oauth must not be advertised without clientCapabilities.auth.terminal"
+            );
+
+            // Configure a custom provider with both non-sensitive X-Title and sensitive Authorization header.
+            let mut headers = agent_client_protocol::schema::IndexMap::new();
+            headers.insert("X-Title".to_string(), "My App".to_string());
+            headers.insert(
+                "Authorization".to_string(),
+                "Bearer secret-token-12345678".to_string(),
+            );
+            let mut provider_meta = serde_json::Map::new();
+            provider_meta.insert("models".to_string(), json!(["custom-m1"]));
+            cx.send_request(
+                SetProviderRequest::new(
+                    "custom-gw",
+                    LlmProtocol::Other("_openai_completions".into()),
+                    &model.url,
+                )
+                .headers(headers)
+                .meta(provider_meta),
+            )
+            .block_task()
+            .await?;
+
+            // Create session with SystemPrompt::Append and custom-gw model.
+            let created = cx
+                .send_request(NewSessionRequest::new(cwd.clone()).system_prompt(
+                    SystemPrompt::new(vec!["EXTRA_RULE".into()]).mode(SystemPromptMode::Append),
+                ))
+                .block_task()
+                .await?;
+            let sid = created.session_id;
+            cx.send_request(SetSessionConfigOptionRequest::new(
+                sid.clone(),
+                "model",
+                "custom-gw/custom-m1",
+            ))
+            .block_task()
+            .await?;
+
+            let reply = ask(&cx, &sid, "read restricted").await?;
+            assert_eq!(reply.stop_reason, StopReason::EndTurn);
+
+            // Fork with the same Append prompt -> must NOT duplicate EXTRA_RULE.
+            let forked = cx
+                .send_request(
+                    ForkSessionRequest::new(sid.clone(), cwd.clone()).system_prompt(
+                        SystemPrompt::new(vec!["EXTRA_RULE".into()]).mode(SystemPromptMode::Append),
+                    ),
+                )
+                .block_task()
+                .await?;
+            let fork_id = forked.session_id;
+
+            // Disable the custom provider -> subsequent prompt MUST fail (NOT fallback to public OpenAI!).
+            cx.send_request(DisableProviderRequest::new("custom-gw"))
+                .block_task()
+                .await?;
+            let disabled_res = ask(&cx, &fork_id, "should fail").await;
+            assert!(
+                disabled_res.is_err(),
+                "disabled custom provider must fail and never fallback to OpenAI"
+            );
+
+            // Immediate close + delete must succeed deterministically (no Lease drop race).
+            cx.send_request(CloseSessionRequest::new(fork_id.clone()))
+                .block_task()
+                .await?;
+            cx.send_request(DeleteSessionRequest::new(fork_id))
+                .block_task()
+                .await?;
+            cx.send_request(CloseSessionRequest::new(sid.clone()))
+                .block_task()
+                .await?;
+            cx.send_request(DeleteSessionRequest::new(sid))
+                .block_task()
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Check model requests: disk content must NEVER have been leaked via fallback.
+    let reqs = model.finish().await;
+    assert_eq!(reqs.len(), 2);
+    let second_body = reqs[1].to_string();
+    assert!(
+        !second_body.contains("TOP_SECRET_DISK_CONTENT"),
+        "denied fs/read_text_file must never fall back to local disk: {second_body}"
+    );
+
+    // Check assistant output updates: "App" preserved, bearer secret redacted.
+    let assistant_text: String = updates
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|n| match &n.update {
+            SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        assistant_text.contains("My App"),
+        "non-sensitive X-Title value must not redact 'App': {assistant_text}"
+    );
+    assert!(
+        !assistant_text.contains("secret-token-12345678"),
+        "Authorization bearer token must be redacted: {assistant_text}"
+    );
+
+    // 2. Initialize WITH auth.terminal = true -> MUST advertise codex-oauth.
+    let agent2 = AcpAgent::new(
+        AcpAgentConfig::new(env!("CARGO_BIN_EXE_pikra-acp"))
+            .args([
+                "--pikra-home",
+                home.path().to_str().unwrap(),
+                "--no-session",
+            ])
+            .env("HOME", home.path().to_str().unwrap()),
+    );
+    Client
+        .v1()
+        .connect_with(agent2, async |cx: ConnectionTo<Agent>| {
+            let caps = ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true));
+            let init = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(caps))
+                .block_task()
+                .await?;
+            assert!(
+                init.auth_methods
+                    .iter()
+                    .any(|m| m.id().0.as_ref() == "codex-oauth"),
+                "codex-oauth must be advertised when clientCapabilities.auth.terminal is true"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}

@@ -1149,3 +1149,89 @@ async fn acp_modes_initialize_over_stdio() {
         assert!(peer.close_stdin_and_wait().await.success());
     }
 }
+
+#[tokio::test]
+async fn review_batch2_rpc_meta_follow_up_hidden_and_skill_search_registered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let skill_root = tmp.path().join("skills");
+    std::fs::create_dir_all(skill_root.join("demo")).unwrap();
+    std::fs::write(
+        skill_root.join("demo/SKILL.md"),
+        "---\nname: demo\ndescription: Demo skill\n---\nDemo body\n",
+    )
+    .unwrap();
+
+    let skill_dir_str = skill_root.to_string_lossy().to_string();
+    let mut proc = RpcClientProc::spawn(&[
+        "--mode",
+        "rpc",
+        "--provider",
+        "openai",
+        "--api",
+        "openai-responses",
+        "--model",
+        "mock-1",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--skill-dir",
+        &skill_dir_str,
+        "--no-session",
+    ]);
+
+    // 1. skill_search must be registered when skills are discovered/configured.
+    proc.send_json(&json!({ "id": "st1", "type": "get_state" }))
+        .await;
+    let (st_resp, _) = proc.read_response_for("st1").await;
+    assert_eq!(st_resp["success"], true);
+    let tools: Vec<&str> = st_resp["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        tools.contains(&"skill_search"),
+        "expected skill_search in tools: {tools:?}"
+    );
+
+    // 2. is_meta: true follow_up must NOT be leaked by clear_queue (while normal follow_up is).
+    proc.send_json(&json!({
+        "id": "fu1",
+        "type": "follow_up",
+        "message": "hidden-meta-followup",
+        "is_meta": true
+    }))
+    .await;
+    assert_eq!(proc.read_response_for("fu1").await.0["success"], true);
+
+    proc.send_json(&json!({
+        "id": "fu2",
+        "type": "follow_up",
+        "message": "visible-followup"
+    }))
+    .await;
+    assert_eq!(proc.read_response_for("fu2").await.0["success"], true);
+
+    proc.send_json(&json!({ "id": "clr", "type": "clear_queue" }))
+        .await;
+    let (clr_resp, _) = proc.read_response_for("clr").await;
+    assert_eq!(clr_resp["success"], true);
+    assert_eq!(clr_resp["data"]["follow_up"], json!(["visible-followup"]));
+
+    // 3. new_session rebuilds session tools cleanly (still exposes skill_search).
+    proc.send_json(&json!({ "id": "ns", "type": "new_session" }))
+        .await;
+    assert_eq!(proc.read_response_for("ns").await.0["success"], true);
+    proc.send_json(&json!({ "id": "st2", "type": "get_state" }))
+        .await;
+    let (st2_resp, _) = proc.read_response_for("st2").await;
+    let tools2: Vec<&str> = st2_resp["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(tools2.contains(&"skill_search"));
+
+    assert!(proc.close_stdin_and_wait().await.success());
+}

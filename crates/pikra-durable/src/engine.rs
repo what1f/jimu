@@ -627,6 +627,7 @@ impl DurableEngine {
         };
         let tokens_before = prepared.input.tokens_before;
         let expected_leaf_id = prepared.expected_leaf_id.clone();
+        let branch = manager.active_branch();
         let output = SessionManager::execute_prepared_compaction(&*self.provider, prepared).await?;
 
         let now = self.clock.now_ms();
@@ -641,10 +642,17 @@ impl DurableEngine {
                 usage: output.usage.clone(),
             },
         };
+        let restored = restored_context_entries_after_compaction(
+            &branch,
+            &output.first_kept_entry_id,
+            entry.id.clone(),
+            now,
+        );
         let mut batch = CommitBatch::new(conversation_id, now);
         batch.expected_head_entry_id = Some(expected_leaf_id);
         batch.require_no_checkpoint = true;
         batch.append_entries.push(entry.clone());
+        batch.append_entries.extend(restored);
         match lease.commit(batch, true) {
             Ok(_) => {}
             Err(DurableError::Conflict { .. } | DurableError::ConversationBusy { .. }) => {
@@ -955,6 +963,7 @@ impl DurableEngine {
             let opts = self.stream_options(&conv, cancel.clone());
             if let Some(prepared) = manager.prepare_compaction(&conv.active_model, opts) {
                 let tokens_before = prepared.input.tokens_before;
+                let branch = manager.active_branch();
                 let output =
                     match SessionManager::execute_prepared_compaction(&*self.provider, prepared)
                         .await
@@ -989,9 +998,16 @@ impl DurableEngine {
                         usage: output.usage,
                     },
                 };
+                let restored = restored_context_entries_after_compaction(
+                    &branch,
+                    &output.first_kept_entry_id,
+                    comp_entry.id.clone(),
+                    now,
+                );
                 let mut batch = CommitBatch::new(conversation_id, now);
                 batch.expected_head_entry_id = Some(conv.head_entry_id);
                 batch.append_entries.push(comp_entry.clone());
+                batch.append_entries.extend(restored);
                 batch.checkpoint = CheckpointMutation::Set(TaskCheckpoint::Generating {
                     submission_id: submission_id.to_string(),
                     turn_index,
@@ -2243,6 +2259,67 @@ fn settled_submission_outcome(existing: SubmissionRecord) -> Option<RunOutcome> 
         }),
         SubmissionState::Running | SubmissionState::Parked => None,
     }
+}
+
+fn restored_context_entries_after_compaction(
+    branch: &[SessionEntry],
+    first_kept_entry_id: &str,
+    mut parent_id: String,
+    now: u64,
+) -> Vec<SessionEntry> {
+    let kept_start = if !first_kept_entry_id.is_empty() {
+        branch
+            .iter()
+            .position(|entry| entry.id == first_kept_entry_id)
+            .unwrap_or(branch.len())
+    } else {
+        branch.len()
+    };
+
+    let mut before_kept: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for entry in &branch[..kept_start] {
+        if let SessionEntryPayload::ContextBlock {
+            name,
+            text,
+            ephemeral: false,
+        } = &entry.payload
+        {
+            before_kept.insert(name.clone(), text.clone());
+        }
+    }
+
+    let mut kept_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &branch[kept_start..] {
+        if let SessionEntryPayload::ContextBlock {
+            name,
+            ephemeral: false,
+            ..
+        } = &entry.payload
+        {
+            kept_names.insert(name.clone());
+        }
+    }
+
+    let mut restored = Vec::new();
+    for (name, text) in before_kept {
+        if kept_names.contains(&name) {
+            continue;
+        }
+        let id = Uuid::now_v7().to_string();
+        restored.push(SessionEntry {
+            id: id.clone(),
+            parent_id: Some(parent_id),
+            timestamp: now,
+            payload: SessionEntryPayload::ContextBlock {
+                name,
+                text,
+                ephemeral: false,
+            },
+        });
+        parent_id = id;
+    }
+    restored
 }
 
 fn outcome_from_tool_result(

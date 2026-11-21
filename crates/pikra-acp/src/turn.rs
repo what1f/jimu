@@ -10,22 +10,19 @@ use base64::Engine;
 use futures_util::{StreamExt, stream};
 use pikra_agent::{AgentEvent, AgentMessage};
 use pikra_ai::{
-    AssistantBlock, AssistantEventStream, AssistantMessageEvent, BoxFuture, CancelToken,
-    ContentPart, HttpTransport, ImageContent, Message, Model, SimpleStreamOptions, StopReason,
-    StreamProvider, TextContent, TranscriptContext, Usage, UserMessage,
+    AssistantBlock, AssistantEventStream, AssistantMessage, AssistantMessageEvent, BoxFuture,
+    CancelToken, ContentPart, HttpTransport, ImageContent, Message, Model, SimpleStreamOptions,
+    StopReason, StreamProvider, TextContent, TranscriptContext, Usage,
 };
 use pikra_kit::KitEvent;
 use pikra_session::{
-    CompactionInput, CompactionOutput, CompactionStrategy, DefaultCompactionStrategy, SessionEntry,
-    SessionEntryPayload, SessionError, SessionHeader, SessionStore,
+    CompactionInput, CompactionOutput, CompactionStrategy, DefaultCompactionStrategy,
+    SessionEntryPayload, SessionError,
 };
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -54,14 +51,18 @@ pub(crate) struct TurnGuard {
 }
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        self.slot.inner.lock().unwrap().progress = None;
+        self.slot
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .progress = None;
         self.slot.change.notify_waiters();
     }
 }
 
 impl TurnSlot {
     pub(crate) fn begin(self: &Arc<Self>) -> Result<TurnGuard> {
-        let mut slot = self.inner.lock().unwrap();
+        let mut slot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if slot.closed {
             return Err(invalid("The session is closed."));
         }
@@ -76,8 +77,16 @@ impl TurnSlot {
         })
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+
     pub(crate) fn current(&self) -> Option<Arc<TurnState>> {
-        self.inner.lock().unwrap().progress.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .progress
+            .clone()
     }
     pub(crate) fn cancel(&self) {
         if let Some(turn) = self.current() {
@@ -85,7 +94,7 @@ impl TurnSlot {
         }
     }
     pub(crate) fn close(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.closed = true;
         if let Some(turn) = &inner.progress {
             turn.cancel.cancel();
@@ -99,100 +108,6 @@ impl TurnSlot {
             }
             changed.await;
         }
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct Steers {
-    items: Mutex<HashMap<String, (Vec<ContentPart>, bool)>>,
-}
-
-impl Steers {
-    pub(crate) fn send(&self, kit: &pikra_kit::KitSession, mut parts: Vec<ContentPart>) {
-        let id = Uuid::new_v4().to_string();
-        let text = if parts
-            .iter()
-            .all(|part| matches!(part, ContentPart::Text(_)))
-        {
-            let text = visible_text(&parts);
-            parts = vec![ContentPart::Text(TextContent::plain(&text))];
-            text
-        } else {
-            // Kit's steering queue accepts text. The ID identifies the complete multimodal
-            // message when the queue delivers it to the transcript and the session store.
-            visible_text(&parts)
-        };
-        self.items
-            .lock()
-            .unwrap()
-            .insert(id.clone(), (parts, false));
-        kit.steer(id, text);
-    }
-
-    fn apply(&self, user: &mut UserMessage, bridge: Option<&Bridge>) {
-        if !user.is_meta
-            && let Some(id) = &user.id
-            && let Some((parts, announced)) = self.items.lock().unwrap().get_mut(id)
-        {
-            user.content.clone_from(parts);
-            if let Some(bridge) = bridge
-                && !*announced
-            {
-                *announced = true;
-                for part in parts {
-                    bridge.update(acp::SessionUpdate::UserMessageChunk(
-                        acp::ContentChunk::new(content_block(part)),
-                    ));
-                }
-            }
-        }
-    }
-
-    fn retain_admitted(&self) {
-        self.items.lock().unwrap().retain(|_, (parts, announced)| {
-            *announced
-                && parts
-                    .iter()
-                    .any(|part| matches!(part, ContentPart::Image(_)))
-        });
-    }
-
-    pub(crate) fn store(self: &Arc<Self>, inner: Arc<dyn SessionStore>) -> Arc<dyn SessionStore> {
-        Arc::new(SteerStore {
-            inner,
-            steers: self.clone(),
-        })
-    }
-}
-
-struct SteerStore {
-    inner: Arc<dyn SessionStore>,
-    steers: Arc<Steers>,
-}
-impl SessionStore for SteerStore {
-    fn load(
-        &self,
-    ) -> std::result::Result<(Option<SessionHeader>, Vec<SessionEntry>), SessionError> {
-        self.inner.load()
-    }
-    fn write_header(&self, header: &SessionHeader) -> std::result::Result<(), SessionError> {
-        self.inner.write_header(header)
-    }
-    fn append_entry(&self, entry: &SessionEntry) -> std::result::Result<(), SessionError> {
-        if let SessionEntryPayload::Message {
-            message: AgentMessage::Llm(Message::User(user)),
-        } = &entry.payload
-            && user.id.is_some()
-        {
-            let mut value = entry.clone();
-            let mut user = user.clone();
-            self.steers.apply(&mut user, None);
-            value.payload = SessionEntryPayload::Message {
-                message: Message::User(user).into(),
-            };
-            return self.inner.append_entry(&value);
-        }
-        self.inner.append_entry(entry)
     }
 }
 
@@ -269,7 +184,6 @@ pub(crate) struct ModelStream {
     override_provider: bool,
     bridge: Arc<Bridge>,
     turn: Arc<TurnSlot>,
-    steers: Arc<Steers>,
     compaction: Arc<Compaction>,
 }
 
@@ -278,7 +192,6 @@ impl ModelStream {
         server: &AcpServer,
         bridge: &Arc<Bridge>,
         turn: Arc<TurnSlot>,
-        steers: Arc<Steers>,
         compaction: Arc<Compaction>,
     ) -> Self {
         Self {
@@ -288,9 +201,25 @@ impl ModelStream {
             override_provider: server.config.provider_override.is_some(),
             bridge: bridge.clone(),
             turn,
-            steers,
             compaction,
         }
+    }
+}
+
+fn error_assistant_message(model: &Model, message: String) -> AssistantMessage {
+    AssistantMessage {
+        content: Vec::new(),
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_id: None,
+        thinking_level: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some(message),
+        diagnostics: Vec::new(),
+        timestamp: crate::auth::now_ms(),
+        duration_ms: None,
     }
 }
 
@@ -301,26 +230,37 @@ impl StreamProvider for ModelStream {
         context: &TranscriptContext,
         mut options: SimpleStreamOptions,
     ) -> AssistantEventStream {
-        let mut model = self.auth.routed_model(model);
-        let mut context = context.clone();
-        let summarizing = self.compaction.active.lock().unwrap().is_some();
+        let model = model.clone();
+        let context = context.clone();
+        let summarizing = self
+            .compaction
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
         let turn = self.turn.current();
         let bridge = self.bridge.clone();
-        let steers = self.steers.clone();
         let provider = self.provider.clone();
         let transport = self.transport.clone();
         let auth = self.auth.clone();
         let override_provider = self.override_provider;
         Box::pin(
             stream::once(async move {
-                if !override_provider {
-                    options.api_key = auth.api_key(&model, &*transport, &options.cancel).await;
-                    model.headers.extend(auth.headers(&model));
-                }
-                for message in &mut context.messages {
-                    if let Message::User(user) = message {
-                        steers.apply(user, (!summarizing).then_some(&*bridge));
+                let (mut resolved, headers) = match auth.resolve_call(&model, override_provider) {
+                    Ok(pair) => pair,
+                    Err(message) => {
+                        let error = error_assistant_message(&model, message);
+                        return Box::pin(stream::once(async move {
+                            AssistantMessageEvent::Error {
+                                reason: StopReason::Error,
+                                error,
+                            }
+                        })) as AssistantEventStream;
                     }
+                };
+                if !override_provider {
+                    options.api_key = auth.api_key(&resolved, &*transport, &options.cancel).await;
+                    resolved.headers.extend(headers);
                 }
                 if !summarizing
                     && let Some(turn) = &turn
@@ -328,8 +268,8 @@ impl StreamProvider for ModelStream {
                 {
                     turn.running.store(true, Ordering::Release);
                 }
-                let upstream = provider.stream(&model, &context, options);
-                upstream.map(move |event| {
+                let upstream = provider.stream(&resolved, &context, options);
+                Box::pin(upstream.map(move |event| {
                     if !summarizing {
                         let update = match &event {
                             AssistantMessageEvent::TextDelta { delta, .. } if !delta.is_empty() => {
@@ -351,7 +291,7 @@ impl StreamProvider for ModelStream {
                         }
                     }
                     event
-                })
+                })) as AssistantEventStream
             })
             .flatten(),
         )
@@ -402,11 +342,13 @@ pub(crate) async fn convert(
                     .and_then(|url| url.to_file_path().ok());
                 let text = if let Some(path) = path {
                     match session.bridge.read_ide(&path, None, None, cancel).await {
-                        Some(text) => Some(text),
+                        Some(Ok(text)) => Some(text),
+                        Some(Err(err)) => return Err(err),
                         None => {
-                            if tokio::fs::metadata(&path)
-                                .await
-                                .is_ok_and(|meta| meta.is_file() && meta.len() <= 1_048_576)
+                            if session.bridge.is_inside_roots(&path)
+                                && tokio::fs::metadata(&path)
+                                    .await
+                                    .is_ok_and(|meta| meta.is_file() && meta.len() <= 1_048_576)
                             {
                                 tokio::fs::read_to_string(&path).await.ok()
                             } else {
@@ -521,7 +463,6 @@ pub(crate) async fn drive(
         cancelled()
     };
     state.running.store(false, Ordering::Release);
-    session.steers.retain_admitted();
     session.bridge.settle();
     if state.cancel.is_cancelled() {
         cancelled()
@@ -583,9 +524,18 @@ pub(crate) async fn run_prompt(
         _ => {}
     }
 
-    let model = server.auth.routed_model(&session.kit.model());
+    let (model, _) = server
+        .auth
+        .resolve_call(
+            &session.kit.model(),
+            server.config.provider_override.is_some(),
+        )
+        .map_err(|err| failed(&err))?;
     if !server.auth.authenticated_for(&model) {
         return Err(acp::Error::auth_required());
+    }
+    if !compact && let Some(bg_prompt) = session.kit.drain_background_prompt() {
+        session.kit.append_meta(bg_prompt);
     }
     let before = session.kit.leaf_id();
     let (stop, failed_turn) = if compact {
@@ -601,6 +551,15 @@ pub(crate) async fn run_prompt(
         if let Ok(mut stream) = stream {
             while let Some(event) = stream.next().await {
                 match event {
+                    KitEvent::Agent(AgentEvent::MessageStart {
+                        message: AgentMessage::Llm(Message::User(user)),
+                    }) if !user.is_meta && user.id.is_some() => {
+                        for part in &user.content {
+                            session.bridge.update(acp::SessionUpdate::UserMessageChunk(
+                                acp::ContentChunk::new(content_block(part)),
+                            ));
+                        }
+                    }
                     KitEvent::Agent(AgentEvent::TurnEnd { message, .. }) => {
                         stop = message.stop_reason
                     }

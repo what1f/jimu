@@ -109,8 +109,10 @@ impl Connection {
         if caps.is_some() {
             return Err(acp::Error::invalid_request());
         }
+        let terminal_auth = req.client_capabilities.auth.terminal;
         *caps = Some(req.client_capabilities);
-        *self.auth_status.lock().unwrap() = Some(self.server.auth.status());
+        *self.auth_status.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(self.server.auth.status());
         let session = acp::SessionCapabilities::new()
             .list(acp::SessionListCapabilities::new())
             .delete(acp::SessionDeleteCapabilities::new())
@@ -143,20 +145,23 @@ impl Connection {
                     .status(acp::AuthStatusCapabilities::new()),
             )
             .providers(acp::ProvidersCapabilities::new());
-        let terminal = acp::AuthMethodTerminal::new("codex-oauth", "ChatGPT / Codex Subscription")
-            .args(vec!["login".into()])
-            .env(args::auth_env(&self.server.config));
+        let mut auth_methods = Vec::new();
+        if terminal_auth {
+            let terminal =
+                acp::AuthMethodTerminal::new("codex-oauth", "ChatGPT / Codex Subscription")
+                    .args(vec!["login".into()])
+                    .env(args::auth_env(&self.server.config));
+            auth_methods.push(acp::AuthMethod::Terminal(terminal));
+        }
         let key = acp::AuthMethodAgent::new("api-key", "API Key (Environment or Provider Config)");
+        auth_methods.push(acp::AuthMethod::Agent(key));
         encode(
             acp::InitializeResponse::new(crate::schema::ProtocolVersion::V1)
                 .agent_info(
                     acp::Implementation::new("pikra-acp", env!("CARGO_PKG_VERSION")).title("Pikra"),
                 )
                 .agent_capabilities(capabilities)
-                .auth_methods(vec![
-                    acp::AuthMethod::Terminal(terminal),
-                    acp::AuthMethod::Agent(key),
-                ])
+                .auth_methods(auth_methods)
                 .meta(meta(json!({"steering":{"supported":true}}))),
         )
     }
@@ -199,8 +204,8 @@ impl Connection {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let sessions = std::mem::take(&mut *self.live.lock().unwrap());
-        futures_util::future::join_all(sessions.values().map(|session| session.shutdown())).await;
+        let sessions = std::mem::take(&mut *self.live.lock().unwrap_or_else(|e| e.into_inner()));
+        futures_util::future::join_all(sessions.values().map(|session| session.close())).await;
     }
 
     pub(crate) fn commands_after(
@@ -522,26 +527,43 @@ impl Connection {
                 Some(session) => Some(session.steering.lock().await),
                 None => None,
             };
-            if current
-                .as_ref()
-                .is_some_and(|session| session.turn.current().is_some())
-            {
-                return Err(failed("Wait for the current turn to finish."));
+            if let Some(session) = &current {
+                if session.turn.is_closed() {
+                    return Err(invalid("The session is closed."));
+                }
+                if session.turn.current().is_some() || session.kit.is_running() {
+                    return Err(failed("Wait for the current turn to finish."));
+                }
+            } else if self.server.sessions.is_open(id) {
+                return Err(failed("This session is open in another connection."));
             }
-            let mut meta = source.metadata.lock().unwrap().clone();
+            let _source_lock = if current.is_none() {
+                self.server.sessions.try_lock_file(id)?
+            } else {
+                None
+            };
+            let mut meta = source
+                .metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             meta.session_id = uuid::Uuid::now_v7().to_string();
             meta.cwd = req.cwd.clone();
             meta.additional_directories = req.additional.clone();
             meta.created_at = crate::auth::now_ms();
             meta.updated_at = meta.created_at;
             meta.archived = false;
-            let entries = branch(
-                source
-                    .store
-                    .load()
-                    .map_err(|_| failed("Could not copy the session history."))?
-                    .1,
-            );
+            let raw_entries = match &current {
+                Some(session) => session.kit.entries(),
+                None => {
+                    source
+                        .store
+                        .load()
+                        .map_err(|_| failed("Could not copy the session history."))?
+                        .1
+                }
+            };
+            let entries = branch(raw_entries);
             (meta, entries)
         } else {
             (
@@ -568,21 +590,23 @@ impl Connection {
         .await;
         let result = match opened {
             Ok(session) => {
-                let base = session.kit.system_prompt();
                 let valid = check_cancel(cancel, &self.peer)
-                    .and_then(|()| session.apply_prompt(req.prompt, Some(&base)))
+                    .and_then(|()| {
+                        session
+                            .apply_prompt(req.prompt, self.server.config.system_prompt.as_deref())
+                    })
                     .and_then(|()| self.server.sessions.register(record));
                 match valid {
                     Ok(()) => {
                         let session = Arc::new(session);
                         self.live
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .insert(meta.session_id.clone(), session.clone());
                         Ok(session)
                     }
                     Err(error) => {
-                        session.shutdown().await;
+                        session.close().await;
                         Err(error)
                     }
                 }
@@ -684,16 +708,24 @@ impl Connection {
                 Ok(next)
             }
             Err(error) => {
-                opened.shutdown().await;
+                if current.is_none() {
+                    opened.close().await;
+                } else {
+                    opened.shutdown().await;
+                }
                 Err(error)
             }
         }
     }
 
     async fn close(&self, id: &str) -> Result<()> {
-        let session = self.live(id)?;
-        session.shutdown().await;
-        self.live.lock().unwrap().remove(id);
+        let session = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+            .ok_or_else(|| invalid("Open the session before using it."))?;
+        session.close().await;
         Ok(())
     }
 
@@ -766,6 +798,9 @@ impl Connection {
         let session = self.live(id)?;
         let _operation = session.steering.lock().await;
         check_cancel(cancel, &self.peer)?;
+        if session.turn.is_closed() {
+            return Err(invalid("The session is closed."));
+        }
         if session.turn.current().is_some() {
             return Err(failed("Wait for the current turn to finish."));
         }
@@ -802,13 +837,10 @@ impl Connection {
                 && session.kit.is_running()
                 && !state.cancel.is_cancelled()
             {
-                if is_meta {
-                    session
-                        .kit
-                        .steer_meta_parts(uuid::Uuid::new_v4().to_string(), parts);
-                } else {
-                    session.steers.send(&session.kit, parts);
-                }
+                session
+                    .kit
+                    .steer_parts(uuid::Uuid::new_v4().to_string(), parts, is_meta)
+                    .await;
                 return Ok(json!({"outcome":"injected"}));
             }
             if !prompt_required {

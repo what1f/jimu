@@ -82,21 +82,26 @@ impl Bridge {
     }
 
     pub(crate) fn start_turn(&self, cancel: CancelToken) {
-        self.calls.lock().unwrap().clear();
-        *self.turn.lock().unwrap() = Some(cancel);
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.turn.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
     }
 
     pub(crate) fn settle(&self) {
-        for (id, call) in self.calls.lock().unwrap().drain() {
+        for (id, call) in self.calls.lock().unwrap_or_else(|e| e.into_inner()).drain() {
             if !call.ended {
                 self.tool_update(&id, call.fields.status(acp::ToolCallStatus::Failed));
             }
         }
-        *self.turn.lock().unwrap() = None;
+        *self.turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub(crate) fn path(&self, path: impl AsRef<Path>) -> PathBuf {
         self.cwd.join(path)
+    }
+
+    pub(crate) fn is_inside_roots(&self, path: &Path) -> bool {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.roots.iter().any(|root| resolved.starts_with(root))
     }
 
     pub(crate) async fn read_ide(
@@ -105,22 +110,26 @@ impl Bridge {
         line: Option<u32>,
         limit: Option<u32>,
         cancel: &CancelToken,
-    ) -> Option<String> {
+    ) -> Option<Result<String, acp::Error>> {
         if !self.capabilities.fs.read_text_file {
             return None;
         }
         let request = acp::ReadTextFileRequest::new(self.id.clone(), path)
             .line(line)
             .limit(limit);
-        self.peer
-            .request::<acp::ReadTextFileResponse>("fs/read_text_file", request, cancel)
-            .await
-            .ok()
-            .map(|response| response.content)
+        Some(
+            self.peer
+                .request::<acp::ReadTextFileResponse>("fs/read_text_file", request, cancel)
+                .await
+                .map(|response| response.content),
+        )
     }
 
     pub(crate) fn wrap(self: &Arc<Self>, tool: Arc<dyn AgentTool>) -> Arc<dyn AgentTool> {
-        self.builtins.lock().unwrap().insert(tool.definition().name);
+        self.builtins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tool.definition().name);
         Arc::new(IdeTool {
             original: tool,
             bridge: self.clone(),
@@ -128,7 +137,10 @@ impl Bridge {
     }
 
     fn is_builtin(&self, name: &str) -> bool {
-        self.builtins.lock().unwrap().contains(name)
+        self.builtins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
     }
 
     fn local_permission(&self, name: &str) -> Option<Permission> {
@@ -158,14 +170,18 @@ impl Bridge {
             return Ok(());
         }
         let _guard = tokio::select! {
-            guard = self.permission_gate.lock() => guard,
+            biased;
             () = cancel.cancelled() => return Err("Operation cancelled.".into()),
+            guard = self.permission_gate.lock() => guard,
         };
         let scope = match permission {
             // Remember a workspace approval separately from each external target.
             Permission::Files if !inside => {
-                let calls = self.calls.lock().unwrap();
-                let mut targets: Vec<String> = calls[id]
+                let calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(call) = calls.get(id) else {
+                    return Err("Tool call state missing.".into());
+                };
+                let mut targets: Vec<String> = call
                     .changes
                     .iter()
                     .map(|change| {
@@ -182,14 +198,26 @@ impl Bridge {
             }
             _ => permission.clone(),
         };
-        if let Some(allowed) = self.permissions.lock().unwrap().get(&scope).copied() {
+        if let Some(allowed) = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&scope)
+            .copied()
+        {
             return if allowed {
                 Ok(())
             } else {
                 Err("Permission was denied.".into())
             };
         }
-        let fields = self.calls.lock().unwrap()[id].fields.clone();
+        let fields = self
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|call| call.fields.clone())
+            .ok_or_else(|| "Tool call state missing.".to_string())?;
         let options = vec![
             acp::PermissionOption::new(
                 "allow_once",
@@ -225,10 +253,19 @@ impl Bridge {
                 cancel,
             )
             .await
-            .map_err(|_| "Permission was not granted.".to_string())?;
+            .map_err(|_| {
+                if cancel.is_cancelled() {
+                    "Operation cancelled.".to_string()
+                } else {
+                    "Permission was not granted.".to_string()
+                }
+            })?;
+        if cancel.is_cancelled() {
+            return Err("Operation cancelled.".into());
+        }
         match response.outcome {
             acp::RequestPermissionOutcome::Cancelled => {
-                if let Some(turn) = self.turn.lock().unwrap().as_ref() {
+                if let Some(turn) = self.turn.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     turn.cancel();
                 }
                 cancel.cancel();
@@ -237,11 +274,17 @@ impl Bridge {
             acp::RequestPermissionOutcome::Selected(choice) => match choice.option_id.0.as_ref() {
                 "allow_once" => Ok(()),
                 "allow_always" => {
-                    self.permissions.lock().unwrap().insert(scope, true);
+                    self.permissions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(scope, true);
                     Ok(())
                 }
                 "reject_always" => {
-                    self.permissions.lock().unwrap().insert(scope, false);
+                    self.permissions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(scope, false);
                     Err("Permission was denied.".into())
                 }
                 _ => Err("Permission was denied.".into()),
@@ -260,7 +303,7 @@ impl Bridge {
         if matches!(name, "call_tool" | "exec") {
             return Ok(());
         }
-        let mode = *self.mode.lock().unwrap();
+        let mode = *self.mode.lock().unwrap_or_else(|e| e.into_inner());
         let permission = self.local_permission(name);
         if mode == Mode::Plan && permission.is_some() {
             self.begin(id, name, args, Vec::new());
@@ -322,7 +365,7 @@ impl Bridge {
             .content(content)
             .locations(locations)
             .raw_input(args.clone());
-        self.calls.lock().unwrap().insert(
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id.into(),
             Call {
                 fields,
@@ -340,7 +383,7 @@ impl Bridge {
     }
 
     fn progress(&self, id: &str, result: &AgentToolResult) {
-        if let Some(call) = self.calls.lock().unwrap().get(id)
+        if let Some(call) = self.calls.lock().unwrap_or_else(|e| e.into_inner()).get(id)
             && !call.ended
             && call.fields.content.as_ref().is_none_or(Vec::is_empty)
         {
@@ -359,7 +402,12 @@ impl Bridge {
     }
 
     fn finish(&self, id: &str, result: &AgentToolResult) {
-        if let Some(call) = self.calls.lock().unwrap().get_mut(id) {
+        if let Some(call) = self
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
             if call.ended {
                 return;
             }
@@ -400,7 +448,6 @@ impl Bridge {
     ) -> Result<AgentToolResult, String> {
         let command = args
             .get("command")
-            .or_else(|| args.get("cmd"))
             .and_then(Value::as_str)
             .filter(|command| !command.trim().is_empty() && !command.contains('\0'))
             .ok_or("A shell command is required.")?;
@@ -411,11 +458,13 @@ impl Bridge {
         let shell = Shell::default();
         let timeout = args
             .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                args.get("timeout")
-                    .and_then(Value::as_u64)
-                    .map(|seconds| seconds.saturating_mul(1000))
+            .and_then(|value| {
+                value.as_u64().or_else(|| {
+                    value
+                        .as_f64()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| v.round() as u64)
+                })
             })
             .map_or(Duration::from_secs(600), |ms| {
                 Duration::from_millis(ms.clamp(1, 86_400_000))
@@ -435,10 +484,17 @@ impl Bridge {
             .await
             .map_err(|_| "The editor could not start a terminal.")?
             .terminal_id;
+        let mut terminal_guard =
+            TerminalCleanupGuard::new(self.peer.clone(), self.id.clone(), terminal.clone());
         let content = vec![acp::ToolCallContent::Terminal(acp::Terminal::new(
             terminal.clone(),
         ))];
-        if let Some(call) = self.calls.lock().unwrap().get_mut(id) {
+        if let Some(call) = self
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
             call.fields.content = Some(content.clone());
         }
         self.tool_update(
@@ -460,6 +516,7 @@ impl Bridge {
         let release = acp::ReleaseTerminalRequest::new(self.id.clone(), terminal.clone());
         let kill = acp::KillTerminalRequest::new(self.id.clone(), terminal.clone());
         if self.peer.closed.is_cancelled() {
+            terminal_guard.disarm();
             self.peer.send_cleanup("terminal/kill", kill);
             self.peer.send_cleanup("terminal/release", release);
             return Ok(AgentToolResult::error("Command cancelled."));
@@ -484,6 +541,7 @@ impl Bridge {
                 Duration::from_secs(5),
             )
             .await;
+        terminal_guard.disarm();
         if self.peer.closed.is_cancelled() {
             self.peer.send_cleanup("terminal/release", release);
         } else {
@@ -533,6 +591,67 @@ impl Bridge {
                 )));
         }
         Ok(result)
+    }
+}
+
+struct TerminalCleanupGuard {
+    peer: Arc<Peer>,
+    session_id: acp::SessionId,
+    terminal_id: Option<acp::TerminalId>,
+}
+
+impl TerminalCleanupGuard {
+    fn new(peer: Arc<Peer>, session_id: acp::SessionId, terminal_id: acp::TerminalId) -> Self {
+        Self {
+            peer,
+            session_id,
+            terminal_id: Some(terminal_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.terminal_id = None;
+    }
+}
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        let Some(terminal_id) = self.terminal_id.take() else {
+            return;
+        };
+        let peer = self.peer.clone();
+        let session_id = self.session_id.clone();
+        let kill = acp::KillTerminalRequest::new(session_id.clone(), terminal_id.clone());
+        let release = acp::ReleaseTerminalRequest::new(session_id, terminal_id);
+        if peer.closed.is_cancelled() {
+            peer.send_cleanup("terminal/kill", kill);
+            peer.send_cleanup("terminal/release", release);
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let cleanup = CancelToken::new();
+                let _ = peer
+                    .request_with_timeout::<acp::KillTerminalResponse>(
+                        "terminal/kill",
+                        kill,
+                        &cleanup,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                let _ = peer
+                    .request_with_timeout::<acp::ReleaseTerminalResponse>(
+                        "terminal/release",
+                        release,
+                        &cleanup,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+            });
+        } else {
+            peer.send_cleanup("terminal/kill", kill);
+            peer.send_cleanup("terminal/release", release);
+        }
     }
 }
 
@@ -595,12 +714,16 @@ impl AgentTool for IdeTool {
                             .and_then(|value| u32::try_from(value).ok())
                     };
                     if !is_image
-                        && let Some(content) = self
+                        && let Some(result) = self
                             .bridge
                             .read_ide(&path, number("offset"), number("limit"), &cancel)
                             .await
                     {
-                        return Ok(AgentToolResult::text(content));
+                        return match result {
+                            Ok(content) => Ok(AgentToolResult::text(content)),
+                            Err(_) if cancel.is_cancelled() => Err("Operation cancelled.".into()),
+                            Err(err) => Err(err.message),
+                        };
                     }
                 }
                 "write" | "edit" | "apply_patch" => {
@@ -608,13 +731,13 @@ impl AgentTool for IdeTool {
                         .bridge
                         .calls
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get_mut(&id)
                         .map(|call| std::mem::take(&mut call.changes))
                         .ok_or("The edit was not approved.")?;
                     return edits::apply(&self.bridge, &changes, &cancel).await;
                 }
-                "bash" | "exec_command" if self.bridge.capabilities.terminal => {
+                "bash" if self.bridge.capabilities.terminal => {
                     return self.bridge.terminal(&id, &args, &cancel).await;
                 }
                 _ => {}
@@ -662,7 +785,12 @@ impl AgentMiddleware for Bridge {
     ) -> BoxFuture<'a, Option<AfterToolCallResult>> {
         Box::pin(async move {
             let id = &ctx.tool_call.id;
-            if !self.calls.lock().unwrap().contains_key(id) {
+            if !self
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(id)
+            {
                 let (name, args) = delegated(&ctx.tool_call.name, ctx.args, &ctx.result.details);
                 self.begin(id, name, args, Vec::new());
             }
@@ -682,7 +810,7 @@ impl AgentMiddleware for Bridge {
                 if !self
                     .calls
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .contains_key(&result.tool_call_id)
                     && let Some(call) = ctx
                         .assistant_message
