@@ -19,14 +19,20 @@ pub const CODEMODE_EXEC_TOOL_NAME: &str = "exec";
 struct AgentToolCodemodeBridge {
     definition: ToolDefinition,
     tool: Arc<dyn AgentTool>,
+    middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
     outer_cancel: CancelToken,
 }
 
 impl AgentToolCodemodeBridge {
-    fn new(tool: Arc<dyn AgentTool>, outer_cancel: CancelToken) -> Self {
+    fn new(
+        tool: Arc<dyn AgentTool>,
+        middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
+        outer_cancel: CancelToken,
+    ) -> Self {
         Self {
             definition: tool.definition(),
             tool,
+            middlewares,
             outer_cancel,
         }
     }
@@ -61,19 +67,75 @@ impl CodemodeTool for AgentToolCodemodeBridge {
                 args
             };
 
-            let validated = match CompiledSchema::compile(self.definition.parameters.clone()) {
-                Ok(compiled) => compiled
-                    .coerce_and_validate(&effective_args)
-                    .map_err(|err| format!("Invalid arguments for `{}`:\n{err}", self.definition.name))?,
-                Err(_) => effective_args,
-            };
-
             let noop_progress: ToolProgressCallback = Arc::new(|_| {});
             let call_id = format!("cm_{}", Uuid::now_v7());
-            let result = self
-                .tool
-                .execute(call_id, validated, self.outer_cancel.clone(), noop_progress)
-                .await?;
+            let result = if self.middlewares.is_empty() {
+                let validated = match CompiledSchema::compile(self.definition.parameters.clone()) {
+                    Ok(compiled) => compiled
+                        .coerce_and_validate(&effective_args)
+                        .map_err(|err| {
+                            format!("Invalid arguments for `{}`:\n{err}", self.definition.name)
+                        })?,
+                    Err(_) => effective_args,
+                };
+                self.tool
+                    .execute(call_id, validated, self.outer_cancel.clone(), noop_progress)
+                    .await?
+            } else {
+                let args_obj = effective_args.as_object().cloned().ok_or_else(|| {
+                    format!(
+                        "Invalid arguments for `{}`: expected JSON object",
+                        self.definition.name
+                    )
+                })?;
+                let dummy_model = pikra_ai::Model::new(
+                    "codemode",
+                    "codemode",
+                    pikra_ai::ApiKind::OpenaiResponses,
+                    "",
+                );
+                let dummy_assistant = pikra_ai::AssistantMessage {
+                    content: Vec::new(),
+                    api: dummy_model.api.clone(),
+                    provider: dummy_model.provider.clone(),
+                    model: dummy_model.id.clone(),
+                    response_id: None,
+                    thinking_level: None,
+                    usage: pikra_ai::Usage::default(),
+                    stop_reason: pikra_ai::StopReason::ToolUse,
+                    error_message: None,
+                    diagnostics: Vec::new(),
+                    timestamp: 0,
+                    duration_ms: None,
+                };
+                let snapshot = pikra_agent::AgentContextSnapshot {
+                    system_prompt: String::new(),
+                    tools: vec![self.definition.clone()],
+                    messages: Vec::new(),
+                    model: dummy_model,
+                    thinking_level: pikra_ai::ThinkingLevel::Off,
+                    fast: false,
+                };
+                let synthetic_tc = pikra_ai::ToolCall {
+                    id: call_id,
+                    name: self.definition.name.clone(),
+                    arguments: args_obj,
+                    thought_signature: None,
+                    namespace: None,
+                    arguments_error: None,
+                };
+                let tools_slice = [Arc::clone(&self.tool)];
+                pikra_agent::run_tool_call(
+                    &tools_slice,
+                    &self.middlewares,
+                    &dummy_assistant,
+                    &synthetic_tc,
+                    &snapshot,
+                    self.outer_cancel.clone(),
+                    noop_progress,
+                )
+                .await
+            };
 
             if result.is_error {
                 let err_text = join_text_parts(&result.content);
@@ -118,6 +180,7 @@ fn join_text_parts(parts: &[ContentPart]) -> String {
 pub struct CodemodeExecTool {
     resident_tools: Arc<Mutex<Vec<Arc<dyn AgentTool>>>>,
     deferred_registry: Arc<DeferredToolRegistry>,
+    middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
     sandbox_options: CodemodeSandboxOptions,
     store: Arc<Mutex<BTreeMap<String, Value>>>,
 }
@@ -131,9 +194,18 @@ impl CodemodeExecTool {
         Self {
             resident_tools,
             deferred_registry,
+            middlewares: Vec::new(),
             sandbox_options,
             store: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub fn with_middlewares(
+        mut self,
+        middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
+    ) -> Self {
+        self.middlewares = middlewares;
+        self
     }
 
     pub fn store_snapshot(&self) -> BTreeMap<String, Value> {
@@ -197,13 +269,21 @@ impl AgentTool for CodemodeExecTool {
             for tool in resident_snapshot {
                 let name = tool.definition().name;
                 if seen_names.insert(name) {
-                    bridged.push(Arc::new(AgentToolCodemodeBridge::new(tool, cancel.clone())));
+                    bridged.push(Arc::new(AgentToolCodemodeBridge::new(
+                        tool,
+                        self.middlewares.clone(),
+                        cancel.clone(),
+                    )));
                 }
             }
             for tool in self.deferred_registry.list_tools() {
                 let name = tool.definition().name;
                 if seen_names.insert(name) {
-                    bridged.push(Arc::new(AgentToolCodemodeBridge::new(tool, cancel.clone())));
+                    bridged.push(Arc::new(AgentToolCodemodeBridge::new(
+                        tool,
+                        self.middlewares.clone(),
+                        cancel.clone(),
+                    )));
                 }
             }
 

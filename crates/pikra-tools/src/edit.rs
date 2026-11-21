@@ -173,6 +173,15 @@ impl AgentTool for EditTool {
             if meta.is_dir() {
                 return Err(format!("cannot edit '{shown}': path is a directory"));
             }
+            if !meta.is_file() {
+                return Err(format!("cannot edit '{shown}': path is not a regular file"));
+            }
+            if meta.len() > 16 * 1024 * 1024 {
+                return Err(format!(
+                    "cannot edit '{shown}': file size ({} bytes) exceeds 16 MiB limit",
+                    meta.len()
+                ));
+            }
 
             let bytes = tokio::fs::read(&resolved)
                 .await

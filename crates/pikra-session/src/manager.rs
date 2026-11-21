@@ -32,6 +32,7 @@ type SessionListener = Arc<dyn Fn(&SessionEvent) + Send + Sync>;
 pub struct PreparedCompaction {
     pub input: CompactionInput,
     pub strategy: Arc<dyn CompactionStrategy>,
+    pub expected_leaf_id: Option<String>,
 }
 
 fn sha256_bytes(text: &str) -> [u8; 32] {
@@ -641,6 +642,7 @@ impl SessionManager {
                 options,
             },
             strategy: Arc::clone(&self.compaction_strategy),
+            expected_leaf_id: self.leaf_id.clone(),
         })
     }
 
@@ -695,6 +697,20 @@ impl SessionManager {
         })
     }
 
+    /// Commit a completed [`CompactionOutput`] only if `self.leaf_id` still matches
+    /// `expected_leaf_id` (prevents stale compaction from writing onto a newly forked branch).
+    pub fn commit_compaction_if_leaf_matches(
+        &mut self,
+        output: CompactionOutput,
+        tokens_before: u64,
+        expected_leaf_id: Option<&str>,
+    ) -> Result<Option<CompactionResult>, SessionError> {
+        if self.leaf_id.as_deref() != expected_leaf_id {
+            return Ok(None);
+        }
+        self.commit_compaction(output, tokens_before).map(Some)
+    }
+
     /// Perform a full compaction immediately. Returns `Ok(None)` if there is nothing to compact.
     pub async fn compact(
         &mut self,
@@ -706,10 +722,10 @@ impl SessionManager {
             return Ok(None);
         };
         let tokens_before = prepared.input.tokens_before;
+        let expected_leaf = prepared.expected_leaf_id.clone();
         self.notify_compaction_start(tokens_before);
         let output = Self::execute_prepared_compaction(provider, prepared).await?;
-        let result = self.commit_compaction(output, tokens_before)?;
-        Ok(Some(result))
+        self.commit_compaction_if_leaf_matches(output, tokens_before, expected_leaf.as_deref())
     }
 
     /// Run compaction only if estimated context tokens exceed the model threshold.

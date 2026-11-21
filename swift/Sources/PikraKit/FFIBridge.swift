@@ -709,6 +709,12 @@ let pikraHttpCancelTrampoline: PikraHttpCancelFn = { ctx, requestID in
     bridge.cancelHTTP(requestID: requestID)
 }
 
+let pikraBridgeDestroyTrampoline: PikraVoidDoneFn = { ctx in
+    guard let ctx else { return }
+    let bridge = Unmanaged<PikraSessionBridge>.fromOpaque(ctx).takeRetainedValue()
+    bridge.cancelAll()
+}
+
 let pikraToolExecuteTrampoline: PikraToolExecuteFn = { ctx, callHandleID, toolCallIDPtr, toolNamePtr, argsJSONPtr, completionPtr in
     guard let ctx, let completionPtr else { return }
     let bridge = Unmanaged<PikraSessionBridge>.fromOpaque(ctx).takeUnretainedValue()

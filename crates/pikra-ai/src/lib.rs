@@ -157,6 +157,30 @@ pub struct Model {
     pub headers: Vec<(String, String)>,
 }
 
+impl Model {
+    pub fn new(
+        id: impl Into<String>,
+        provider: impl Into<String>,
+        api: ApiKind,
+        base_url: impl Into<String>,
+    ) -> Self {
+        let id = id.into();
+        Self {
+            name: id.clone(),
+            id,
+            provider: provider.into(),
+            api,
+            base_url: base_url.into(),
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            supports_images: false,
+            supports_reasoning: false,
+            cost: ModelCost::default(),
+            headers: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,

@@ -530,6 +530,12 @@ impl Agent {
         })
     }
 
+    pub fn set_api_key(&self, api_key: Option<String>) -> Result<(), AgentError> {
+        self.with_idle_inner(|inner| {
+            inner.api_key = api_key;
+        })
+    }
+
     pub fn set_system_prompt(&self, prompt: impl Into<String>) -> Result<(), AgentError> {
         let prompt = prompt.into();
         self.with_idle_inner(|inner| {

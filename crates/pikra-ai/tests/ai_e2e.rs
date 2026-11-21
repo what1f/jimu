@@ -166,7 +166,11 @@ fn all_four_protocols_stream_thinking_parallel_tools_malformed_json_and_cost() {
         assert_eq!(resp_msg.stop_reason, StopReason::ToolUse);
         assert_eq!(resp_msg.response_id.as_deref(), Some("resp_1"));
         assert_eq!(resp_msg.tool_calls().len(), 2);
-        assert_eq!(resp_msg.tool_calls()[0].id, "call_1|fc_a");
+        assert_eq!(resp_msg.tool_calls()[0].id, "call_1");
+        assert_eq!(
+            resp_msg.tool_calls()[0].thought_signature.as_deref(),
+            Some("fc_a")
+        );
         assert_eq!(resp_msg.usage.input, 600);
         assert_eq!(resp_msg.usage.cache_read, 400);
         assert_eq!(resp_msg.usage.reasoning, Some(50));

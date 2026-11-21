@@ -465,12 +465,24 @@ impl AgentMiddleware for JsExtensionRuntime {
         if !self.inner.has_hook(HookKind::AfterToolCall) {
             return Box::pin(async { None });
         }
+        let fail_closed = |reason: String| AfterToolCallResult {
+            content: Some(vec![pikra_ai::ContentPart::Text(
+                pikra_ai::TextContent::plain(format!(
+                    "Tool output withheld because after_tool_call hook failed: {reason}"
+                )),
+            )]),
+            structured_content: None,
+            details: Some(serde_json::Value::Null),
+            is_error: Some(true),
+            terminate: None,
+        };
         let payload = JsAfterToolCallPayload::from(&ctx);
         let payload_json = match serde_json::to_string(&payload) {
             Ok(s) => s,
             Err(err) => {
-                self.inner.record_error(JsExtensionError::Serialization(err.to_string()));
-                return Box::pin(async { None });
+                let reason = err.to_string();
+                self.inner.record_error(JsExtensionError::Serialization(reason.clone()));
+                return Box::pin(async move { Some(fail_closed(reason)) });
             }
         };
         let inner = Arc::clone(&self.inner);
@@ -482,14 +494,16 @@ impl AgentMiddleware for JsExtensionRuntime {
                 Ok(Some(json)) => match parse_after_tool_call_result(&json) {
                     Ok(res) => res,
                     Err(err) => {
+                        let reason = err.to_string();
                         inner.record_error(err);
-                        None
+                        Some(fail_closed(reason))
                     }
                 },
                 Ok(None) => None,
                 Err(err) => {
+                    let reason = err.to_string();
                     inner.record_error(err);
-                    None
+                    Some(fail_closed(reason))
                 }
             }
         })

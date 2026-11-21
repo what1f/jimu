@@ -19,9 +19,25 @@ pub struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
-    /// Build a new `ReqwestTransport` with default rustls settings (no disk cache).
+    /// Build a new `ReqwestTransport` with default rustls settings (no disk cache)
+    /// and a strict same-origin redirect policy so API credentials never leak cross-origin.
     pub fn new() -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder().build()?;
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            if let Some(first) = attempt.previous().first() {
+                let next = attempt.url();
+                let same_origin = first.scheme() == next.scheme()
+                    && first.host_str() == next.host_str()
+                    && first.port_or_known_default() == next.port_or_known_default();
+                if !same_origin {
+                    return attempt.error("cross-origin redirect refused for credential safety");
+                }
+            }
+            attempt.follow()
+        });
+        let client = reqwest::Client::builder().redirect(policy).build()?;
         Ok(Self { client })
     }
 

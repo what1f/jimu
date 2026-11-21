@@ -750,6 +750,7 @@ dependencies = [
 name = "pikra-rpc"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "pikra-agent",
  "pikra-ai",
  "pikra-codemode",
@@ -758,10 +759,13 @@ dependencies = [
  "pikra-kit",
  "pikra-schema",
  "pikra-session",
+ "pikra-testkit",
  "pikra-tools",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

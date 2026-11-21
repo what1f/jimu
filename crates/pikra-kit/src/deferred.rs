@@ -212,7 +212,10 @@ impl DeferredToolRegistry {
 }
 
 fn strip_select_prefix(query: &str) -> Option<&str> {
-    if query.len() >= 7 && query[..7].eq_ignore_ascii_case("select:") {
+    if query
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select:"))
+    {
         Some(&query[7..])
     } else {
         None
@@ -318,11 +321,23 @@ impl AgentTool for ToolSearchTool {
 /// Built-in resident `call_tool` gateway invoking any registered deferred tool directly by name.
 pub struct CallToolGateway {
     registry: Arc<DeferredToolRegistry>,
+    middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
 }
 
 impl CallToolGateway {
     pub fn new(registry: Arc<DeferredToolRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            middlewares: Vec::new(),
+        }
+    }
+
+    pub fn with_middlewares(
+        mut self,
+        middlewares: Vec<Arc<dyn pikra_agent::AgentMiddleware>>,
+    ) -> Self {
+        self.middlewares = middlewares;
+        self
     }
 }
 
@@ -345,7 +360,7 @@ impl AgentTool for CallToolGateway {
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
-        ToolExecutionMode::Parallel
+        ToolExecutionMode::Sequential
     }
 
     fn execute(
@@ -371,20 +386,77 @@ impl AgentTool for CallToolGateway {
                 )));
             };
 
-            let validated_args = match CompiledSchema::compile(tool.definition().parameters) {
-                Ok(compiled) => match compiled.coerce_and_validate(&raw_tool_args) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(AgentToolResult::error(format!(
-                            "Invalid arguments for deferred tool `{name}`:\n{err}"
-                        )));
-                    }
-                },
-                Err(_) => raw_tool_args,
+            if self.middlewares.is_empty() {
+                let validated_args = match CompiledSchema::compile(tool.definition().parameters) {
+                    Ok(compiled) => match compiled.coerce_and_validate(&raw_tool_args) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            return Ok(AgentToolResult::error(format!(
+                                "Invalid arguments for deferred tool `{name}`:\n{err}"
+                            )));
+                        }
+                    },
+                    Err(_) => raw_tool_args,
+                };
+
+                return tool
+                    .execute(tool_call_id, validated_args, cancel, on_update)
+                    .await;
+            }
+
+            let Some(args_obj) = raw_tool_args.as_object().cloned() else {
+                return Ok(AgentToolResult::error(format!(
+                    "Invalid arguments for deferred tool `{name}`: expected JSON object"
+                )));
             };
 
-            tool.execute(tool_call_id, validated_args, cancel, on_update)
-                .await
+            let dummy_model = pikra_ai::Model::new(
+                "gateway",
+                "gateway",
+                pikra_ai::ApiKind::OpenaiResponses,
+                "",
+            );
+            let dummy_assistant = pikra_ai::AssistantMessage {
+                content: Vec::new(),
+                api: dummy_model.api.clone(),
+                provider: dummy_model.provider.clone(),
+                model: dummy_model.id.clone(),
+                response_id: None,
+                thinking_level: None,
+                usage: pikra_ai::Usage::default(),
+                stop_reason: pikra_ai::StopReason::ToolUse,
+                error_message: None,
+                diagnostics: Vec::new(),
+                timestamp: 0,
+                duration_ms: None,
+            };
+            let snapshot = pikra_agent::AgentContextSnapshot {
+                system_prompt: String::new(),
+                tools: vec![tool.definition()],
+                messages: Vec::new(),
+                model: dummy_model,
+                thinking_level: pikra_ai::ThinkingLevel::Off,
+                fast: false,
+            };
+            let synthetic_tc = pikra_ai::ToolCall {
+                id: tool_call_id,
+                name: name.to_string(),
+                arguments: args_obj,
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            };
+            let tools_slice = [tool];
+            Ok(pikra_agent::run_tool_call(
+                &tools_slice,
+                &self.middlewares,
+                &dummy_assistant,
+                &synthetic_tc,
+                &snapshot,
+                cancel,
+                on_update,
+            )
+            .await)
         })
     }
 }

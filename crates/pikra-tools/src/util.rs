@@ -72,9 +72,14 @@ async fn write_and_rename(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+
+    let mut file = opts
         .open(tmp_path)
         .await
         .map_err(|e| format!("failed to create temporary file for '{}': {e}", target.display()))?;
@@ -88,7 +93,9 @@ async fn write_and_rename(
     drop(file);
 
     if let Some(perms) = existing_perms {
-        let _ = tokio::fs::set_permissions(tmp_path, perms).await;
+        tokio::fs::set_permissions(tmp_path, perms)
+            .await
+            .map_err(|e| format!("failed to preserve permissions on '{}': {e}", target.display()))?;
     }
 
     tokio::fs::rename(tmp_path, target)

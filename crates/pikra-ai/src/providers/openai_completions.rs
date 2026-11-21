@@ -360,6 +360,23 @@ pub fn stream(
                 }
             };
 
+            if let Some(err_val) = chunk.get("error").filter(|v| !v.is_null()) {
+                let err_msg = err_val
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| err_val.to_string());
+                emit_protocol_error(
+                    &sink,
+                    output,
+                    "stream_error",
+                    err_msg,
+                    &cancel,
+                    started_at,
+                );
+                return;
+            }
+
             if output.response_id.is_none()
                 && let Some(id) = chunk.get("id").and_then(Value::as_str)
             {

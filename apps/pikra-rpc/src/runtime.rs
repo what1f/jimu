@@ -1006,6 +1006,11 @@ impl RpcRuntime {
             cancel.cancel();
         }
         self.current_agent().abort_now();
+        if let Ok(mut guard) = self.active_run.try_lock()
+            && let Some(task) = guard.take()
+        {
+            task.handle.abort();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

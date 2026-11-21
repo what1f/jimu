@@ -580,6 +580,29 @@ pub unsafe extern "C" fn pikra_session_set_fast(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_session_set_api_key(
+    session: *mut PikraSession,
+    api_key: *const c_char,
+    out_error: *mut *mut c_char,
+) -> PikraStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        let s = match with_session(session, out_error) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let opt_key = unsafe { read_opt_cstr(api_key) }.filter(|k| !k.is_empty());
+        match s.inner.set_api_key(opt_key) {
+            Ok(()) => PikraStatus::Ok,
+            Err((code, msg)) => {
+                unsafe { write_out_string(out_error, msg) };
+                code
+            }
+        }
+    }))
+    .unwrap_or(PikraStatus::ErrInternal)
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pikra_session_upsert_tools(
     session: *mut PikraSession,
     tools_json: *const c_char,

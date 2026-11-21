@@ -5,22 +5,21 @@ import Foundation
 public actor PikraAgent {
     private final class HandleBox: @unchecked Sendable {
         var session: OpaquePointer?
-        var bridgePtr: UnsafeMutableRawPointer?
+        let bridge: PikraSessionBridge
 
-        init(session: OpaquePointer, bridgePtr: UnsafeMutableRawPointer) {
+        init(session: OpaquePointer, bridge: PikraSessionBridge) {
             self.session = session
-            self.bridgePtr = bridgePtr
+            self.bridge = bridge
         }
 
         func destroyNow() {
+            bridge.cancelAll()
             if let s = session {
                 session = nil
+                // Cancels any active Rust run and drops Swift's Arc<FfiSession>.
+                // The retained bridgePtr is released inside `FfiSession::drop` via
+                // `pikraBridgeDestroyTrampoline` only after the last Rust task exits.
                 pikra_session_destroy(s)
-            }
-            if let bp = bridgePtr {
-                bridgePtr = nil
-                let bridge = Unmanaged<PikraSessionBridge>.fromOpaque(bp).takeRetainedValue()
-                bridge.cancelAll()
             }
         }
 
@@ -33,8 +32,8 @@ public actor PikraAgent {
     private let bridge: PikraSessionBridge
     private var isClosed = false
 
-    private init(session: OpaquePointer, bridge: PikraSessionBridge, bridgePtr: UnsafeMutableRawPointer) {
-        self.handleBox = HandleBox(session: session, bridgePtr: bridgePtr)
+    private init(session: OpaquePointer, bridge: PikraSessionBridge) {
+        self.handleBox = HandleBox(session: session, bridge: bridge)
         self.bridge = bridge
     }
 
@@ -53,7 +52,8 @@ public actor PikraAgent {
         let httpCallbacks = PikraHttpCallbacks(
             ctx: bridgePtr,
             start: pikraHttpStartTrampoline,
-            cancel: pikraHttpCancelTrampoline
+            cancel: pikraHttpCancelTrampoline,
+            destroy: pikraBridgeDestroyTrampoline
         )
         let toolCallbacks = PikraToolCallbacks(
             ctx: bridgePtr,
@@ -79,7 +79,7 @@ public actor PikraAgent {
             throw PikraError.invalidArgument(message)
         }
 
-        return PikraAgent(session: sessionPtr, bridge: bridge, bridgePtr: bridgePtr)
+        return PikraAgent(session: sessionPtr, bridge: bridge)
     }
 
     private func requireSession() throws -> OpaquePointer {
@@ -242,6 +242,23 @@ public actor PikraAgent {
         let session = try requireSession()
         var errorPtr: UnsafeMutablePointer<CChar>?
         let status = pikra_session_set_fast(session, fast, &errorPtr)
+        if status != PIKRA_OK {
+            throw mapStatusError(status, message: takeOwnedCString(errorPtr))
+        }
+    }
+
+    /// Updates or clears the active API key while idle (for token rotation without reopening).
+    public func setAPIKey(_ apiKey: String?) throws {
+        let session = try requireSession()
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let status: PikraStatus
+        if let apiKey {
+            status = apiKey.withCString { cstr in
+                pikra_session_set_api_key(session, cstr, &errorPtr)
+            }
+        } else {
+            status = pikra_session_set_api_key(session, nil, &errorPtr)
+        }
         if status != PIKRA_OK {
             throw mapStatusError(status, message: takeOwnedCString(errorPtr))
         }

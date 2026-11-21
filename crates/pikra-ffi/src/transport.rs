@@ -33,6 +33,7 @@ pub struct PikraHttpCallbacks {
     pub ctx: *mut c_void,
     pub start: Option<PikraHttpStartFn>,
     pub cancel: Option<PikraHttpCancelFn>,
+    pub destroy: Option<crate::session::PikraVoidDoneFn>,
 }
 
 #[derive(Clone, Copy)]
@@ -40,8 +41,8 @@ pub(crate) struct SendHttpCallbacks {
     raw: PikraHttpCallbacks,
 }
 
-// SAFETY: Host guarantees `ctx` and callback pointers remain valid and thread-safe for the
-// lifetime of `PikraSession`.
+// SAFETY: Host guarantees `ctx` and callback pointers remain valid and thread-safe until
+// `destroy` is invoked when `FfiSession` drops.
 unsafe impl Send for SendHttpCallbacks {}
 unsafe impl Sync for SendHttpCallbacks {}
 
@@ -51,6 +52,12 @@ impl SendHttpCallbacks {
             return Err("http_callbacks.start must not be null".to_string());
         }
         Ok(Self { raw })
+    }
+
+    pub(crate) fn fire_destroy(&self) {
+        if let Some(f) = self.raw.destroy {
+            f(self.raw.ctx);
+        }
     }
 
     fn fire_start(

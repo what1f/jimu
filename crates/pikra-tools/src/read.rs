@@ -102,6 +102,15 @@ impl AgentTool for ReadTool {
             if meta.is_dir() {
                 return Err(format!("cannot read '{shown}': path is a directory"));
             }
+            if !meta.is_file() {
+                return Err(format!("cannot read '{shown}': path is not a regular file"));
+            }
+            if meta.len() > 16 * 1024 * 1024 {
+                return Err(format!(
+                    "cannot read '{shown}': file size ({} bytes) exceeds 16 MiB limit",
+                    meta.len()
+                ));
+            }
 
             let bytes = tokio::fs::read(&resolved)
                 .await

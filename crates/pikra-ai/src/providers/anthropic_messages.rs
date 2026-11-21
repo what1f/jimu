@@ -329,16 +329,31 @@ pub fn build_request_body(
     let mut thinking_enabled = false;
     if model.supports_reasoning
         && let Some(level) = options.reasoning
-        && let Some(budget) = thinking_budget_for_level(level, max_tokens)
+        && level != ThinkingLevel::Off
     {
-        thinking_enabled = true;
-        body.insert(
-            "thinking".into(),
-            json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            }),
-        );
+        let lower_id = model.id.to_ascii_lowercase();
+        let uses_adaptive = lower_id.contains("4-7") || lower_id.contains("4.7");
+        if uses_adaptive {
+            thinking_enabled = true;
+            let effort = match level {
+                ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
+                ThinkingLevel::Off => "low",
+            };
+            body.insert("thinking".into(), json!({ "type": "adaptive" }));
+            body.insert("output_config".into(), json!({ "effort": effort }));
+        } else if let Some(budget) = thinking_budget_for_level(level, max_tokens) {
+            thinking_enabled = true;
+            body.insert(
+                "thinking".into(),
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }),
+            );
+        }
     }
 
     if let Some(temperature) = options.temperature
@@ -764,6 +779,7 @@ pub fn stream(
                 }
                 "message_stop" => {
                     saw_message_stop = true;
+                    break;
                 }
                 "error" => {
                     let msg = parsed

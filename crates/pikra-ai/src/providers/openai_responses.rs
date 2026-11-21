@@ -188,10 +188,11 @@ fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
                             input.push(Value::Object(item));
                         }
                         AssistantBlock::ToolCall(tc) => {
-                            let (call_id, raw_item_id) = match tc.id.split_once('|') {
+                            let (call_id, legacy_item_id) = match tc.id.split_once('|') {
                                 Some((c, i)) => (c, Some(i)),
                                 None => (tc.id.as_str(), None),
                             };
+                            let raw_item_id = tc.thought_signature.as_deref().or(legacy_item_id);
                             let mut item = Map::new();
                             item.insert("type".into(), json!("function_call"));
                             if is_same_model
@@ -779,6 +780,7 @@ pub fn stream(
                             }
                         }
                     }
+                    break;
                 }
                 "response.failed" => {
                     let err_msg = parsed
@@ -886,11 +888,12 @@ fn create_slot_from_item(
         "function_call" => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
-            let id = if !item_id.is_empty() {
-                format!("{call_id}|{item_id}")
-            } else {
+            let id = if !call_id.is_empty() {
                 call_id.to_string()
+            } else {
+                item_id.to_string()
             };
+            let stored_item_id = (!item_id.is_empty()).then(|| item_id.to_string());
             let name = item
                 .get("name")
                 .and_then(Value::as_str)
@@ -911,7 +914,7 @@ fn create_slot_from_item(
                 id: id.clone(),
                 name: name.clone(),
                 arguments: Map::new(),
-                thought_signature: None,
+                thought_signature: stored_item_id,
                 namespace,
                 arguments_error: None,
             }));

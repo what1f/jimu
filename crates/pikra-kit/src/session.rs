@@ -33,10 +33,17 @@ const SKILLS_CONTEXT_NAME: &str = "skills";
 const DEFERRED_TOOLS_CONTEXT_NAME: &str = "deferred_tools";
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        0
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// Tool registration specification distinguishing resident vs deferred tools.
@@ -256,7 +263,10 @@ impl KitSession {
                 resident.push(Arc::new(ToolSearchTool::new(Arc::clone(&deferred_registry))));
             }
             if !resident.iter().any(|t| t.definition().name == CALL_TOOL_NAME) {
-                resident.push(Arc::new(CallToolGateway::new(Arc::clone(&deferred_registry))));
+                resident.push(Arc::new(
+                    CallToolGateway::new(Arc::clone(&deferred_registry))
+                        .with_middlewares(config.middlewares.clone()),
+                ));
             }
         }
 
@@ -267,11 +277,14 @@ impl KitSession {
                 .iter()
                 .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
         {
-            let exec_tool: Arc<dyn AgentTool> = Arc::new(CodemodeExecTool::new(
-                Arc::clone(&resident_tools_handle),
-                Arc::clone(&deferred_registry),
-                config.codemode_options.clone(),
-            ));
+            let exec_tool: Arc<dyn AgentTool> = Arc::new(
+                CodemodeExecTool::new(
+                    Arc::clone(&resident_tools_handle),
+                    Arc::clone(&deferred_registry),
+                    config.codemode_options.clone(),
+                )
+                .with_middlewares(config.middlewares.clone()),
+            );
             resident.push(exec_tool);
             *resident_tools_handle
                 .lock()
@@ -697,7 +710,7 @@ impl KitSession {
                 if let AgentEvent::MessageEnd { message } = &ev {
                     if seen_ends >= flushed_count {
                         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = session.append_message(message.clone());
+                        session.append_message(message.clone())?;
                     }
                     seen_ends += 1;
                 }
@@ -754,9 +767,10 @@ impl KitSession {
                 .or_else(|| self.api_key.clone()),
             None => self.api_key.clone(),
         };
+        let level = self.agent.thinking_level();
         SimpleStreamOptions {
             api_key,
-            reasoning: Some(self.agent.thinking_level()),
+            reasoning: (level != ThinkingLevel::Off).then_some(level),
             fast: Some(self.agent.fast()),
             temperature: None,
             max_tokens: None,
@@ -789,6 +803,7 @@ impl KitSession {
         };
 
         let tokens_before = prepared.input.tokens_before;
+        let expected_leaf = prepared.expected_leaf_id.clone();
         if let Some(tx) = stream_tx {
             let _ = tx.unbounded_send(KitEvent::Session(SessionEvent::CompactionStart {
                 tokens_before,
@@ -798,11 +813,19 @@ impl KitSession {
         let output =
             SessionManager::execute_prepared_compaction(&*self.provider, prepared).await?;
 
-        let (result, reconstructed) = {
+        let (maybe_result, reconstructed) = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            let res = session.commit_compaction(output, tokens_before)?;
+            let res = session.commit_compaction_if_leaf_matches(
+                output,
+                tokens_before,
+                expected_leaf.as_deref(),
+            )?;
             let recon = session.reconstruct_context();
             (res, recon)
+        };
+
+        let Some(result) = maybe_result else {
+            return Ok(None);
         };
 
         self.deferred_registry.clear_seen_schemas();

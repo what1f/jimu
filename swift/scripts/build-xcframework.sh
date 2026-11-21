@@ -68,9 +68,9 @@ else
   cp "$tmp_dir/libpikra_ffi_${default_target}.a" "$tmp_dir/libpikra_ffi.a"
 fi
 
-mkdir -p "$tmp_dir/Headers"
-cp "$repo_root/crates/pikra-ffi/include/pikra.h" "$tmp_dir/Headers/pikra.h"
-cp "$repo_root/crates/pikra-ffi/include/module.modulemap" "$tmp_dir/Headers/module.modulemap"
+mkdir -p "$tmp_dir/Headers/CPikra"
+cp "$repo_root/crates/pikra-ffi/include/pikra.h" "$tmp_dir/Headers/CPikra/pikra.h"
+cp "$repo_root/crates/pikra-ffi/include/module.modulemap" "$tmp_dir/Headers/CPikra/module.modulemap"
 
 out_xcframework="$repo_root/swift/Artifacts/PikraCore.xcframework"
 mkdir -p "$repo_root/swift/Artifacts"

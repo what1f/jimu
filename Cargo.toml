@@ -35,6 +35,9 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+[profile.release.build-override]
+strip = "none"
+
 [workspace.dependencies]
 pikra-schema = { path = "crates/pikra-schema" }
 pikra-ai = { path = "crates/pikra-ai" }

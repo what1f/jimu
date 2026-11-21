@@ -8,10 +8,17 @@ pub type ConvertToLlmFn =
     Arc<dyn Fn(&str, &[ToolDefinition], &[AgentMessage]) -> TranscriptContext + Send + Sync>;
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        0
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// Converts [`AgentMessage`]s into a [`TranscriptContext`] for the LLM while preserving

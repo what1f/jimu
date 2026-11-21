@@ -24,7 +24,7 @@ fn convert_tools(tools: &[ToolDefinition]) -> Value {
             let mut decl = Map::new();
             decl.insert("name".into(), Value::String(tool.name.clone()));
             decl.insert("description".into(), Value::String(tool.description.clone()));
-            decl.insert("parameters".into(), tool.parameters.clone());
+            decl.insert("parametersJsonSchema".into(), tool.parameters.clone());
             Value::Object(decl)
         })
         .collect();
@@ -214,9 +214,13 @@ fn uses_thinking_level(model_id: &str) -> bool {
     lower.contains("gemini-3") || lower.contains("gemini-4")
 }
 
-fn build_thinking_config(model: &Model, level: ThinkingLevel) -> Value {
+fn build_thinking_config(model: &Model, level: ThinkingLevel) -> Option<Value> {
     if level == ThinkingLevel::Off {
-        return json!({ "thinkingBudget": 0 });
+        let lower = model.id.to_ascii_lowercase();
+        if lower.contains("pro") || uses_thinking_level(&model.id) {
+            return None;
+        }
+        return Some(json!({ "thinkingBudget": 0 }));
     }
     if uses_thinking_level(&model.id) {
         let lvl = match level {
@@ -226,10 +230,10 @@ fn build_thinking_config(model: &Model, level: ThinkingLevel) -> Value {
             ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "HIGH",
             ThinkingLevel::Off => "MINIMAL",
         };
-        json!({
+        Some(json!({
             "includeThoughts": true,
             "thinkingLevel": lvl,
-        })
+        }))
     } else {
         let budget = match level {
             ThinkingLevel::Minimal => 128,
@@ -238,10 +242,10 @@ fn build_thinking_config(model: &Model, level: ThinkingLevel) -> Value {
             ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => 24_576,
             ThinkingLevel::Off => 0,
         };
-        json!({
+        Some(json!({
             "includeThoughts": true,
             "thinkingBudget": budget,
-        })
+        }))
     }
 }
 
@@ -278,8 +282,9 @@ pub fn build_request_body(
     }
     if model.supports_reasoning
         && let Some(level) = options.reasoning
+        && let Some(tc) = build_thinking_config(model, level)
     {
-        gen_cfg.insert("thinkingConfig".into(), build_thinking_config(model, level));
+        gen_cfg.insert("thinkingConfig".into(), tc);
     }
     for (k, v) in &options.sampling_params {
         gen_cfg.insert(k.clone(), v.clone());

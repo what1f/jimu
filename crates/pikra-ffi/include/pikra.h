@@ -48,10 +48,15 @@ typedef void (*PikraHttpCancelFn)(
     uint64_t request_id
 );
 
+typedef void (*PikraVoidDoneFn)(
+    void *ctx
+);
+
 typedef struct PikraHttpCallbacks {
     void *ctx;
     PikraHttpStartFn start;
     PikraHttpCancelFn cancel;
+    PikraVoidDoneFn destroy;
 } PikraHttpCallbacks;
 
 /* ---- Host Native Async Tool Callbacks ---- */
@@ -87,10 +92,6 @@ typedef void (*PikraStreamDoneFn)(
     void *ctx,
     PikraStatus status,
     const char *error_message
-);
-
-typedef void (*PikraVoidDoneFn)(
-    void *ctx
 );
 
 typedef void (*PikraResultDoneFn)(
@@ -211,6 +212,12 @@ PikraStatus pikra_session_set_thinking_level(
 PikraStatus pikra_session_set_fast(
     PikraSession *session,
     bool fast,
+    char **out_error
+);
+
+PikraStatus pikra_session_set_api_key(
+    PikraSession *session,
+    const char *api_key,
     char **out_error
 );
 

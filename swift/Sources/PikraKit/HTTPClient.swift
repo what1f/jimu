@@ -240,6 +240,8 @@ private final class CredentialRedirectPolicy: NSObject, URLSessionTaskDelegate {
     ) async -> URLRequest? {
         guard let original = task.originalRequest,
               original.value(forHTTPHeaderField: "Authorization") == nil,
+              original.value(forHTTPHeaderField: "x-api-key") == nil,
+              original.value(forHTTPHeaderField: "x-goog-api-key") == nil,
               ["GET", "HEAD"].contains(original.httpMethod ?? "GET")
         else {
             return nil

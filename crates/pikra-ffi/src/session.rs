@@ -87,14 +87,21 @@ pub struct FfiSession {
     skills: Mutex<SkillCatalog>,
     skill_roots: Vec<PathBuf>,
     had_deferred_catalog: Mutex<bool>,
+    http_callbacks: SendHttpCallbacks,
     tool_callbacks: SendToolCallbacks,
     next_tool_call_id: Arc<AtomicU64>,
     js_runtime: Option<JsExtensionRuntime>,
-    api_key: Option<String>,
+    api_key: Mutex<Option<String>>,
     cache_retention: CacheRetention,
     headers: Vec<(String, Option<String>)>,
     rollback_first_turn_on_failure: bool,
     run_state: Mutex<SessionRunState>,
+}
+
+impl Drop for FfiSession {
+    fn drop(&mut self) {
+        self.http_callbacks.fire_destroy();
+    }
 }
 
 /// Opaque C handle wrapping `Arc<FfiSession>`.
@@ -158,9 +165,10 @@ impl FfiSession {
                 resident.push(Arc::new(ToolSearchTool::new(Arc::clone(&deferred_registry))));
             }
             if !resident.iter().any(|t| t.definition().name == CALL_TOOL_NAME) {
-                resident.push(Arc::new(CallToolGateway::new(Arc::clone(
-                    &deferred_registry,
-                ))));
+                resident.push(Arc::new(
+                    CallToolGateway::new(Arc::clone(&deferred_registry))
+                        .with_middlewares(middlewares.clone()),
+                ));
             }
         }
 
@@ -175,11 +183,14 @@ impl FfiSession {
                 .codemode_options
                 .map(Into::into)
                 .unwrap_or_default();
-            let exec_tool: Arc<dyn AgentTool> = Arc::new(CodemodeExecTool::new(
-                Arc::clone(&resident_tools_handle),
-                Arc::clone(&deferred_registry),
-                cm_opts,
-            ));
+            let exec_tool: Arc<dyn AgentTool> = Arc::new(
+                CodemodeExecTool::new(
+                    Arc::clone(&resident_tools_handle),
+                    Arc::clone(&deferred_registry),
+                    cm_opts,
+                )
+                .with_middlewares(middlewares.clone()),
+            );
             resident.push(exec_tool);
             *resident_tools_handle
                 .lock()
@@ -258,10 +269,11 @@ impl FfiSession {
             skills: Mutex::new(skills),
             skill_roots,
             had_deferred_catalog: Mutex::new(had_deferred_catalog),
+            http_callbacks: http_cb,
             tool_callbacks: tool_cb,
             next_tool_call_id,
             js_runtime,
-            api_key: config.api_key,
+            api_key: Mutex::new(config.api_key),
             cache_retention: config.cache_retention,
             headers: config.headers,
             rollback_first_turn_on_failure: config.rollback_first_turn_on_failure,
@@ -360,6 +372,20 @@ impl FfiSession {
                 }
             }
 
+            if prompt_cancel.is_cancelled() || this.is_closed() {
+                emit(&FfiEvent::TurnEnded {
+                    stop_reason: StopReason::Aborted,
+                    user_message_kept: false,
+                    error_message: Some("Operation aborted".to_string()),
+                });
+                let waiters = this.finish_active_run();
+                on_done(ctx.as_ptr(), PikraStatus::Ok, std::ptr::null());
+                for w in waiters {
+                    let _ = w.send(());
+                }
+                return;
+            }
+
             let stream_res = this.agent.prompt_messages_stream(prompt_messages);
             let mut agent_stream = match stream_res {
                 Ok(s) => s,
@@ -377,6 +403,9 @@ impl FfiSession {
                     return;
                 }
             };
+            if prompt_cancel.is_cancelled() || this.is_closed() {
+                this.agent.abort_now();
+            }
 
             let mut seen_ends = 0usize;
             let mut deferred_persist: Vec<AgentMessage> = Vec::new();
@@ -588,6 +617,7 @@ impl FfiSession {
             let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(active) = state.active.as_mut() {
                 active.cancel.cancel();
+                self.agent.abort_now();
                 let (tx, rx) = oneshot::channel();
                 active.idle_waiters.push(tx);
                 Some(rx)
@@ -595,11 +625,8 @@ impl FfiSession {
                 None
             }
         };
-        self.agent.abort_now();
 
-        let this = Arc::clone(self);
         global_pool().spawn_ok(async move {
-            this.agent.abort().await;
             if let Some(rx) = waiter {
                 let _ = rx.await;
             }
@@ -617,6 +644,7 @@ impl FfiSession {
             state.closed = true;
             if let Some(active) = state.active.as_mut() {
                 active.cancel.cancel();
+                self.agent.abort_now();
                 let (tx, rx) = oneshot::channel();
                 active.idle_waiters.push(tx);
                 Some(rx)
@@ -624,11 +652,8 @@ impl FfiSession {
                 None
             }
         };
-        self.agent.abort_now();
 
-        let this = Arc::clone(self);
         global_pool().spawn_ok(async move {
-            this.agent.abort().await;
             if let Some(rx) = waiter {
                 let _ = rx.await;
             }
@@ -717,6 +742,16 @@ impl FfiSession {
             .unwrap_or_else(|e| e.into_inner())
             .append_thinking_change(level, fast)
             .map_err(|e| (PikraStatus::ErrIo, e.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) fn set_api_key(&self, api_key: Option<String>) -> Result<(), (PikraStatus, String)> {
+        self.check_open_and_idle()
+            .map_err(|s| (s, status_message(s)))?;
+        self.agent
+            .set_api_key(api_key.clone())
+            .map_err(|e| (PikraStatus::ErrBusy, e.to_string()))?;
+        *self.api_key.lock().unwrap_or_else(|e| e.into_inner()) = api_key;
         Ok(())
     }
 
@@ -859,9 +894,15 @@ impl FfiSession {
         cancel: CancelToken,
     ) -> Result<Option<CompactionResult>, String> {
         let model = self.agent.model();
+        let level = self.agent.thinking_level();
+        let current_api_key = self
+            .api_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let options = SimpleStreamOptions {
-            api_key: self.api_key.clone(),
-            reasoning: Some(self.agent.thinking_level()),
+            api_key: current_api_key,
+            reasoning: (level != ThinkingLevel::Off).then_some(level),
             fast: Some(self.agent.fast()),
             temperature: None,
             max_tokens: None,
@@ -885,6 +926,7 @@ impl FfiSession {
         };
 
         let tokens_before = prepared.input.tokens_before;
+        let expected_leaf = prepared.expected_leaf_id.clone();
         if let Some(cb) = emit {
             cb(&FfiEvent::CompactionStarted { tokens_before });
         }
@@ -893,13 +935,21 @@ impl FfiSession {
             .await
             .map_err(|e| e.to_string())?;
 
-        let (result, reconstructed) = {
+        let (maybe_result, reconstructed) = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
             let res = session
-                .commit_compaction(output, tokens_before)
+                .commit_compaction_if_leaf_matches(
+                    output,
+                    tokens_before,
+                    expected_leaf.as_deref(),
+                )
                 .map_err(|e| e.to_string())?;
             let recon = session.reconstruct_context();
             (res, recon)
+        };
+
+        let Some(result) = maybe_result else {
+            return Ok(None);
         };
 
         self.deferred_registry.clear_seen_schemas();
