@@ -4,7 +4,12 @@ use crate::deferred::{
 };
 use crate::error::KitError;
 use crate::mcp::{McpClient, McpToolRegistrationMode};
-use crate::skills::SkillCatalog;
+use crate::skills::{
+    SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillSearchTool, escape_xml,
+};
+use crate::wakeup::{
+    Activity, ActivityGuard, BackgroundEventSender, BackgroundInbox, KitTurnOrigin,
+};
 use futures_channel::mpsc;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -14,7 +19,7 @@ use pikra_agent::{
 };
 use pikra_ai::{
     BoxFuture, CacheRetention, CancelToken, ContentPart, Message, Model, SimpleStreamOptions,
-    StreamProvider, ThinkingLevel, ToolDefinition, UserMessage,
+    StopReason, StreamProvider, ThinkingLevel, ToolDefinition, UserMessage,
 };
 use pikra_codemode::CodemodeSandboxOptions;
 use pikra_session::{
@@ -22,14 +27,19 @@ use pikra_session::{
     SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore, SessionTreeNode,
     baseline_to_system_message, context_block_to_agent_message,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SKILLS_CONTEXT_NAME: &str = "skills";
+const SKILL_STATE_ENTRY: &str = "kit.known_skills";
+const DEFAULT_AUTO_DEFER_BYTES: usize = 8192;
 const DEFERRED_TOOLS_CONTEXT_NAME: &str = "deferred_tools";
 
 fn now_ms() -> u64 {
@@ -46,27 +56,39 @@ fn now_ms() -> u64 {
     }
 }
 
-/// Tool registration specification distinguishing resident vs deferred tools.
+/// Controls how a tool is exposed to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KitToolRegistrationMode {
+    Resident,
+    Deferred,
+    Auto,
+}
+
 #[derive(Clone)]
 pub struct KitToolSpec {
     pub tool: Arc<dyn AgentTool>,
-    /// When `true`, tool is registered in the deferred gateway (`tool_search` + `call_tool`)
-    /// and NEVER enters the top-level resident `tools` array.
-    pub deferred: bool,
+    pub mode: KitToolRegistrationMode,
 }
 
 impl KitToolSpec {
     pub fn resident(tool: Arc<dyn AgentTool>) -> Self {
         Self {
             tool,
-            deferred: false,
+            mode: KitToolRegistrationMode::Resident,
         }
     }
 
     pub fn deferred(tool: Arc<dyn AgentTool>) -> Self {
         Self {
             tool,
-            deferred: true,
+            mode: KitToolRegistrationMode::Deferred,
+        }
+    }
+
+    pub fn auto(tool: Arc<dyn AgentTool>) -> Self {
+        Self {
+            tool,
+            mode: KitToolRegistrationMode::Auto,
         }
     }
 }
@@ -80,6 +102,15 @@ pub struct KitSessionConfig {
     pub thinking_level: ThinkingLevel,
     pub fast: bool,
     pub skill_roots: Vec<PathBuf>,
+    pub skill_discovery: SkillDiscoveryConfig,
+    /// Expose a resident skill search tool (default: true).
+    pub enable_skill_search: bool,
+    /// Resident schema budget for automatic placement. Explicit resident tools are pinned.
+    /// When omitted, tools explicitly marked Auto use an 8 KiB budget.
+    pub auto_defer_threshold_bytes: Option<usize>,
+    /// Pause background turns after an error or abort, until a foreground turn succeeds
+    /// or the host calls resume_background (default: true).
+    pub pause_background_on_error: bool,
     /// Expose resident `tool_search` & `call_tool` gateway tools (default: `true`).
     pub enable_deferred_gateway: bool,
     /// Expose resident `exec` tool backed by `pikra_codemode::CodemodeSandbox` (default: `false`).
@@ -111,6 +142,10 @@ impl KitSessionConfig {
             thinking_level: ThinkingLevel::Off,
             fast: false,
             skill_roots: Vec::new(),
+            skill_discovery: SkillDiscoveryConfig::default(),
+            enable_skill_search: true,
+            auto_defer_threshold_bytes: None,
+            pause_background_on_error: true,
             enable_deferred_gateway: true,
             enable_codemode: false,
             codemode_options: CodemodeSandboxOptions::default(),
@@ -157,6 +192,11 @@ impl KitSessionConfig {
         self
     }
 
+    pub fn with_skill_discovery(mut self, discovery: SkillDiscoveryConfig) -> Self {
+        self.skill_discovery = discovery;
+        self
+    }
+
     pub fn with_codemode(mut self, enabled: bool) -> Self {
         self.enable_codemode = enabled;
         self
@@ -192,6 +232,13 @@ pub struct KitEventStream<'a> {
     rx: mpsc::UnboundedReceiver<KitEvent>,
     driver: Option<BoxFuture<'a, Result<(), KitError>>>,
     terminal_error: Option<String>,
+    origin: KitTurnOrigin,
+}
+
+impl KitEventStream<'_> {
+    pub fn origin(&self) -> KitTurnOrigin {
+        self.origin
+    }
 }
 
 impl Stream for KitEventStream<'_> {
@@ -239,20 +286,103 @@ impl Stream for KitEventStream<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KitActivity {
-    Idle,
-    RunningPrompt,
-    Compacting,
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KnownSkillEntry {
+    description: String,
+    file_path: String,
+    revision: String,
 }
 
-struct ActivityGuard {
-    activity: Arc<Mutex<KitActivity>>,
+#[derive(Default)]
+struct KnownSkills {
+    entries: Option<BTreeMap<String, KnownSkillEntry>>,
+    has_named_context: bool,
 }
 
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = KitActivity::Idle;
+impl KnownSkills {
+    fn from_branch(session: &SessionManager) -> Self {
+        let branch = session.active_branch();
+        let previous_catalog = branch.iter().rev().find_map(|entry| match &entry.payload {
+            SessionEntryPayload::ContextBlock { name, text } if name == SKILLS_CONTEXT_NAME => {
+                Some(text)
+            }
+            _ => None,
+        });
+        let entries = branch
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.payload {
+                SessionEntryPayload::Custom { custom_type, data }
+                    if custom_type == SKILL_STATE_ENTRY =>
+                {
+                    serde_json::from_value(data.clone()).ok().map(Some)
+                }
+                SessionEntryPayload::Compaction { .. } => Some(None),
+                // Older sessions put the whole catalog in the named context block.
+                SessionEntryPayload::ContextBlock { name, text } if name == SKILLS_CONTEXT_NAME => {
+                    let skills = text
+                        .split("<skill>")
+                        .skip(1)
+                        .filter_map(|row| {
+                            let field = |tag: &str| {
+                                let content = row.split_once(&format!("<{tag}>"))?.1;
+                                let raw = content.split_once(&format!("</{tag}>"))?.0;
+                                Some(
+                                    raw.replace("&lt;", "<")
+                                        .replace("&gt;", ">")
+                                        .replace("&quot;", "\"")
+                                        .replace("&apos;", "'")
+                                        .replace("&amp;", "&"),
+                                )
+                            };
+                            Some((
+                                field("name")?,
+                                KnownSkillEntry {
+                                    description: field("description")?,
+                                    file_path: field("location")?,
+                                    revision: String::new(),
+                                },
+                            ))
+                        })
+                        .collect();
+                    Some(Some(skills))
+                }
+                _ => None,
+            })
+            .flatten();
+        Self {
+            entries,
+            has_named_context: previous_catalog.is_some(),
+        }
+    }
+}
+
+struct SchemaBudget {
+    remaining: usize,
+}
+
+impl SchemaBudget {
+    fn new(threshold: Option<usize>, pinned: &[ToolDefinition]) -> Self {
+        let budget = threshold.unwrap_or(DEFAULT_AUTO_DEFER_BYTES);
+        let occupied = pinned.iter().fold(0usize, |total, definition| {
+            total.saturating_add(Self::size(definition))
+        });
+        Self {
+            remaining: budget.saturating_sub(occupied),
+        }
+    }
+
+    fn size(definition: &ToolDefinition) -> usize {
+        serde_json::to_vec(definition).map_or(usize::MAX, |bytes| bytes.len())
+    }
+
+    fn admit(&mut self, definition: &ToolDefinition) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(Self::size(definition)) else {
+            self.remaining = 0;
+            return false;
+        };
+        self.remaining = remaining;
+        true
     }
 }
 
@@ -266,11 +396,13 @@ pub struct KitSession {
     resident_tools: Arc<Mutex<Vec<Arc<dyn AgentTool>>>>,
     codemode_exec_tool: Option<Arc<dyn AgentTool>>,
     deferred_registry: Arc<DeferredToolRegistry>,
-    skills: Mutex<SkillCatalog>,
-    skill_roots: Vec<PathBuf>,
-    had_skills_catalog: Mutex<bool>,
+    skills: Arc<Mutex<SkillCatalog>>,
+    skill_discovery: SkillDiscoveryConfig,
+    known_skills: Mutex<KnownSkills>,
+    auto_defer_threshold_bytes: Option<usize>,
+    pause_background_on_error: bool,
+    inbox: BackgroundInbox,
     had_deferred_catalog: Mutex<bool>,
-    activity: Arc<Mutex<KitActivity>>,
     api_key: Option<String>,
     get_api_key: Option<ApiKeyResolver>,
     cache_retention: CacheRetention,
@@ -281,21 +413,47 @@ impl KitSession {
     /// Construct a new or reopened [`KitSession`].
     pub fn new(
         provider: Arc<dyn StreamProvider>,
-        config: KitSessionConfig,
+        mut config: KitSessionConfig,
     ) -> Result<Self, KitError> {
         let deferred_registry = Arc::new(DeferredToolRegistry::new());
         let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
         let mut deferred: Vec<Arc<dyn AgentTool>> = Vec::new();
 
+        let mut skill_discovery = config.skill_discovery;
+        skill_discovery.extra_roots.append(&mut config.skill_roots);
+        if skill_discovery.cwd.is_none() {
+            skill_discovery.cwd = config.cwd.as_ref().map(PathBuf::from);
+        }
+        let skills = Arc::new(Mutex::new(SkillCatalog::discover_with_config(
+            &skill_discovery,
+        )));
+
+        let pinned: Vec<_> = config
+            .tools
+            .iter()
+            .filter(|spec| spec.mode == KitToolRegistrationMode::Resident)
+            .map(|spec| spec.tool.definition())
+            .collect();
+        let mut budget = SchemaBudget::new(config.auto_defer_threshold_bytes, &pinned);
         for spec in config.tools {
-            if spec.deferred {
-                deferred.push(spec.tool);
-            } else {
-                resident.push(spec.tool);
+            match spec.mode {
+                KitToolRegistrationMode::Resident => resident.push(spec.tool),
+                KitToolRegistrationMode::Auto if budget.admit(&spec.tool.definition()) => {
+                    resident.push(spec.tool)
+                }
+                KitToolRegistrationMode::Auto | KitToolRegistrationMode::Deferred => {
+                    deferred.push(spec.tool)
+                }
             }
         }
-
         deferred_registry.upsert(deferred);
+        if config.enable_skill_search
+            && !resident
+                .iter()
+                .any(|tool| tool.definition().name == SKILL_SEARCH_NAME)
+        {
+            resident.push(Arc::new(SkillSearchTool::shared(Arc::clone(&skills))));
+        }
 
         // Always keep built-in deferred gateway resident (when enabled) so adding/removing
         // deferred tools later NEVER mutates the leading resident `tools` array!
@@ -378,19 +536,7 @@ impl KitSession {
             .map(|(_, f)| f)
             .unwrap_or(config.fast);
 
-        let skills = SkillCatalog::discover(&config.skill_roots);
-        let mut had_skills_catalog = reconstructed
-            .all_branch_context_blocks
-            .contains_key(SKILLS_CONTEXT_NAME);
-        if let Some(skills_xml) = skills.format_for_context() {
-            session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
-            had_skills_catalog = true;
-        } else if had_skills_catalog {
-            session_manager.set_context(
-                SKILLS_CONTEXT_NAME,
-                "<available_skills>\n</available_skills>",
-            );
-        }
+        let known_skills = KnownSkills::from_branch(&session_manager);
 
         let mut had_deferred_catalog = false;
         if let Some(catalog) = deferred_registry.format_catalog() {
@@ -426,11 +572,13 @@ impl KitSession {
             resident_tools: resident_tools_handle,
             codemode_exec_tool,
             deferred_registry,
-            skills: Mutex::new(skills),
-            skill_roots: config.skill_roots,
-            had_skills_catalog: Mutex::new(had_skills_catalog),
+            skills,
+            skill_discovery,
+            known_skills: Mutex::new(known_skills),
+            auto_defer_threshold_bytes: config.auto_defer_threshold_bytes,
+            pause_background_on_error: config.pause_background_on_error,
+            inbox: BackgroundInbox::default(),
             had_deferred_catalog: Mutex::new(had_deferred_catalog),
-            activity: Arc::new(Mutex::new(KitActivity::Idle)),
             api_key: config.api_key,
             get_api_key: config.get_api_key,
             cache_retention: config.cache_retention,
@@ -492,30 +640,31 @@ impl KitSession {
     }
 
     pub fn is_running(&self) -> bool {
-        self.agent.is_running()
-            || *self.activity.lock().unwrap_or_else(|e| e.into_inner()) != KitActivity::Idle
+        self.inbox.is_active() || self.agent.is_running()
     }
 
-    fn try_begin_activity(&self, next: KitActivity) -> Result<ActivityGuard, KitError> {
-        let mut guard = self.activity.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard != KitActivity::Idle || self.agent.is_running() {
+    fn try_begin_activity(&self, activity: Activity) -> Result<ActivityGuard, KitError> {
+        if self.agent.is_running() {
             return Err(KitError::Busy);
         }
-        *guard = next;
-        Ok(ActivityGuard {
-            activity: Arc::clone(&self.activity),
-        })
+        Ok(self
+            .inbox
+            .begin(activity, self.pause_background_on_error)?
+            .expect("foreground prompts and compaction do not require a background event"))
     }
 
     fn with_idle_mutation<R>(
         &self,
         f: impl FnOnce() -> Result<R, KitError>,
     ) -> Result<R, KitError> {
-        let guard = self.activity.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard != KitActivity::Idle || self.agent.is_running() {
-            return Err(KitError::Busy);
-        }
-        f()
+        self.inbox
+            .with_idle(|| {
+                if self.agent.is_running() {
+                    return Err(KitError::Busy);
+                }
+                f()
+            })
+            .ok_or(KitError::Busy)?
     }
 
     fn sync_agent_leading_system_message(
@@ -556,33 +705,20 @@ impl KitSession {
             .clone()
     }
 
-    /// Re-scan configured `skill_roots` and update the `"skills"` context block only if changed.
+    /// Re-scan configured skill roots. The next prompt delivers the net additions and removals.
+    /// Returns whether model-visible skill names changed.
     pub fn reload_skills(&self) -> bool {
-        let discovered = SkillCatalog::discover(&self.skill_roots);
-        let formatted = discovered.format_for_context();
-        *self.skills.lock().unwrap_or_else(|e| e.into_inner()) = discovered;
-        let mut had_catalog = self
-            .had_skills_catalog
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match formatted {
-            Some(xml) => {
-                *had_catalog = true;
-                self.session
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .set_context(SKILLS_CONTEXT_NAME, xml)
-            }
-            None if *had_catalog => self
-                .session
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_context(
-                    SKILLS_CONTEXT_NAME,
-                    "<available_skills>\n</available_skills>",
-                ),
-            None => false,
-        }
+        let mut skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let discovered = SkillCatalog::discover_with_config(&self.skill_discovery);
+        let names = |catalog: &SkillCatalog| {
+            catalog
+                .visible()
+                .map(|skill| skill.name.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let changed = names(&skills) != names(&discovered);
+        *skills = discovered;
+        changed
     }
 
     // ---- Idle Configuration Updates (Zero Spurious Busy) ----
@@ -721,62 +857,77 @@ impl KitSession {
         let names: Vec<String> = agent_tools.iter().map(|t| t.definition().name).collect();
 
         self.with_idle_mutation(|| {
-            match mode {
-                McpToolRegistrationMode::Deferred => {
-                    self.deferred_registry.upsert(agent_tools);
-                    self.sync_deferred_tools_context();
+            let (resident, deferred): (Vec<_>, Vec<_>) = match mode {
+                McpToolRegistrationMode::Resident => (agent_tools, Vec::new()),
+                McpToolRegistrationMode::Deferred => (Vec::new(), agent_tools),
+                McpToolRegistrationMode::Auto => {
+                    let definitions = self.agent.tool_definitions();
+                    let existing: std::collections::HashSet<_> =
+                        definitions.iter().map(|def| def.name.as_str()).collect();
+                    let mut budget =
+                        SchemaBudget::new(self.auto_defer_threshold_bytes, &definitions);
+                    let has_started = self
+                        .session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entries()
+                        .iter()
+                        .any(|entry| matches!(entry.payload, SessionEntryPayload::Message { .. }));
+                    agent_tools
+                        .into_iter()
+                        .filter(|tool| !existing.contains(tool.definition().name.as_str()))
+                        .partition(|tool| {
+                            let definition = tool.definition();
+                            !has_started
+                                && self.deferred_registry.get(&definition.name).is_none()
+                                && budget.admit(&definition)
+                        })
                 }
-                McpToolRegistrationMode::Resident => {
-                    if !agent_tools.is_empty() {
-                        let mut next_resident = self
-                            .resident_tools
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
-                        let mut override_exec: Option<Arc<dyn AgentTool>> = None;
-                        for tool in agent_tools {
-                            let name = tool.definition().name;
-                            if name == CODEMODE_EXEC_TOOL_NAME {
-                                override_exec = Some(tool);
-                                continue;
-                            }
-                            if let Some(existing) = next_resident
-                                .iter_mut()
-                                .find(|t| t.definition().name == name)
-                            {
-                                *existing = tool;
-                            } else {
-                                next_resident.push(tool);
-                            }
-                        }
-
-                        let mut full_tools = next_resident.clone();
-                        if let Some(exec_tool) =
-                            override_exec.or_else(|| self.codemode_exec_tool.clone())
-                        {
-                            full_tools.push(exec_tool);
-                        }
-
-                        let updated_defs: Vec<ToolDefinition> =
-                            full_tools.iter().map(|t| t.definition()).collect();
-                        let current_prompt = self.agent.system_prompt();
-
-                        self.session
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .append_system_baseline(&current_prompt, updated_defs.clone())?;
-                        self.agent.set_tools(full_tools)?;
-                        self.sync_agent_leading_system_message(&current_prompt, &updated_defs)?;
-                        *self
-                            .resident_tools
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()) = next_resident;
-                    }
-                }
+            };
+            if !resident.is_empty() {
+                self.attach_resident_tools(resident)?;
+            }
+            if !deferred.is_empty() {
+                self.deferred_registry.upsert(deferred);
+                self.sync_deferred_tools_context();
             }
             Ok(())
         })?;
         Ok(names)
+    }
+
+    fn attach_resident_tools(&self, tools: Vec<Arc<dyn AgentTool>>) -> Result<(), KitError> {
+        let mut resident = self
+            .resident_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut next_resident = resident.clone();
+        let mut exec = self.codemode_exec_tool.clone();
+        for tool in tools {
+            let name = tool.definition().name;
+            if name == CODEMODE_EXEC_TOOL_NAME {
+                exec = Some(tool);
+            } else if let Some(existing) = next_resident
+                .iter_mut()
+                .find(|existing| existing.definition().name == name)
+            {
+                *existing = tool;
+            } else {
+                next_resident.push(tool);
+            }
+        }
+        let mut full_tools = next_resident.clone();
+        full_tools.extend(exec);
+        let definitions: Vec<_> = full_tools.iter().map(|tool| tool.definition()).collect();
+        let prompt = self.agent.system_prompt();
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_system_baseline(&prompt, definitions.clone())?;
+        self.agent.set_tools(full_tools)?;
+        self.sync_agent_leading_system_message(&prompt, &definitions)?;
+        *resident = next_resident;
+        Ok(())
     }
 
     /// Branch the session to `entry_id` without deleting sibling entries and re-sync `Agent`.
@@ -785,7 +936,20 @@ impl KitSession {
             let reconstructed = {
                 let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
                 session.fork(entry_id)?;
-                session.reconstruct_context()
+                let reconstructed = session.reconstruct_context();
+                let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
+                let mut restored = KnownSkills::from_branch(&session);
+                if let Some(catalog) = reconstructed
+                    .all_branch_context_blocks
+                    .get(SKILLS_CONTEXT_NAME)
+                {
+                    session.set_context(SKILLS_CONTEXT_NAME, catalog);
+                } else if known.has_named_context {
+                    session.set_context(SKILLS_CONTEXT_NAME, "");
+                    restored.has_named_context = true;
+                }
+                *known = restored;
+                reconstructed
             };
             self.deferred_registry.clear_seen_schemas();
             self.agent.set_system_prompt(&reconstructed.system_prompt)?;
@@ -796,7 +960,7 @@ impl KitSession {
 
     /// Run manual compaction immediately while idle.
     pub async fn compact(&self) -> Result<Option<CompactionResult>, KitError> {
-        let _activity_guard = self.try_begin_activity(KitActivity::Compacting)?;
+        let _activity_guard = self.try_begin_activity(Activity::Compacting)?;
         self.run_compaction_internal(false, None).await
     }
 
@@ -815,12 +979,14 @@ impl KitSession {
     }
 
     pub fn abort_now(&self) {
+        self.inbox.abort_prompt();
         self.agent.abort_now();
     }
 
     /// Cancel any active run and await complete teardown so immediate subsequent calls never
     /// spuriously fail with `Busy`.
     pub async fn abort(&self) {
+        self.inbox.abort_prompt();
         self.agent.abort().await;
     }
 
@@ -853,81 +1019,190 @@ impl KitSession {
         &self,
         user_msg: AgentMessage,
     ) -> Result<Vec<AgentMessage>, KitError> {
-        let _activity_guard = self.try_begin_activity(KitActivity::RunningPrompt)?;
-
-        let (prompt_messages, flushed_count) = self.prepare_turn_prompt_messages(user_msg)?;
-        let new_messages = self.agent.prompt_messages(prompt_messages).await?;
-
-        {
-            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            for msg in new_messages.iter().skip(flushed_count) {
-                session.append_message(msg.clone())?;
-            }
-        }
-
-        // Auto-compact if threshold exceeded after turn completes.
-        let _ = self.run_compaction_internal(true, None).await?;
-
-        Ok(new_messages)
+        let activity = self.try_begin_activity(Activity::Prompt(KitTurnOrigin::Foreground))?;
+        self.drive_prompt(Some(user_msg), activity, None).await
     }
 
-    /// Run a text prompt as a [`KitEventStream`] yielding `AgentEvent` and `SessionEvent` items.
+    pub fn background_sender(&self) -> BackgroundEventSender {
+        self.inbox.sender()
+    }
+
+    pub fn drain_background_prompt(&self) -> Option<String> {
+        self.inbox.drain_prompt()
+    }
+
+    pub fn subscribe_background_wakeups(&self) -> mpsc::UnboundedReceiver<()> {
+        self.inbox.subscribe()
+    }
+
+    pub fn resume_background(&self) {
+        self.inbox.resume();
+    }
+
+    pub fn is_background_paused(&self) -> bool {
+        self.inbox.is_paused()
+    }
+
+    /// Reserve one background turn. The returned stream takes the batch when first polled.
+    /// Hosts can give user input priority by starting it before acting on a background wakeup.
+    pub fn run_background_turn(&self) -> Result<Option<KitEventStream<'_>>, KitError> {
+        if self.agent.is_running() {
+            return Err(KitError::Busy);
+        }
+        let origin = KitTurnOrigin::Background;
+        Ok(self
+            .inbox
+            .begin(Activity::Prompt(origin), self.pause_background_on_error)?
+            .map(|activity| self.start_prompt_stream(None, origin, activity)))
+    }
+
+    /// Run a text prompt as a stream of agent and session events.
     pub fn prompt_stream(&self, text: impl Into<String>) -> Result<KitEventStream<'_>, KitError> {
-        let activity_guard = self.try_begin_activity(KitActivity::RunningPrompt)?;
+        let origin = KitTurnOrigin::Foreground;
+        let activity = self.try_begin_activity(Activity::Prompt(origin))?;
         let user_msg = AgentMessage::Llm(Message::User(UserMessage::text(text, now_ms())));
+        Ok(self.start_prompt_stream(Some(user_msg), origin, activity))
+    }
+
+    fn start_prompt_stream(
+        &self,
+        user_msg: Option<AgentMessage>,
+        origin: KitTurnOrigin,
+        activity: ActivityGuard,
+    ) -> KitEventStream<'_> {
         let (tx, rx) = mpsc::unbounded();
-
-        // Defer flushing pending context and starting the agent run until the stream is actually
-        // polled for the first time, so dropping an unpolled `KitEventStream` never writes context
-        // blocks to `SessionManager` without delivering them to `Agent`.
+        // Start and flush only once the stream is polled.
         let driver: BoxFuture<'_, Result<(), KitError>> = Box::pin(async move {
-            let _activity_guard = activity_guard;
-            let (prompt_messages, flushed_count, flushed_events) =
-                self.prepare_turn_prompt_messages_with_events(user_msg)?;
-            for ev in flushed_events {
-                let _ = tx.unbounded_send(KitEvent::Session(ev));
-            }
-
-            let mut agent_stream = self.agent.prompt_messages_stream(prompt_messages)?;
-            let mut seen_ends = 0usize;
-            while let Some(ev) = agent_stream.next().await {
-                if let AgentEvent::MessageEnd { message } = &ev {
-                    if seen_ends >= flushed_count {
-                        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-                        session.append_message(message.clone())?;
-                    }
-                    seen_ends += 1;
-                }
-                let _ = tx.unbounded_send(KitEvent::Agent(ev));
-            }
-            // Agent stream has finished and released active_run; safe to auto-compact now.
-            let _ = self.run_compaction_internal(true, Some(&tx)).await?;
+            self.drive_prompt(user_msg, activity, Some(&tx)).await?;
             Ok(())
         });
 
-        Ok(KitEventStream {
+        KitEventStream {
             rx,
             driver: Some(driver),
             terminal_error: None,
-        })
+            origin,
+        }
     }
 
-    fn prepare_turn_prompt_messages(
+    async fn drive_prompt(
         &self,
-        user_msg: AgentMessage,
-    ) -> Result<(Vec<AgentMessage>, usize), KitError> {
-        let (msgs, count, _) = self.prepare_turn_prompt_messages_with_events(user_msg)?;
-        Ok((msgs, count))
+        user_msg: Option<AgentMessage>,
+        mut activity: ActivityGuard,
+        tx: Option<&mpsc::UnboundedSender<KitEvent>>,
+    ) -> Result<Vec<AgentMessage>, KitError> {
+        if activity.aborted() {
+            return Ok(Vec::new());
+        }
+
+        let origin = if user_msg.is_some() {
+            KitTurnOrigin::Foreground
+        } else {
+            KitTurnOrigin::Background
+        };
+        let background = activity.start(origin);
+        let user_msg = user_msg.unwrap_or_else(|| {
+            Message::User(UserMessage::text(
+                background.expect("background turn has a reserved batch"),
+                now_ms(),
+            ))
+            .into()
+        });
+        let (prompt_messages, flushed_count, flushed_events) =
+            self.prepare_turn_prompt_messages_with_events(user_msg, origin)?;
+        if let Some(tx) = tx {
+            for event in flushed_events {
+                let _ = tx.unbounded_send(KitEvent::Session(event));
+            }
+        }
+
+        let mut failed = false;
+        let mut seen_ends = 0usize;
+        let mut new_messages = Vec::new();
+        let mut agent_stream = self.agent.prompt_messages_stream(prompt_messages)?;
+        if activity.aborted() {
+            self.agent.abort_now();
+        }
+        while let Some(event) = agent_stream.next().await {
+            match &event {
+                AgentEvent::MessageEnd { message } => {
+                    if seen_ends >= flushed_count {
+                        self.session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .append_message(message.clone())?;
+                        if seen_ends == flushed_count
+                            && matches!(message, AgentMessage::Llm(Message::User(_)))
+                        {
+                            activity.delivered();
+                        }
+                    }
+                    seen_ends += 1;
+                }
+                AgentEvent::TurnEnd { message, .. } => {
+                    failed |=
+                        matches!(message.stop_reason, StopReason::Aborted | StopReason::Error);
+                }
+                AgentEvent::AgentEnd { messages, .. } if tx.is_none() => {
+                    new_messages = messages.clone();
+                }
+                _ => {}
+            }
+            if let Some(tx) = tx {
+                let _ = tx.unbounded_send(KitEvent::Agent(event));
+            }
+        }
+        if !failed && !activity.aborted() {
+            self.run_compaction_internal(true, tx).await?;
+        }
+        activity.complete(!failed);
+        Ok(new_messages)
     }
 
     fn prepare_turn_prompt_messages_with_events(
         &self,
         user_msg: AgentMessage,
+        origin: KitTurnOrigin,
     ) -> Result<(Vec<AgentMessage>, usize, Vec<SessionEvent>), KitError> {
-        let flushed = {
-            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            session.flush_pending_context()?
-        };
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        let skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
+        let current = update_skill_context(&mut session, &skills, &mut known);
+        if origin == KitTurnOrigin::Foreground
+            && let AgentMessage::Llm(Message::User(user)) = &user_msg
+        {
+            let text = user
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mentions = skills.resolve_explicit_mentions(&text);
+            if !mentions.is_empty() {
+                session.append_context(
+                    mentions
+                        .iter()
+                        .map(|skill| {
+                            format!(
+                                "<skill_mention name=\"{}\" location=\"{}\" />",
+                                escape_xml(&skill.name),
+                                escape_xml(&skill.file_path.to_string_lossy()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        let flushed = session.flush_pending_context()?;
+        if known.entries.as_ref() != Some(&current) {
+            let data = serde_json::to_value(&current).map_err(pikra_session::SessionError::from)?;
+            session.append_custom(SKILL_STATE_ENTRY, data)?;
+            known.entries = Some(current);
+        }
 
         let mut prompt_messages = Vec::with_capacity(flushed.len() + 1);
         let mut events = Vec::with_capacity(flushed.len());
@@ -1014,6 +1289,11 @@ impl KitSession {
 
         self.deferred_registry.clear_seen_schemas();
         self.agent.replace_messages(reconstructed.messages)?;
+        self.reload_skills();
+        self.known_skills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries = None;
 
         if let Some(tx) = stream_tx {
             let _ = tx.unbounded_send(KitEvent::Session(SessionEvent::CompactionEnd {
@@ -1026,4 +1306,60 @@ impl KitSession {
 
         Ok(Some(result))
     }
+}
+
+fn update_skill_context(
+    session: &mut SessionManager,
+    catalog: &SkillCatalog,
+    known: &mut KnownSkills,
+) -> BTreeMap<String, KnownSkillEntry> {
+    let current: BTreeMap<_, _> = catalog
+        .visible()
+        .map(|skill| {
+            (
+                skill.name.clone(),
+                KnownSkillEntry {
+                    description: skill.description.clone(),
+                    file_path: skill.file_path.to_string_lossy().into_owned(),
+                    revision: skill.revision.clone(),
+                },
+            )
+        })
+        .collect();
+    if let Some(previous) = &known.entries {
+        let removed: Vec<_> = previous
+            .keys()
+            .filter(|name| !current.contains_key(*name))
+            .collect();
+        let is_added = |skill: &crate::Skill| !previous.contains_key(&skill.name);
+        let has_additions = catalog.visible().any(is_added);
+        if has_additions || !removed.is_empty() {
+            let mut diff = String::from("# Skills changed");
+            if has_additions {
+                diff.push('\n');
+                let added = catalog.format_visible(is_added);
+                diff.push_str(
+                    added
+                        .as_deref()
+                        .unwrap_or("Use skill_search to find additional skills."),
+                );
+            }
+            for name in removed {
+                diff.push_str(&format!(
+                    "\nThe {} skill has been removed and is unavailable.",
+                    escape_xml(name)
+                ));
+            }
+            session.append_context(diff);
+        }
+    } else if let Some(xml) = catalog.format_for_context() {
+        if !session.set_context(SKILLS_CONTEXT_NAME, &xml) {
+            // Compaction can retain the previous catalog as part of its kept tail.
+            session.append_context(xml);
+        }
+        known.has_named_context = true;
+    } else if known.has_named_context {
+        session.set_context(SKILLS_CONTEXT_NAME, catalog.empty_context());
+    }
+    current
 }

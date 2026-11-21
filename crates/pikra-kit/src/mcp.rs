@@ -128,6 +128,8 @@ pub enum McpToolRegistrationMode {
     /// Register into the deferred tool gateway (`tool_search` / `call_tool`), preserving prompt cache bytes.
     #[default]
     Deferred,
+    /// Admit tools within the session's schema budget before the first turn, and defer the rest.
+    Auto,
 }
 
 /// Abstract JSON-RPC 2.0 transport trait for MCP (Streamable HTTP, stdio, in-memory, etc.).
