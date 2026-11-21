@@ -1,16 +1,19 @@
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, sync::Arc};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DescriptionOverride {
     Replace(String),
     Append(String),
 }
 
 /// Host customizations for the tool's top-level parameters.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct ToolDefinitionOverride {
     pub rename: Option<String>,
     pub description: Option<DescriptionOverride>,

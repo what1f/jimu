@@ -15,7 +15,8 @@ use pikra_ai::{
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
     CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, CallToolGateway, CodemodeExecTool,
-    DeferredToolRegistry, SkillCatalog, TOOL_SEARCH_NAME, ToolSearchTool,
+    DeferredToolRegistry, SKILL_SEARCH_NAME, SKILLS_CONTEXT_NAME, SkillCatalog, SkillContextState,
+    SkillDiscoveryConfig, SkillSearchTool, TOOL_SEARCH_NAME, ToolSchemaBudget, ToolSearchTool,
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
@@ -29,7 +30,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SKILLS_CONTEXT_NAME: &str = "skills";
 const DEFERRED_TOOLS_CONTEXT_NAME: &str = "deferred_tools";
 
 pub type PikraEventFn = extern "C" fn(ctx: *mut c_void, event_json: *const c_char);
@@ -84,11 +84,10 @@ pub struct FfiSession {
     agent: Agent,
     session: Arc<Mutex<SessionManager>>,
     deferred_registry: Arc<DeferredToolRegistry>,
-    skills: Mutex<SkillCatalog>,
-    skill_roots: Vec<PathBuf>,
-    had_skills_catalog: Mutex<bool>,
+    skills: Arc<Mutex<SkillCatalog>>,
+    skill_discovery: Option<SkillDiscoveryConfig>,
+    known_skills: Mutex<SkillContextState>,
     had_deferred_catalog: Mutex<bool>,
-    http_callbacks: SendHttpCallbacks,
     tool_callbacks: SendToolCallbacks,
     next_tool_call_id: Arc<AtomicU64>,
     js_runtime: Option<JsExtensionRuntime>,
@@ -97,12 +96,6 @@ pub struct FfiSession {
     headers: Vec<(String, Option<String>)>,
     rollback_first_turn_on_failure: bool,
     run_state: Mutex<SessionRunState>,
-}
-
-impl Drop for FfiSession {
-    fn drop(&mut self) {
-        self.http_callbacks.fire_destroy();
-    }
 }
 
 /// Opaque C handle wrapping `Arc<FfiSession>`.
@@ -120,21 +113,69 @@ impl FfiSession {
         let tool_cb = SendToolCallbacks::new(tool_callbacks);
         let next_tool_call_id = Arc::new(AtomicU64::new(1));
 
-        let transport = Arc::new(FfiHttpTransport::new(http_cb));
+        let transport = Arc::new(FfiHttpTransport::new(http_cb.clone()));
         let provider = Arc::new(Client::new(transport));
 
         let deferred_registry = Arc::new(DeferredToolRegistry::new());
         let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
         let mut deferred: Vec<Arc<dyn AgentTool>> = Vec::new();
 
+        let auto_defer = config
+            .auto_defer_threshold_bytes
+            .filter(|_| config.enable_deferred_gateway);
+        let reserved = |name: &str| {
+            [
+                TOOL_SEARCH_NAME,
+                CALL_TOOL_NAME,
+                CODEMODE_EXEC_TOOL_NAME,
+                SKILL_SEARCH_NAME,
+            ]
+            .contains(&name)
+        };
+        let pinned = config
+            .tools
+            .iter()
+            .filter(|spec| !spec.deferred && reserved(&spec.name))
+            .map(FfiToolSpec::definition)
+            .collect::<Vec<_>>();
+        let mut budget = ToolSchemaBudget::new(auto_defer, &pinned);
         for spec in &config.tools {
             let tool = FfiAgentTool::from_spec(spec, tool_cb, Arc::clone(&next_tool_call_id));
-            if spec.deferred {
+            if spec.deferred
+                || (auto_defer.is_some()
+                    && !reserved(&spec.name)
+                    && !budget.admit(&tool.definition()))
+            {
                 deferred.push(tool);
             } else {
                 resident.push(tool);
             }
         }
+
+        let enable_skill_search = config.skill_discovery.is_some();
+        let skill_discovery = if let Some(mut discovery) = config.skill_discovery {
+            if discovery.cwd.is_none() {
+                discovery.cwd = config.cwd.as_ref().map(PathBuf::from);
+            }
+            discovery
+                .extra_roots
+                .extend(config.skill_roots.into_iter().map(PathBuf::from));
+            Some(discovery)
+        } else if !config.skill_roots.is_empty() {
+            Some(SkillDiscoveryConfig {
+                extra_roots: config.skill_roots.into_iter().map(PathBuf::from).collect(),
+                include_user_skills: false,
+                ..SkillDiscoveryConfig::default()
+            })
+        } else {
+            None
+        };
+        let skills = Arc::new(Mutex::new(
+            skill_discovery
+                .as_ref()
+                .map(SkillCatalog::discover_with_config)
+                .unwrap_or_default(),
+        ));
 
         // Load optional QuickJS extensions (`pikra-js`).
         let mut middlewares: Vec<Arc<dyn AgentMiddleware>> = Vec::new();
@@ -158,6 +199,13 @@ impl FfiSession {
         }
 
         deferred_registry.upsert(deferred);
+        if enable_skill_search
+            && !resident
+                .iter()
+                .any(|t| t.definition().name == SKILL_SEARCH_NAME)
+        {
+            resident.push(Arc::new(SkillSearchTool::shared(skills.clone())));
+        }
 
         // Keep deferred gateway resident when enabled so dynamic deferred tool updates
         // NEVER mutate the top-level resident `tools` array (prompt cache stability).
@@ -229,15 +277,7 @@ impl FfiSession {
             .map(|(_, f)| f)
             .unwrap_or(config.fast);
 
-        let skill_roots: Vec<PathBuf> = config.skill_roots.into_iter().map(PathBuf::from).collect();
-        let skills = SkillCatalog::discover(&skill_roots);
-        let mut had_skills_catalog = reconstructed
-            .all_branch_context_blocks
-            .contains_key(SKILLS_CONTEXT_NAME);
-        if let Some(skills_xml) = skills.format_for_context() {
-            session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
-            had_skills_catalog = true;
-        }
+        let known_skills = SkillContextState::from_branch(&session_manager);
 
         let mut had_deferred_catalog = false;
         if let Some(catalog) = deferred_registry.format_catalog() {
@@ -266,16 +306,16 @@ impl FfiSession {
 
         let agent = Agent::new(provider.clone(), agent_cfg);
 
+        http_cb.take_ownership();
         Ok(Arc::new(Self {
             provider,
             agent,
             session: Arc::new(Mutex::new(session_manager)),
             deferred_registry,
-            skills: Mutex::new(skills),
-            skill_roots,
-            had_skills_catalog: Mutex::new(had_skills_catalog),
+            skills,
+            skill_discovery,
+            known_skills: Mutex::new(known_skills),
             had_deferred_catalog: Mutex::new(had_deferred_catalog),
-            http_callbacks: http_cb,
             tool_callbacks: tool_cb,
             next_tool_call_id,
             js_runtime,
@@ -611,9 +651,18 @@ impl FfiSession {
     ) -> Result<(Vec<AgentMessage>, usize, Vec<SessionEvent>), String> {
         let flushed = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            session
-                .flush_pending_context()
-                .map_err(|e| format!("failed to flush pending context: {e}"))?
+            if self.skill_discovery.is_some() {
+                let skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+                let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
+                let content = match &user_msg {
+                    AgentMessage::Llm(Message::User(user)) => Some(user.content.as_slice()),
+                    _ => None,
+                };
+                known.flush_for_prompt(&mut session, &skills, content)
+            } else {
+                session.flush_pending_context()
+            }
+            .map_err(|e| format!("failed to flush pending context: {e}"))?
         };
 
         let mut prompt_messages = Vec::with_capacity(flushed.len() + 1);
@@ -1016,6 +1065,13 @@ impl FfiSession {
         };
 
         self.deferred_registry.clear_seen_schemas();
+        if self.skill_discovery.is_some() {
+            let _ = self.reload_skills();
+            self.known_skills
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset_after_compaction();
+        }
         self.agent
             .replace_messages(reconstructed.messages)
             .map_err(|e| e.to_string())?;
@@ -1040,7 +1096,20 @@ impl FfiSession {
             session
                 .fork(entry_id)
                 .map_err(|e| (PikraStatus::ErrNotFound, e.to_string()))?;
-            session.reconstruct_context()
+            let reconstructed = session.reconstruct_context();
+            if self.skill_discovery.is_some() {
+                self.known_skills
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .restore_fork(
+                        &mut session,
+                        reconstructed
+                            .all_branch_context_blocks
+                            .get(SKILLS_CONTEXT_NAME)
+                            .map(String::as_str),
+                    );
+            }
+            reconstructed
         };
         self.deferred_registry.clear_seen_schemas();
         self.agent
@@ -1112,32 +1181,14 @@ impl FfiSession {
         if self.is_closed() {
             return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
         }
-        let discovered = SkillCatalog::discover(&self.skill_roots);
-        let formatted = discovered.format_for_context();
-        *self.skills.lock().unwrap_or_else(|e| e.into_inner()) = discovered;
-        let mut had_catalog = self
-            .had_skills_catalog
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match formatted {
-            Some(xml) => {
-                *had_catalog = true;
-                Ok(self
-                    .session
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .set_context(SKILLS_CONTEXT_NAME, xml))
-            }
-            None if *had_catalog => Ok(self
-                .session
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_context(
-                    SKILLS_CONTEXT_NAME,
-                    "<available_skills>\n</available_skills>",
-                )),
-            None => Ok(false),
-        }
+        let Some(config) = &self.skill_discovery else {
+            return Ok(false);
+        };
+        let mut skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
+        let discovered = SkillCatalog::discover_with_config(config);
+        let changed = !skills.has_same_visible_names(&discovered);
+        *skills = discovered;
+        Ok(changed)
     }
 }
 

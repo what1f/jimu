@@ -12,12 +12,18 @@ struct RpcClientProc {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     buf: Vec<u8>,
+    _fixture_home: tempfile::TempDir,
 }
 
 impl RpcClientProc {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_home(args, tempfile::tempdir().expect("fixture home"))
+    }
+
+    fn spawn_with_home(args: &[&str], home: tempfile::TempDir) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_pikra"))
             .args(args)
+            .env("HOME", home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -30,6 +36,7 @@ impl RpcClientProc {
             stdin: Some(stdin),
             stdout,
             buf: Vec::with_capacity(4096),
+            _fixture_home: home,
         }
     }
 
@@ -146,6 +153,24 @@ async fn rpc_full_lifecycle_over_stdio_pipes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ws = tmp.path();
     std::fs::write(ws.join("input.txt"), "alpha-file-content").expect("write input.txt");
+    std::fs::create_dir(ws.join(".git")).expect("set project root");
+    let home = tempfile::tempdir().expect("fixture home");
+    for (root, name) in [
+        (ws.join(".agents/skills"), "rpc-agents-skill"),
+        (ws.join(".pikra/skills"), "rpc-project-skill"),
+        (ws.join("extra-skills"), "rpc-extra-skill"),
+        (home.path().join(".agents/skills"), "rpc-user-agents-skill"),
+        (home.path().join(".pikra/skills"), "rpc-user-pikra-skill"),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("create skill folder");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: RPC fixture\n---\n"),
+        )
+        .expect("write skill");
+    }
+    let extra_skills = ws.join("extra-skills");
 
     let ext_path = ws.join("hook.js");
     std::fs::write(
@@ -270,24 +295,29 @@ export default function(pikra) {
     let session_str = session_path.display().to_string();
     let ext_str = ext_path.display().to_string();
 
-    let mut proc = RpcClientProc::spawn(&[
-        "--mode",
-        "rpc",
-        "--cwd",
-        &cwd_str,
-        "--provider",
-        "mock",
-        "--model",
-        "mock-1",
-        "--api",
-        "openai-completions",
-        "--base-url",
-        &base_url,
-        "--session",
-        &session_str,
-        "--extension",
-        &ext_str,
-    ]);
+    let mut proc = RpcClientProc::spawn_with_home(
+        &[
+            "--mode",
+            "rpc",
+            "--cwd",
+            &cwd_str,
+            "--provider",
+            "mock",
+            "--model",
+            "mock-1",
+            "--api",
+            "openai-completions",
+            "--base-url",
+            &base_url,
+            "--session",
+            &session_str,
+            "--extension",
+            &ext_str,
+            "--skill-dir",
+            extra_skills.to_str().unwrap(),
+        ],
+        home,
+    );
 
     // 1. Malformed JSON emits parse error without crashing.
     proc.send_raw_bytes(b"{not-valid-json\n").await;
@@ -309,7 +339,23 @@ export default function(pikra) {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    assert!(tools.contains(&"read") && tools.contains(&"write"));
+    for name in [
+        "read",
+        "write",
+        "edit",
+        "apply_patch",
+        "find",
+        "grep",
+        "bash",
+        "sleep",
+        "web_fetch",
+    ] {
+        assert!(tools.contains(&name), "missing default tool {name}");
+    }
+    #[cfg(unix)]
+    for name in ["exec_command", "write_stdin", "monitor"] {
+        assert!(tools.contains(&name), "missing default tool {name}");
+    }
     assert_eq!(
         state_resp["data"]["extensions"].as_array().unwrap().len(),
         1
@@ -335,10 +381,22 @@ export default function(pikra) {
 
     // Wait until streaming delta arrives so we know Request 1 is active mid-stream.
     let mut saw_context_event = false;
+    let mut saw_skill_catalog = false;
     loop {
         let ev = proc.next_record().await;
         if ev["type"] == "context_appended" && ev["name"] == "workspace_env" {
             saw_context_event = true;
+        }
+        if ev["type"] == "context_appended" && ev["name"] == "skills" {
+            let text = ev["text"].as_str().unwrap();
+            assert!(
+                text.contains("rpc-agents-skill")
+                    && text.contains("rpc-project-skill")
+                    && text.contains("rpc-extra-skill")
+                    && text.contains("rpc-user-agents-skill")
+                    && text.contains("rpc-user-pikra-skill")
+            );
+            saw_skill_catalog = true;
         }
         if ev["type"] == "message_update"
             && ev["assistant_message_event"]["type"] == "text_delta"
@@ -348,6 +406,7 @@ export default function(pikra) {
         }
     }
     assert!(saw_context_event, "expected context_appended event");
+    assert!(saw_skill_catalog, "expected discovered skills in context");
 
     // Concurrently inspect state & enqueue mid-stream steer while prompt is running.
     proc.send_json(&json!({ "id": "s2", "type": "get_state" }))
@@ -582,9 +641,12 @@ async fn rpc_live_deepseek_smoke_if_key_present() {
         return;
     }
 
+    let workspace = tempfile::tempdir().expect("live fixture workspace");
     let mut proc = RpcClientProc::spawn(&[
         "--mode",
         "rpc",
+        "--cwd",
+        workspace.path().to_str().unwrap(),
         "--no-session",
         "--no-tools",
         "--provider",

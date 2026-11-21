@@ -1,17 +1,19 @@
 //! C-ABI core for PikraKit Swift SDK and native language bindings.
 //!
-//! Strictly decoupled from `pikra-http`, `reqwest`, `rustls`, and `tokio`: all HTTP streaming
-//! and host tools are bridged over clean C callback VTables while Rust drives the agent loop,
+//! Strictly decoupled from `pikra-http`, `reqwest`, `rustls`, and native TLS: HTTP streaming
+//! and host tools are bridged over C callbacks. Rust drives the agent loop,
 //! multi-provider SSE/wire protocols, JSONL persistence, prompt-cache-stable compaction,
 //! deferred tool gateway, codemode QuickJS sandbox, and JS extension runtime.
 
 #![allow(clippy::missing_safety_doc)]
 
+mod builtin_tools;
 mod session;
 mod tools;
 mod transport;
 mod types;
 
+pub use builtin_tools::*;
 pub use session::{
     PikraEventFn, PikraResultDoneFn, PikraSession, PikraStreamDoneFn, PikraVoidDoneFn,
 };
@@ -945,41 +947,68 @@ pub unsafe extern "C" fn pikra_discover_skills(
             .map(std::path::PathBuf::from)
             .collect();
         let catalog = pikra_kit::SkillCatalog::discover(&root_paths);
-        let skills: Vec<FfiDiscoveredSkill> = catalog
-            .skills()
-            .iter()
-            .map(|skill| FfiDiscoveredSkill {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                location: skill.file_path.to_string_lossy().into_owned(),
-                disable_model_invocation: skill.disable_model_invocation,
-                revision: skill.revision.clone(),
-            })
-            .collect();
-        let prompt = format_discovered_skills_prompt(&skills);
-        let response = FfiSkillDiscoveryResponse { skills, prompt };
-
-        match serde_json::to_string(&response) {
-            Ok(json) => {
-                let sanitized = json.replace('\0', "");
-                match CString::new(sanitized) {
-                    Ok(cstr) => cstr.into_raw(),
-                    Err(e) => {
-                        unsafe {
-                            write_out_string(out_error, format!("encode skills JSON: {e}"));
-                        }
-                        std::ptr::null_mut()
-                    }
-                }
-            }
-            Err(e) => {
-                unsafe { write_out_string(out_error, format!("serialize skills JSON: {e}")) };
-                std::ptr::null_mut()
-            }
-        }
+        encode_skill_catalog(&catalog, true, out_error)
     }))
     .unwrap_or_else(|_| {
         unsafe { write_out_string(out_error, "panic inside pikra_discover_skills") };
         std::ptr::null_mut()
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_discover_skills_with_config(
+    config_json: *const c_char,
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let config = unsafe { read_cstr(config_json, "config_json") }.and_then(|json| {
+            serde_json::from_str::<pikra_kit::SkillDiscoveryConfig>(json).map_err(|e| e.to_string())
+        });
+        match config {
+            Ok(config) => encode_skill_catalog(
+                &pikra_kit::SkillCatalog::discover_with_config(&config),
+                false,
+                out_error,
+            ),
+            Err(error) => {
+                unsafe { write_out_string(out_error, error) };
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+fn encode_skill_catalog(
+    catalog: &pikra_kit::SkillCatalog,
+    legacy_prompt: bool,
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    let skills: Vec<_> = catalog
+        .skills()
+        .iter()
+        .map(|skill| FfiDiscoveredSkill {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            location: skill.file_path.to_string_lossy().into_owned(),
+            disable_model_invocation: skill.disable_model_invocation,
+            revision: skill.revision.clone(),
+        })
+        .collect();
+    let prompt = if legacy_prompt {
+        format_discovered_skills_prompt(&skills)
+    } else {
+        catalog.format_for_context().unwrap_or_default()
+    };
+    let response = FfiSkillDiscoveryResponse { skills, prompt };
+    match serde_json::to_vec(&response)
+        .map_err(|error| error.to_string())
+        .and_then(|json| CString::new(json).map_err(|error| error.to_string()))
+    {
+        Ok(json) => json.into_raw(),
+        Err(error) => {
+            unsafe { write_out_string(out_error, error) };
+            std::ptr::null_mut()
+        }
+    }
 }

@@ -1071,7 +1071,7 @@ struct PikraKitE2ETests {
                 MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
                     id: "tc_6",
                     name: "bash",
-                    argumentsJSON: "{\"command\":\"printf '%s:%s' \\\"$PIKRA_WS_ENV\\\" \\\"0123456789abcdefghijklmnopqrstuvwxyz\\\"\"}"
+                    argumentsJSON: "{\"command\":\"printf '%s:%s' \\\"$PIKRA_WS_ENV\\\" \\\"0123456789abcdefghijklmnopqrstuvwxyz\\\"\",\"timeout\":2.5}"
                 ))
             },
             // 7. bash non-zero exit
@@ -1079,7 +1079,7 @@ struct PikraKitE2ETests {
                 MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
                     id: "tc_7",
                     name: "bash",
-                    argumentsJSON: "{\"command\":\"echo boom && exit 7\"}"
+                    argumentsJSON: "{\"command\":\"echo boom && exit 7\",\"timeout_ms\":2000}"
                 ))
             },
             // 8. final response
@@ -1133,6 +1133,7 @@ struct PikraKitE2ETests {
         // 6. bash success with env & output_truncated
         #expect(toolResults[5].1 == "bash" && toolResults[5].3 == false)
         let bashOk = try JSONDecoder().decode(JSONValue.self, from: Data(toolResults[5].2.textOutput.utf8))
+        #expect(toolResults[5].2.structuredContent == bashOk)
         #expect(bashOk["exit_code"]?.intValue == 0)
         #expect(bashOk["output_truncated"]?.boolValue == true)
         #expect(bashOk["output"]?.stringValue?.hasPrefix("env_ok:") == true)
@@ -1143,6 +1144,10 @@ struct PikraKitE2ETests {
         let bashErr = try JSONDecoder().decode(JSONValue.self, from: Data(toolResults[6].2.textOutput.utf8))
         #expect(bashErr["exit_code"]?.intValue == 7)
         #expect(bashErr["output"]?.stringValue?.contains("boom") == true)
+        var redacted = toolResults[6].2
+        redacted.content = [.text(redacted.textOutput.replacingOccurrences(of: "boom", with: "[redacted]"))]
+        #expect(redacted.structuredContent?["output"]?.stringValue?.contains("[redacted]") == true)
+
 
         // Approval sequence: write (allowPlugin), bash #1 (allowOnce), bash #2 (allowOnce); read/find/edit skipped
         let recordedApprovals = await approvalLog.recorded()
@@ -1152,6 +1157,57 @@ struct PikraKitE2ETests {
             "ws-plugin:bash:dangerous",
         ])
 
+        await agent.close()
+    }
+
+    @Test("Scoped skills resolve explicit mentions and budgeted tools remain callable through the gateway")
+    func scopedSkillsAndAutoDeferral() async throws {
+        let workspace = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let cwd = workspace.appendingPathComponent("nested")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        for path in [cwd, workspace.appendingPathComponent(".git")] {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        for name in ["fixture-skill", "disabled-skill"] {
+            let directory = workspace.appendingPathComponent(".agents/skills/\(name)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try "---\nname: \(name)\ndescription: A project skill\n---\n# Fixture\n"
+                .write(to: directory.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+        }
+        let discovery = PikraSkillDiscovery.Configuration(
+            cwd: cwd, includeUserSkills: false, rules: [.init(.byName("disabled-skill"), enabled: false)]
+        )
+        let catalog = try PikraSkillDiscovery.discover(config: discovery)
+        #expect(catalog.skills.map(\.name) == ["fixture-skill"])
+
+        let mockClient = MockSSEClient(handlers: [
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(
+                id: "delegation", name: "call_tool",
+                argumentsJSON: #"{"name":"deferred_echo","arguments":{}}"#
+            )) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Complete")) },
+        ])
+        let echo = PikraTool(name: "deferred_echo", description: "Echo", parameters: ["type": "object"]) {
+            _, _ in .text("called directly")
+        }
+        var config = PikraConfiguration(model: testModel(), tools: [echo], httpClient: mockClient)
+        config.skillDiscovery = discovery
+        config.autoDeferThresholdBytes = 0
+        let agent = try await PikraAgent.open(configuration: config)
+        let events = try await collectEvents(try await agent.prompt("Use $fixture-skill"))
+        let delegated = try #require(events.compactMap { event -> PikraToolOutput? in
+            guard case .toolFinished(_, "call_tool", let output, false) = event else { return nil }
+            return output
+        }.first)
+        #expect(delegated.textOutput == "called directly")
+        #expect(delegated.details["delegated_tool"]?["name"] == "deferred_echo")
+        let request = try #require(await mockClient.recordedRequests().first)
+        let body = try JSONDecoder().decode(JSONValue.self, from: request.body)
+        let toolNames = body["tools"]?.arrayValue?.compactMap { $0["function"]?["name"]?.stringValue }
+        #expect(toolNames?.contains("call_tool") == true)
+        #expect(toolNames?.contains("deferred_echo") == false)
+        #expect(String(decoding: request.body, as: UTF8.self).contains("<skill_mention"))
+        #expect(try await agent.removeTools(named: ["deferred_echo"]) == 1)
         await agent.close()
     }
 
@@ -1367,7 +1423,7 @@ struct PikraKitE2ETests {
         let removedRes = try await agent.removeTools(named: ["res_echo"])
         #expect(removedRes == 0)
 
-        // #38: Delete last skill and reloadSkills() -> must report changed == true and emit empty <available_skills>
+        // #38: Deleting the last skill sends an incremental removal reminder.
         try FileManager.default.removeItem(at: oneSkillDir)
         let skillChanged = try await agent.reloadSkills()
         #expect(skillChanged == true)
@@ -1375,7 +1431,7 @@ struct PikraKitE2ETests {
         let t2Events = try await collectEvents(try await agent.prompt("Run turn 2"))
         #expect(t2Events.contains { ev in
             if case .contextAppended(let name, let text) = ev {
-                return name == "skills" && text == "<available_skills>\n</available_skills>"
+                return name == "context" && text == "# Skills changed\nThe demo skill has been removed and is unavailable."
             }
             return false
         })

@@ -36,28 +36,29 @@ pub struct PikraHttpCallbacks {
     pub destroy: Option<crate::session::PikraVoidDoneFn>,
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct SendHttpCallbacks {
     raw: PikraHttpCallbacks,
+    owned: AtomicBool,
 }
 
 // SAFETY: Host guarantees `ctx` and callback pointers remain valid and thread-safe until
-// `destroy` is invoked when `FfiSession` drops.
+// the last HTTP callback owner invokes `destroy`.
 unsafe impl Send for SendHttpCallbacks {}
 unsafe impl Sync for SendHttpCallbacks {}
 
 impl SendHttpCallbacks {
-    pub(crate) fn new(raw: PikraHttpCallbacks) -> Result<Self, String> {
+    pub(crate) fn new(raw: PikraHttpCallbacks) -> Result<Arc<Self>, String> {
         if raw.start.is_none() {
             return Err("http_callbacks.start must not be null".to_string());
         }
-        Ok(Self { raw })
+        Ok(Arc::new(Self {
+            raw,
+            owned: AtomicBool::new(false),
+        }))
     }
 
-    pub(crate) fn fire_destroy(&self) {
-        if let Some(f) = self.raw.destroy {
-            f(self.raw.ctx);
-        }
+    pub(crate) fn take_ownership(&self) {
+        self.owned.store(true, Ordering::Release);
     }
 
     fn fire_start(
@@ -91,9 +92,19 @@ impl SendHttpCallbacks {
     }
 }
 
+impl Drop for SendHttpCallbacks {
+    fn drop(&mut self) {
+        if *self.owned.get_mut()
+            && let Some(destroy) = self.raw.destroy
+        {
+            destroy(self.raw.ctx);
+        }
+    }
+}
+
 struct HttpRequestLifecycle {
     req_id: u64,
-    callbacks: SendHttpCallbacks,
+    callbacks: Arc<SendHttpCallbacks>,
     cancelled: AtomicBool,
     finished: AtomicBool,
     cancel_fired: AtomicBool,
@@ -232,6 +243,16 @@ impl PikraHttpStream {
     }
 }
 
+struct PendingHead(Option<Arc<HttpRequestLifecycle>>);
+
+impl Drop for PendingHead {
+    fn drop(&mut self) {
+        if let Some(request) = &self.0 {
+            request.fire_cancel_once();
+        }
+    }
+}
+
 struct FfiByteStream {
     rx: mpsc::Receiver<Bytes>,
     cancel: CancelToken,
@@ -278,12 +299,12 @@ impl Drop for FfiByteStream {
 }
 
 pub(crate) struct FfiHttpTransport {
-    callbacks: SendHttpCallbacks,
+    callbacks: Arc<SendHttpCallbacks>,
     next_request_id: AtomicU64,
 }
 
 impl FfiHttpTransport {
-    pub(crate) fn new(callbacks: SendHttpCallbacks) -> Self {
+    pub(crate) fn new(callbacks: Arc<SendHttpCallbacks>) -> Self {
         Self {
             callbacks,
             next_request_id: AtomicU64::new(1),
@@ -297,7 +318,7 @@ impl HttpTransport for FfiHttpTransport {
         request: HttpRequest,
         cancel: CancelToken,
     ) -> BoxFuture<'_, Result<HttpStreamResponse, TransportError>> {
-        let callbacks = self.callbacks;
+        let callbacks = self.callbacks.clone();
         let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 
         Box::pin(async move {
@@ -322,13 +343,23 @@ impl HttpTransport for FfiHttpTransport {
 
             let lifecycle = Arc::new(HttpRequestLifecycle {
                 req_id,
-                callbacks,
+                callbacks: callbacks.clone(),
                 cancelled: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
                 cancel_fired: AtomicBool::new(false),
                 terminal_error: Mutex::new(None),
                 finish_notify: Mutex::new(Some(finish_tx)),
             });
+
+            let stream_box = Box::new(PikraHttpStream {
+                head_tx: Mutex::new(Some(head_tx)),
+                body_tx: Mutex::new(Some(body_tx)),
+                lifecycle: Arc::clone(&lifecycle),
+            });
+            let stream_ptr = Box::into_raw(stream_box);
+
+            callbacks.fire_start(req_id, &head_cstr, &request.body, stream_ptr);
+            let mut pending = PendingHead(Some(lifecycle.clone()));
 
             // Immediately fire host `cancel_http(ctx, req_id)` whenever `CancelToken` cancels.
             {
@@ -342,21 +373,13 @@ impl HttpTransport for FfiHttpTransport {
                 });
             }
 
-            let stream_box = Box::new(PikraHttpStream {
-                head_tx: Mutex::new(Some(head_tx)),
-                body_tx: Mutex::new(Some(body_tx)),
-                lifecycle: Arc::clone(&lifecycle),
-            });
-            let stream_ptr = Box::into_raw(stream_box);
-
-            callbacks.fire_start(req_id, &head_cstr, &request.body, stream_ptr);
-
             match select(head_rx, cancel.cancelled()).await {
                 Either::Left((Ok(Ok((status, headers))), _)) => {
                     if cancel.is_cancelled() {
                         lifecycle.fire_cancel_once();
                         return Err(TransportError::Aborted);
                     }
+                    pending.0 = None;
                     let cancel_fut = Box::pin(cancel.cancelled());
                     Ok(HttpStreamResponse {
                         status,

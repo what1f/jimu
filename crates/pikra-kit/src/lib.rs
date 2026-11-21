@@ -6,6 +6,7 @@ mod deferred;
 mod error;
 pub mod mcp;
 mod session;
+mod skill_context;
 mod skills;
 mod wakeup;
 
@@ -23,7 +24,9 @@ pub use mcp::{
 pub use mcp::{StdioMcpConfig, StdioMcpTransport};
 pub use session::{
     KitEvent, KitEventStream, KitSession, KitSessionConfig, KitToolRegistrationMode, KitToolSpec,
+    ToolSchemaBudget,
 };
+pub use skill_context::{SKILLS_CONTEXT_NAME, SkillContextState};
 pub use skills::{
     SKILL_SEARCH_NAME, Skill, SkillCatalog, SkillDiagnostic, SkillDiscoveryConfig, SkillEnableRule,
     SkillSearchTool, SkillSelector,

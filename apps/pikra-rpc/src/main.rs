@@ -49,6 +49,7 @@ async fn run_oneshot(cli: args::CliArgs) -> ExitCode {
     };
 
     let res = runtime.run_oneshot(prompt, mode).await;
+    runtime.shutdown_tools().await;
     drop(runtime);
     writer_guard.finish().await;
 
@@ -121,6 +122,7 @@ async fn run_rpc(cli: args::CliArgs) -> ExitCode {
         } else {
             runtime.wait_for_active_run().await;
         }
+        runtime.shutdown_tools().await;
     };
 
     tokio::select! {

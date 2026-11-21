@@ -202,6 +202,8 @@ pub struct FfiSessionConfig {
     pub sampling_params: Map<String, Value>,
     #[serde(default)]
     pub skill_roots: Vec<String>,
+    pub skill_discovery: Option<pikra_kit::SkillDiscoveryConfig>,
+    pub auto_defer_threshold_bytes: Option<usize>,
     #[serde(default = "default_true")]
     pub enable_deferred_gateway: bool,
     #[serde(default)]

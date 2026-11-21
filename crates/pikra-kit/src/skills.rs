@@ -2,6 +2,7 @@ use crate::bm25::{Document, score_documents};
 use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -26,20 +27,22 @@ pub struct SkillDiagnostic {
 }
 
 /// Select a skill by declared name or source file path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SkillSelector {
     ByName(String),
     ByPath(PathBuf),
 }
 
 /// Later matching rules take precedence over earlier ones.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SkillEnableRule {
     pub selector: SkillSelector,
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SkillDiscoveryConfig {
     pub cwd: Option<PathBuf>,
     pub project_root_markers: Vec<String>,
@@ -229,6 +232,17 @@ impl SkillCatalog {
                 }
             })
             .collect()
+    }
+
+    /// Compare the names available for model invocation.
+    pub fn has_same_visible_names(&self, other: &Self) -> bool {
+        let names = |catalog: &Self| {
+            catalog
+                .visible()
+                .map(|skill| skill.name.clone())
+                .collect::<HashSet<_>>()
+        };
+        names(self) == names(other)
     }
 
     pub(crate) fn visible(&self) -> impl Iterator<Item = &Skill> {
@@ -724,7 +738,7 @@ impl SkillSearchTool {
         Self::shared(Arc::new(Mutex::new(catalog)))
     }
 
-    pub(crate) fn shared(catalog: Arc<Mutex<SkillCatalog>>) -> Self {
+    pub fn shared(catalog: Arc<Mutex<SkillCatalog>>) -> Self {
         Self { catalog }
     }
 }

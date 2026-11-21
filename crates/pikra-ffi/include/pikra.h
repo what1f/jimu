@@ -138,6 +138,78 @@ void pikra_tool_complete(
     const char *error_message
 );
 
+/* ---- Independent Workspace Tools ---- */
+
+typedef struct PikraBuiltinEnv PikraBuiltinEnv;
+typedef struct PikraBuiltinTool PikraBuiltinTool;
+typedef struct PikraBuiltinRun PikraBuiltinRun;
+typedef struct PikraBuiltinEnvCompletion PikraBuiltinEnvCompletion;
+
+typedef void (*PikraBuiltinEnvProviderFn)(void *ctx, PikraBuiltinEnvCompletion *completion);
+
+typedef struct PikraBuiltinCallbacks {
+    void *ctx;
+    PikraBuiltinEnvProviderFn environment;
+    PikraEventFn background_event;
+    PikraVoidDoneFn destroy;
+} PikraBuiltinCallbacks;
+
+/* Config JSON takes cwd, optional max_output_bytes and default_bash_timeout_ms.
+ * Either callbacks table may be NULL. On success the environment owns the callback
+ * contexts until their destroy functions run. On failure ownership stays with the caller.
+ * Background callbacks run on worker threads and must enqueue and return promptly. */
+PikraBuiltinEnv *pikra_builtin_env_create(
+    const char *config_json,
+    const PikraBuiltinCallbacks *callbacks,
+    const PikraHttpCallbacks *http_callbacks,
+    char **out_error
+);
+
+/* Complete exactly once per environment request. Pass a JSON object of strings or NULL. */
+void pikra_builtin_env_complete(PikraBuiltinEnvCompletion *completion, const char *environment_json);
+
+/* Shutdown cancels active calls, reaps background processes and then calls on_done.
+ * Destroy starts the same shutdown and frees the handle without waiting. */
+void pikra_builtin_env_shutdown(PikraBuiltinEnv *env, void *ctx, PikraVoidDoneFn on_done);
+void pikra_builtin_env_destroy(PikraBuiltinEnv *env);
+
+PikraBuiltinTool *pikra_builtin_tool_read(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_write(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_edit(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_apply_patch(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_find(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_grep(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_sleep(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_web_fetch(PikraBuiltinEnv *env, char **out_error);
+
+/* Subprocess constructors report an invalid argument on iOS. */
+PikraBuiltinTool *pikra_builtin_tool_bash(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_exec_command(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_write_stdin(PikraBuiltinEnv *env, char **out_error);
+PikraBuiltinTool *pikra_builtin_tool_monitor(PikraBuiltinEnv *env, char **out_error);
+
+PikraBuiltinTool *pikra_builtin_tool_override(
+    const PikraBuiltinTool *tool, const char *override_json, char **out_error
+);
+char *pikra_builtin_tool_definition_json(const PikraBuiltinTool *tool);
+bool pikra_builtin_tool_is_sequential(const PikraBuiltinTool *tool);
+
+/* A successful start calls done exactly once. The caller owns the run handle and
+ * must destroy it, independently of tool lifetime. Progress and result JSON are
+ * borrowed for the duration of each callback. */
+PikraBuiltinRun *pikra_builtin_tool_execute(
+    const PikraBuiltinTool *tool,
+    const char *call_id,
+    const char *arguments_json,
+    void *ctx,
+    PikraEventFn progress,
+    PikraResultDoneFn done,
+    char **out_error
+);
+void pikra_builtin_tool_cancel(const PikraBuiltinRun *run);
+void pikra_builtin_run_destroy(PikraBuiltinRun *run);
+void pikra_builtin_tool_destroy(PikraBuiltinTool *tool);
+
 /* ---- Session Lifecycle & Operations ---- */
 
 PikraSession *pikra_session_create(
@@ -275,6 +347,8 @@ char *pikra_discover_skills(
     const char *roots_json,
     char **out_error
 );
+
+char *pikra_discover_skills_with_config(const char *config_json, char **out_error);
 
 #ifdef __cplusplus
 }

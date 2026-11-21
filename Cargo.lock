@@ -1258,9 +1258,11 @@ dependencies = [
  "pikra-kit",
  "pikra-schema",
  "pikra-session",
+ "pikra-tools",
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -17,13 +17,23 @@ use pikra_ai::{
 use pikra_codemode::CodemodeSandboxOptions;
 use pikra_http::ReqwestTransport;
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
-use pikra_kit::{CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool, DeferredToolRegistry, SkillCatalog};
+use pikra_kit::{
+    CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool, DeferredToolRegistry, SkillCatalog,
+    SkillDiscoveryConfig,
+};
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
     SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
     context_block_to_agent_message,
 };
-use pikra_tools::{WorkspaceTools, WorkspaceToolsConfig};
+use pikra_tools::{
+    BuiltinToolSet, SleepTool, WakeGate, WebFetchConfig, WebFetchTool, WorkspaceTools,
+    WorkspaceToolsConfig,
+};
+#[cfg(all(unix, not(target_os = "ios")))]
+use pikra_tools::{
+    ExecCommandTool, MonitorManager, MonitorTool, ProcessSessionManager, WriteStdinTool,
+};
 use serde_json::{Map, json};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -267,7 +277,9 @@ pub struct RpcRuntime {
     resident_tools: Arc<Mutex<Vec<Arc<dyn AgentTool>>>>,
     deferred_registry: Arc<DeferredToolRegistry>,
     js_runtime: Option<Arc<JsExtensionRuntime>>,
-    skill_roots: Vec<PathBuf>,
+    skill_discovery: SkillDiscoveryConfig,
+    #[cfg(all(unix, not(target_os = "ios")))]
+    background_tools: Option<(ProcessSessionManager, MonitorManager)>,
     no_session: bool,
     compaction_config: Mutex<CompactionConfig>,
     state: Mutex<SessionRuntimeState>,
@@ -284,7 +296,8 @@ impl RpcRuntime {
     pub fn new(args: &CliArgs, writer: JsonlWriter) -> Result<Self, String> {
         let transport = ReqwestTransport::new()
             .map_err(|err| format!("failed to initialize HTTP transport: {err}"))?;
-        let provider: Arc<dyn StreamProvider> = Arc::new(Client::new(Arc::new(transport)));
+        let transport = Arc::new(transport);
+        let provider: Arc<dyn StreamProvider> = Arc::new(Client::new(transport.clone()));
 
         let explicit_env = args.api_key_env.clone();
         let api_key_resolver: ApiKeyResolver = Arc::new(move |provider_id: &str| {
@@ -319,9 +332,37 @@ impl RpcRuntime {
         let deferred_registry = Arc::new(DeferredToolRegistry::new());
         let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
 
+        #[cfg(all(unix, not(target_os = "ios")))]
+        let mut background_tools = None;
         if !args.no_tools {
-            resident.extend(WorkspaceTools::build(WorkspaceToolsConfig::new(&args.cwd)));
+            let workspace =
+                WorkspaceToolsConfig::new(&args.cwd).with_enabled_tools(BuiltinToolSet::all());
+            let wake_gate = WakeGate::new();
+            resident.extend(WorkspaceTools::build(workspace.clone()));
+            #[cfg(all(unix, not(target_os = "ios")))]
+            {
+                let workspace = Arc::new(workspace);
+                let processes =
+                    ProcessSessionManager::new(workspace.clone(), wake_gate.clone(), None);
+                let monitors = MonitorManager::new(workspace, wake_gate.clone(), None);
+                resident.push(Arc::new(ExecCommandTool::new(processes.clone())));
+                resident.push(Arc::new(WriteStdinTool::new(processes.clone())));
+                resident.push(Arc::new(MonitorTool::new(monitors.clone())));
+                background_tools = Some((processes, monitors));
+            }
+            resident.push(Arc::new(SleepTool::new(wake_gate)));
+            resident.push(Arc::new(WebFetchTool::new(
+                transport,
+                WebFetchConfig::default(),
+            )));
         }
+
+        let skill_discovery = SkillDiscoveryConfig {
+            cwd: Some(args.cwd.clone()),
+            extra_roots: args.skill_dirs.clone(),
+            user_skill_dirs: vec![PathBuf::from("~/.pikra/skills")],
+            ..SkillDiscoveryConfig::default()
+        };
 
         let js_runtime = if args.extensions.is_empty() {
             None
@@ -381,7 +422,7 @@ impl RpcRuntime {
             &base_system_prompt,
             &resident,
             js_runtime.as_ref(),
-            &args.skill_dirs,
+            &skill_discovery,
             compaction.clone(),
             initial_model,
             !explicit_model_override,
@@ -406,7 +447,9 @@ impl RpcRuntime {
             resident_tools: resident_tools_handle,
             deferred_registry,
             js_runtime,
-            skill_roots: args.skill_dirs.clone(),
+            skill_discovery,
+            #[cfg(all(unix, not(target_os = "ios")))]
+            background_tools,
             no_session: args.no_session,
             compaction_config: Mutex::new(compaction),
             state: Mutex::new(SessionRuntimeState {
@@ -883,10 +926,14 @@ impl RpcRuntime {
             let flushed = match sess.flush_pending_context() {
                 Ok(f) => f,
                 Err(err) => {
-                    self.writer.send_json(&RpcResponse::error(
+                    self.writer.send_json(&RpcResponse::ok(
                         id,
                         "prompt",
-                        format!("Failed to flush pending context: {err}"),
+                        Some(json!({"disposition": "started"})),
+                    ));
+                    self.writer.send_json(&AgentSettledEvent::with_error(
+                        false,
+                        Some(format!("failed to persist session message: {err}")),
                     ));
                     return;
                 }
@@ -1124,6 +1171,13 @@ impl RpcRuntime {
                     "Prompt worker terminated unexpectedly before starting",
                 ));
             }
+        }
+    }
+
+    pub async fn shutdown_tools(&self) {
+        #[cfg(all(unix, not(target_os = "ios")))]
+        if let Some((processes, monitors)) = &self.background_tools {
+            tokio::join!(processes.shutdown(), monitors.shutdown());
         }
     }
 
@@ -1408,7 +1462,7 @@ impl RpcRuntime {
             &self.base_system_prompt,
             &tools,
             self.js_runtime.as_ref(),
-            &self.skill_roots,
+            &self.skill_discovery,
             compaction,
             current_model,
             false,
@@ -1488,7 +1542,7 @@ impl RpcRuntime {
             &self.base_system_prompt,
             &tools,
             self.js_runtime.as_ref(),
-            &self.skill_roots,
+            &self.skill_discovery,
             compaction,
             current_model,
             true,
@@ -1823,7 +1877,7 @@ fn build_session_and_agent(
     base_system_prompt: &str,
     resident_tools: &[Arc<dyn AgentTool>],
     js_runtime: Option<&Arc<JsExtensionRuntime>>,
-    skill_roots: &[PathBuf],
+    skill_discovery: &SkillDiscoveryConfig,
     compaction: CompactionConfig,
     fallback_model: Model,
     should_restore_model: bool,
@@ -1875,7 +1929,7 @@ fn build_session_and_agent(
         .unwrap_or(thinking_level);
     let effective_fast = reconstructed.thinking.map(|(_, f)| f).unwrap_or(fast);
 
-    let skills = SkillCatalog::discover(skill_roots);
+    let skills = SkillCatalog::discover_with_config(skill_discovery);
     if let Some(skills_xml) = skills.format_for_context() {
         session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
     }

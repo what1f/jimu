@@ -5,6 +5,87 @@ import Foundation
 
 /// Pure-FFI skill discovery returning parsed descriptors, content revisions, and XML prompt block.
 public struct PikraSkillDiscovery: Sendable {
+    public struct Configuration: Encodable, Sendable {
+        public struct Rule: Encodable, Sendable {
+            public enum Selector: Encodable, Sendable {
+                case byName(String)
+                case byPath(URL)
+
+                private enum CodingKeys: String, CodingKey {
+                    case byName = "by_name"
+                    case byPath = "by_path"
+                }
+
+                public func encode(to encoder: any Encoder) throws {
+                    var container = encoder.container(keyedBy: CodingKeys.self)
+                    switch self {
+                    case .byName(let name): try container.encode(name, forKey: .byName)
+                    case .byPath(let path): try container.encode(path.path, forKey: .byPath)
+                    }
+                }
+            }
+
+            public var selector: Selector
+            public var enabled: Bool
+
+            public init(_ selector: Selector, enabled: Bool) {
+                self.selector = selector
+                self.enabled = enabled
+            }
+        }
+
+        public var cwd: URL?
+        public var projectSkillDirs: [String]
+        public var includeAgentsSkills: Bool
+        public var includeUserSkills: Bool
+        public var userSkillDirs: [String]
+        public var extraRoots: [URL]
+        public var rules: [Rule]
+        public var maxCatalogBytes: UInt
+
+        public init(
+            cwd: URL? = nil,
+            projectSkillDirs: [String] = [".pikra/skills"],
+            includeAgentsSkills: Bool = true,
+            includeUserSkills: Bool = true,
+            userSkillDirs: [String] = [],
+            extraRoots: [URL] = [],
+            rules: [Rule] = [],
+            maxCatalogBytes: UInt = 8192
+        ) {
+            self.cwd = cwd
+            self.projectSkillDirs = projectSkillDirs
+            self.includeAgentsSkills = includeAgentsSkills
+            self.includeUserSkills = includeUserSkills
+            self.userSkillDirs = userSkillDirs
+            self.extraRoots = extraRoots
+            self.rules = rules
+            self.maxCatalogBytes = maxCatalogBytes
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case cwd, rules
+            case projectSkillDirs = "project_skill_dirs"
+            case includeAgentsSkills = "include_agents_skills"
+            case includeUserSkills = "include_user_skills"
+            case userSkillDirs = "user_skill_dirs"
+            case extraRoots = "extra_roots"
+            case maxCatalogBytes = "max_catalog_bytes"
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(cwd?.path, forKey: .cwd)
+            try container.encode(projectSkillDirs, forKey: .projectSkillDirs)
+            try container.encode(includeAgentsSkills, forKey: .includeAgentsSkills)
+            try container.encode(includeUserSkills, forKey: .includeUserSkills)
+            try container.encode(userSkillDirs, forKey: .userSkillDirs)
+            try container.encode(extraRoots.map(\.path), forKey: .extraRoots)
+            try container.encode(rules, forKey: .rules)
+            try container.encode(maxCatalogBytes, forKey: .maxCatalogBytes)
+        }
+    }
+
     public struct Entry: Sendable, Equatable {
         public let name: String
         public let description: String
@@ -59,11 +140,19 @@ public struct PikraSkillDiscovery: Sendable {
     }
 
     public static func discover(roots: [URL]) throws -> Catalog {
-        let rootsJSON = try encodeJSONString(roots.map(\.path))
+        try discover(json: encodeJSONString(roots.map(\.path)), using: pikra_discover_skills)
+    }
+
+    public static func discover(config: Configuration) throws -> Catalog {
+        try discover(json: encodeJSONString(config), using: pikra_discover_skills_with_config)
+    }
+
+    private static func discover(
+        json: String,
+        using discover: (UnsafePointer<CChar>?, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> UnsafeMutablePointer<CChar>?
+    ) throws -> Catalog {
         var errorPtr: UnsafeMutablePointer<CChar>?
-        let rawPtr = rootsJSON.withCString { cstr in
-            pikra_discover_skills(cstr, &errorPtr)
-        }
+        let rawPtr = json.withCString { discover($0, &errorPtr) }
         guard let jsonStr = takeOwnedCString(rawPtr) else {
             let message = takeOwnedCString(errorPtr) ?? "Failed to discover skills"
             throw PikraError.io(message)

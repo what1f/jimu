@@ -158,10 +158,12 @@ public struct PikraURLSessionHTTPClient: PikraHTTPClient {
         }
         try Task.checkCancellation()
 
-        let urlRequest = request.toURLRequest()
+        var urlRequest = request.toURLRequest()
+        let manualRedirect = urlRequest.value(forHTTPHeaderField: "x-pikra-no-redirect") != nil
+        urlRequest.setValue(nil, forHTTPHeaderField: "x-pikra-no-redirect")
         let (bytes, response) = try await session.bytes(
             for: urlRequest,
-            delegate: CredentialRedirectPolicy()
+            delegate: CredentialRedirectPolicy(manualRedirect: manualRedirect)
         )
         if Task.isCancelled {
             bytes.task.cancel()
@@ -261,23 +263,37 @@ private final class AsyncBytesChunkReader: @unchecked Sendable {
     }
 }
 
-/// Prevent forwarding `Authorization` headers or POST request bodies across redirects.
+/// Leave anonymous redirects to the caller. Authenticated requests can redirect within their origin.
 private final class CredentialRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    private let manualRedirect: Bool
+    private static let credentialHeaders = ["Authorization", "x-api-key", "x-goog-api-key", "chatgpt-account-id"]
+
+    init(manualRedirect: Bool) {
+        self.manualRedirect = manualRedirect
+    }
+
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
         willPerformHTTPRedirection response: HTTPURLResponse,
         newRequest request: URLRequest
     ) async -> URLRequest? {
-        guard let original = task.originalRequest,
-              original.value(forHTTPHeaderField: "Authorization") == nil,
-              original.value(forHTTPHeaderField: "x-api-key") == nil,
-              original.value(forHTTPHeaderField: "x-goog-api-key") == nil,
-              original.value(forHTTPHeaderField: "chatgpt-account-id") == nil,
-              ["GET", "HEAD"].contains(original.httpMethod ?? "GET")
-        else {
-            return nil
+        guard !manualRedirect, let original = task.originalRequest,
+              Self.credentialHeaders.contains(where: { original.value(forHTTPHeaderField: $0) != nil }),
+              let origin = original.url, let target = request.url,
+              let scheme = origin.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              scheme == target.scheme?.lowercased(),
+              let host = origin.host?.lowercased(), host == target.host?.lowercased()
+        else { return nil }
+
+        let defaultPort = scheme == "https" ? 443 : 80
+        guard (origin.port ?? defaultPort) == (target.port ?? defaultPort) else { return nil }
+        var authenticated = request
+        for header in Self.credentialHeaders {
+            if let value = original.value(forHTTPHeaderField: header) {
+                authenticated.setValue(value, forHTTPHeaderField: header)
+            }
         }
-        return request
+        return authenticated
     }
 }

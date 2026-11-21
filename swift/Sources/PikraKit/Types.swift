@@ -376,7 +376,20 @@ public enum PikraContentPart: Codable, Sendable, Equatable {
 
 /// Output returned by a native Swift tool execution.
 public struct PikraToolOutput: Codable, Sendable, Equatable {
-    public var content: [PikraContentPart]
+    public var content: [PikraContentPart] {
+        didSet {
+            // Workspace bash mirrors its JSON text as structured content. Keep that copy
+            // synchronized when a host wrapper redacts or limits the rendered output.
+            guard let payload = structuredContent,
+                  payload["exit_code"]?.intValue != nil,
+                  payload["output"]?.stringValue != nil,
+                  payload["output_truncated"]?.boolValue != nil,
+                  oldValue.count == 1, case .text(let text) = oldValue[0],
+                  (try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))) == payload
+            else { return }
+            structuredContent = try? JSONDecoder().decode(JSONValue.self, from: Data(textOutput.utf8))
+        }
+    }
     public var details: JSONValue
     public var structuredContent: JSONValue?
     public var isError: Bool
@@ -636,6 +649,11 @@ public struct PikraConfiguration: Sendable {
     public var headers: [(String, String?)]
     public var samplingParams: [String: JSONValue]
     public var skillRoots: [URL]
+    public var skillDiscovery: PikraSkillDiscovery.Configuration? = nil
+    /// Set a schema budget to defer additional tools when the deferred gateway is enabled.
+    public var autoDeferThresholdBytes: UInt? = nil
+    /// Receives background events for this environment and shuts it down when the agent closes.
+    public var workspaceEnvironment: PikraWorkspaceEnvironment? = nil
     public var enableDeferredGateway: Bool
     public var enableCodemode: Bool
     public var codemodeOptions: PikraCodemodeOptions?

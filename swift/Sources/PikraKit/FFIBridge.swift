@@ -98,6 +98,8 @@ struct WireSessionConfig: Encodable {
     let headers: [WireHeaderOverride]
     let samplingParams: [String: JSONValue]
     let skillRoots: [String]
+    let skillDiscovery: PikraSkillDiscovery.Configuration?
+    let autoDeferThresholdBytes: UInt?
     let enableDeferredGateway: Bool
     let enableCodemode: Bool
     let codemodeOptions: PikraCodemodeOptions?
@@ -123,6 +125,8 @@ struct WireSessionConfig: Encodable {
         case headers
         case samplingParams = "sampling_params"
         case skillRoots = "skill_roots"
+        case skillDiscovery = "skill_discovery"
+        case autoDeferThresholdBytes = "auto_defer_threshold_bytes"
         case enableDeferredGateway = "enable_deferred_gateway"
         case enableCodemode = "enable_codemode"
         case codemodeOptions = "codemode_options"
@@ -149,6 +153,8 @@ struct WireSessionConfig: Encodable {
         self.headers = config.headers.map { WireHeaderOverride(name: $0.0, value: $0.1) }
         self.samplingParams = config.samplingParams
         self.skillRoots = config.skillRoots.map(\.path)
+        self.skillDiscovery = config.skillDiscovery
+        self.autoDeferThresholdBytes = config.autoDeferThresholdBytes
         self.enableDeferredGateway = config.enableDeferredGateway
         self.enableCodemode = config.enableCodemode
         self.codemodeOptions = config.codemodeOptions
@@ -189,6 +195,9 @@ struct WireSessionInfo: Decodable {
     let thinkingLevel: PikraThinkingLevel
     let fast: Bool
     let isRunning: Bool
+    let residentTools: [Tool]
+
+    struct Tool: Decodable { let name: String }
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
@@ -197,6 +206,7 @@ struct WireSessionInfo: Decodable {
         case thinkingLevel = "thinking_level"
         case fast
         case isRunning = "is_running"
+        case residentTools = "resident_tools"
     }
 }
 
@@ -363,7 +373,6 @@ final class PikraSessionBridge: @unchecked Sendable {
     private let beforeRequest: (@Sendable (Data) async throws -> Void)?
 
     private let lock = NSLock()
-    private let residentToolNames: Set<String>
     private var toolsByName: [String: PikraTool]
     private var httpTasks: [UInt64: Task<Void, Never>] = [:]
     private var toolTasks: [UInt64: Task<Void, Never>] = [:]
@@ -378,29 +387,12 @@ final class PikraSessionBridge: @unchecked Sendable {
         self.httpClient = httpClient
         self.authorizeRequest = authorizeRequest
         self.beforeRequest = beforeRequest
-        var map: [String: PikraTool] = [:]
-        var resident: Set<String> = []
-        for tool in initialTools {
-            map[tool.name] = tool
-            if !tool.deferred {
-                resident.insert(tool.name)
-            }
-        }
-        self.toolsByName = map
-        self.residentToolNames = resident
-    }
-
-    func residentCollision(in names: [String]) -> String? {
-        names.first { residentToolNames.contains($0) }
-    }
-
-    func isResidentTool(_ name: String) -> Bool {
-        residentToolNames.contains(name)
+        self.toolsByName = Dictionary(initialTools.map { ($0.name, $0) }, uniquingKeysWith: { _, last in last })
     }
 
     func upsertTools(_ tools: [PikraTool]) {
         lock.withLock {
-            for tool in tools where !residentToolNames.contains(tool.name) {
+            for tool in tools {
                 toolsByName[tool.name] = tool
             }
         }
@@ -408,7 +400,7 @@ final class PikraSessionBridge: @unchecked Sendable {
 
     func removeTools(named names: [String]) {
         lock.withLock {
-            for name in names where !residentToolNames.contains(name) {
+            for name in names {
                 toolsByName.removeValue(forKey: name)
             }
         }
@@ -435,23 +427,20 @@ final class PikraSessionBridge: @unchecked Sendable {
         body: Data,
         streamPtr: SendableHttpStreamPtr
     ) {
-        let task = Task { [weak self] in
-            defer {
-                self?.removeHTTPTask(requestID)
-            }
-            guard let self else {
-                pikra_http_finish(streamPtr.raw, Int32(PIKRA_HTTP_ERR_ABORTED.rawValue), "session destroyed")
-                return
-            }
-            await self.driveHTTP(
-                requestID: requestID,
-                requestJSON: requestJSON,
-                body: body,
-                streamPtr: streamPtr
-            )
-        }
         lock.withLock {
-            httpTasks[requestID] = task
+            httpTasks[requestID] = Task { [weak self] in
+                defer { self?.removeHTTPTask(requestID) }
+                guard let self else {
+                    pikra_http_finish(streamPtr.raw, Int32(PIKRA_HTTP_ERR_ABORTED.rawValue), "session destroyed")
+                    return
+                }
+                await self.driveHTTP(
+                    requestID: requestID,
+                    requestJSON: requestJSON,
+                    body: body,
+                    streamPtr: streamPtr
+                )
+            }
         }
     }
 

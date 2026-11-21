@@ -17,6 +17,8 @@ pikra-session.workspace = true
 pikra-codemode.workspace = true
 pikra-js.workspace = true
 pikra-kit.workspace = true
+pikra-tools = { path = "../pikra-tools", default-features = false, features = ["fs", "patch", "search", "sleep", "web-fetch"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
@@ -27,3 +29,6 @@ futures-executor.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
 rquickjs = { workspace = true, features = ["bindgen"] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+pikra-tools = { path = "../pikra-tools", default-features = false, features = ["shell", "monitor"] }

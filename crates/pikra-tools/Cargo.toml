@@ -10,14 +10,15 @@ test = false
 
 [features]
 default = ["fs", "patch", "search", "shell", "monitor", "sleep", "web-fetch"]
-fs = ["dep:tempfile"]
+fs = ["dep:tempfile", "dep:base64", "dep:libc"]
 patch = ["fs"]
 search = ["dep:ignore", "dep:grep-searcher", "dep:grep-regex", "dep:grep-matcher", "dep:globset"]
 sleep = ["dep:tokio"]
-shell = ["sleep", "dep:libc"]
+shell = ["sleep", "dep:libc", "tokio/process", "tokio/io-util", "tokio/fs", "tokio/net"]
 monitor = ["shell"]
 web-fetch = [
     "dep:tokio",
+    "tokio/net",
     "dep:futures-core",
     "dep:futures-util",
     "dep:thiserror",
@@ -40,7 +41,7 @@ grep-searcher = { version = "0.1", optional = true }
 grep-regex = { version = "0.1", optional = true }
 grep-matcher = { version = "0.1", optional = true }
 globset = { version = "0.4", optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { version = "1.54", features = ["rt", "macros", "sync", "time"], optional = true }
 futures-core = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
@@ -50,7 +51,7 @@ ego-tree = { workspace = true, optional = true }
 scraper = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
-[target.'cfg(all(unix, not(target_os = "ios")))'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]

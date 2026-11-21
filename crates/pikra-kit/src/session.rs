@@ -4,9 +4,7 @@ use crate::deferred::{
 };
 use crate::error::KitError;
 use crate::mcp::{McpClient, McpToolRegistrationMode};
-use crate::skills::{
-    SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillSearchTool, escape_xml,
-};
+use crate::skills::{SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillSearchTool};
 use crate::wakeup::{
     Activity, ActivityGuard, BackgroundEventSender, BackgroundInbox, KitTurnOrigin,
 };
@@ -27,9 +25,7 @@ use pikra_session::{
     SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore, SessionTreeNode,
     baseline_to_system_message, context_block_to_agent_message,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -37,8 +33,7 @@ use std::task::{Context, Poll};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SKILLS_CONTEXT_NAME: &str = "skills";
-const SKILL_STATE_ENTRY: &str = "kit.known_skills";
+use crate::skill_context::{SKILLS_CONTEXT_NAME, SkillContextState};
 const DEFAULT_AUTO_DEFER_BYTES: usize = 8192;
 const DEFERRED_TOOLS_CONTEXT_NAME: &str = "deferred_tools";
 
@@ -286,83 +281,12 @@ impl Stream for KitEventStream<'_> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KnownSkillEntry {
-    description: String,
-    file_path: String,
-    revision: String,
-}
-
-#[derive(Default)]
-struct KnownSkills {
-    entries: Option<BTreeMap<String, KnownSkillEntry>>,
-    has_named_context: bool,
-}
-
-impl KnownSkills {
-    fn from_branch(session: &SessionManager) -> Self {
-        let branch = session.active_branch();
-        let previous_catalog = branch.iter().rev().find_map(|entry| match &entry.payload {
-            SessionEntryPayload::ContextBlock { name, text } if name == SKILLS_CONTEXT_NAME => {
-                Some(text)
-            }
-            _ => None,
-        });
-        let entries = branch
-            .iter()
-            .rev()
-            .find_map(|entry| match &entry.payload {
-                SessionEntryPayload::Custom { custom_type, data }
-                    if custom_type == SKILL_STATE_ENTRY =>
-                {
-                    serde_json::from_value(data.clone()).ok().map(Some)
-                }
-                SessionEntryPayload::Compaction { .. } => Some(None),
-                // Older sessions put the whole catalog in the named context block.
-                SessionEntryPayload::ContextBlock { name, text } if name == SKILLS_CONTEXT_NAME => {
-                    let skills = text
-                        .split("<skill>")
-                        .skip(1)
-                        .filter_map(|row| {
-                            let field = |tag: &str| {
-                                let content = row.split_once(&format!("<{tag}>"))?.1;
-                                let raw = content.split_once(&format!("</{tag}>"))?.0;
-                                Some(
-                                    raw.replace("&lt;", "<")
-                                        .replace("&gt;", ">")
-                                        .replace("&quot;", "\"")
-                                        .replace("&apos;", "'")
-                                        .replace("&amp;", "&"),
-                                )
-                            };
-                            Some((
-                                field("name")?,
-                                KnownSkillEntry {
-                                    description: field("description")?,
-                                    file_path: field("location")?,
-                                    revision: String::new(),
-                                },
-                            ))
-                        })
-                        .collect();
-                    Some(Some(skills))
-                }
-                _ => None,
-            })
-            .flatten();
-        Self {
-            entries,
-            has_named_context: previous_catalog.is_some(),
-        }
-    }
-}
-
-struct SchemaBudget {
+pub struct ToolSchemaBudget {
     remaining: usize,
 }
 
-impl SchemaBudget {
-    fn new(threshold: Option<usize>, pinned: &[ToolDefinition]) -> Self {
+impl ToolSchemaBudget {
+    pub fn new(threshold: Option<usize>, pinned: &[ToolDefinition]) -> Self {
         let budget = threshold.unwrap_or(DEFAULT_AUTO_DEFER_BYTES);
         let occupied = pinned.iter().fold(0usize, |total, definition| {
             total.saturating_add(Self::size(definition))
@@ -376,7 +300,7 @@ impl SchemaBudget {
         serde_json::to_vec(definition).map_or(usize::MAX, |bytes| bytes.len())
     }
 
-    fn admit(&mut self, definition: &ToolDefinition) -> bool {
+    pub fn admit(&mut self, definition: &ToolDefinition) -> bool {
         let Some(remaining) = self.remaining.checked_sub(Self::size(definition)) else {
             self.remaining = 0;
             return false;
@@ -398,7 +322,7 @@ pub struct KitSession {
     deferred_registry: Arc<DeferredToolRegistry>,
     skills: Arc<Mutex<SkillCatalog>>,
     skill_discovery: SkillDiscoveryConfig,
-    known_skills: Mutex<KnownSkills>,
+    known_skills: Mutex<SkillContextState>,
     auto_defer_threshold_bytes: Option<usize>,
     pause_background_on_error: bool,
     inbox: BackgroundInbox,
@@ -434,7 +358,7 @@ impl KitSession {
             .filter(|spec| spec.mode == KitToolRegistrationMode::Resident)
             .map(|spec| spec.tool.definition())
             .collect();
-        let mut budget = SchemaBudget::new(config.auto_defer_threshold_bytes, &pinned);
+        let mut budget = ToolSchemaBudget::new(config.auto_defer_threshold_bytes, &pinned);
         for spec in config.tools {
             match spec.mode {
                 KitToolRegistrationMode::Resident => resident.push(spec.tool),
@@ -536,7 +460,7 @@ impl KitSession {
             .map(|(_, f)| f)
             .unwrap_or(config.fast);
 
-        let known_skills = KnownSkills::from_branch(&session_manager);
+        let known_skills = SkillContextState::from_branch(&session_manager);
 
         let mut had_deferred_catalog = false;
         if let Some(catalog) = deferred_registry.format_catalog() {
@@ -710,13 +634,7 @@ impl KitSession {
     pub fn reload_skills(&self) -> bool {
         let mut skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
         let discovered = SkillCatalog::discover_with_config(&self.skill_discovery);
-        let names = |catalog: &SkillCatalog| {
-            catalog
-                .visible()
-                .map(|skill| skill.name.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        let changed = names(&skills) != names(&discovered);
+        let changed = !skills.has_same_visible_names(&discovered);
         *skills = discovered;
         changed
     }
@@ -865,7 +783,7 @@ impl KitSession {
                     let existing: std::collections::HashSet<_> =
                         definitions.iter().map(|def| def.name.as_str()).collect();
                     let mut budget =
-                        SchemaBudget::new(self.auto_defer_threshold_bytes, &definitions);
+                        ToolSchemaBudget::new(self.auto_defer_threshold_bytes, &definitions);
                     let has_started = self
                         .session
                         .lock()
@@ -938,17 +856,13 @@ impl KitSession {
                 session.fork(entry_id)?;
                 let reconstructed = session.reconstruct_context();
                 let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
-                let mut restored = KnownSkills::from_branch(&session);
-                if let Some(catalog) = reconstructed
-                    .all_branch_context_blocks
-                    .get(SKILLS_CONTEXT_NAME)
-                {
-                    session.set_context(SKILLS_CONTEXT_NAME, catalog);
-                } else if known.has_named_context {
-                    session.set_context(SKILLS_CONTEXT_NAME, "");
-                    restored.has_named_context = true;
-                }
-                *known = restored;
+                known.restore_fork(
+                    &mut session,
+                    reconstructed
+                        .all_branch_context_blocks
+                        .get(SKILLS_CONTEXT_NAME)
+                        .map(String::as_str),
+                );
                 reconstructed
             };
             self.deferred_registry.clear_seen_schemas();
@@ -1167,42 +1081,13 @@ impl KitSession {
         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
         let skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
         let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
-        let current = update_skill_context(&mut session, &skills, &mut known);
-        if origin == KitTurnOrigin::Foreground
-            && let AgentMessage::Llm(Message::User(user)) = &user_msg
-        {
-            let text = user
-                .content
-                .iter()
-                .filter_map(|part| match part {
-                    ContentPart::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let mentions = skills.resolve_explicit_mentions(&text);
-            if !mentions.is_empty() {
-                session.append_context(
-                    mentions
-                        .iter()
-                        .map(|skill| {
-                            format!(
-                                "<skill_mention name=\"{}\" location=\"{}\" />",
-                                escape_xml(&skill.name),
-                                escape_xml(&skill.file_path.to_string_lossy()),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+        let content = match &user_msg {
+            AgentMessage::Llm(Message::User(user)) if origin == KitTurnOrigin::Foreground => {
+                Some(user.content.as_slice())
             }
-        }
-        let flushed = session.flush_pending_context()?;
-        if known.entries.as_ref() != Some(&current) {
-            let data = serde_json::to_value(&current).map_err(pikra_session::SessionError::from)?;
-            session.append_custom(SKILL_STATE_ENTRY, data)?;
-            known.entries = Some(current);
-        }
+            _ => None,
+        };
+        let flushed = known.flush_for_prompt(&mut session, &skills, content)?;
 
         let mut prompt_messages = Vec::with_capacity(flushed.len() + 1);
         let mut events = Vec::with_capacity(flushed.len());
@@ -1293,7 +1178,7 @@ impl KitSession {
         self.known_skills
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entries = None;
+            .reset_after_compaction();
 
         if let Some(tx) = stream_tx {
             let _ = tx.unbounded_send(KitEvent::Session(SessionEvent::CompactionEnd {
@@ -1306,60 +1191,4 @@ impl KitSession {
 
         Ok(Some(result))
     }
-}
-
-fn update_skill_context(
-    session: &mut SessionManager,
-    catalog: &SkillCatalog,
-    known: &mut KnownSkills,
-) -> BTreeMap<String, KnownSkillEntry> {
-    let current: BTreeMap<_, _> = catalog
-        .visible()
-        .map(|skill| {
-            (
-                skill.name.clone(),
-                KnownSkillEntry {
-                    description: skill.description.clone(),
-                    file_path: skill.file_path.to_string_lossy().into_owned(),
-                    revision: skill.revision.clone(),
-                },
-            )
-        })
-        .collect();
-    if let Some(previous) = &known.entries {
-        let removed: Vec<_> = previous
-            .keys()
-            .filter(|name| !current.contains_key(*name))
-            .collect();
-        let is_added = |skill: &crate::Skill| !previous.contains_key(&skill.name);
-        let has_additions = catalog.visible().any(is_added);
-        if has_additions || !removed.is_empty() {
-            let mut diff = String::from("# Skills changed");
-            if has_additions {
-                diff.push('\n');
-                let added = catalog.format_visible(is_added);
-                diff.push_str(
-                    added
-                        .as_deref()
-                        .unwrap_or("Use skill_search to find additional skills."),
-                );
-            }
-            for name in removed {
-                diff.push_str(&format!(
-                    "\nThe {} skill has been removed and is unavailable.",
-                    escape_xml(name)
-                ));
-            }
-            session.append_context(diff);
-        }
-    } else if let Some(xml) = catalog.format_for_context() {
-        if !session.set_context(SKILLS_CONTEXT_NAME, &xml) {
-            // Compaction can retain the previous catalog as part of its kept tail.
-            session.append_context(xml);
-        }
-        known.has_named_context = true;
-    } else if known.has_named_context {
-        session.set_context(SKILLS_CONTEXT_NAME, catalog.empty_context());
-    }
-    current
 }

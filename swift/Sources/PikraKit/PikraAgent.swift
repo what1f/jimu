@@ -17,8 +17,7 @@ public actor PikraAgent {
             if let s = session {
                 session = nil
                 // Cancels any active Rust run and drops Swift's Arc<FfiSession>.
-                // The retained bridgePtr is released inside `FfiSession::drop` via
-                // `pikraBridgeDestroyTrampoline` only after the last Rust task exits.
+                // The HTTP callbacks retain the bridge until the last Rust request releases it.
                 pikra_session_destroy(s)
             }
         }
@@ -31,10 +30,23 @@ public actor PikraAgent {
     private let handleBox: HandleBox
     private let bridge: PikraSessionBridge
     private var isClosed = false
+    private let workspaceEnvironment: PikraWorkspaceEnvironment?
+    /// Background events from the workspace environment selected in the configuration.
+    public nonisolated let backgroundEvents: AsyncStream<PikraBackgroundEvent>
 
-    private init(session: OpaquePointer, bridge: PikraSessionBridge) {
+    private init(
+        session: OpaquePointer,
+        bridge: PikraSessionBridge,
+        workspaceEnvironment: PikraWorkspaceEnvironment?
+    ) {
         self.handleBox = HandleBox(session: session, bridge: bridge)
         self.bridge = bridge
+        self.workspaceEnvironment = workspaceEnvironment
+        backgroundEvents = workspaceEnvironment?.backgroundEvents ?? AsyncStream { $0.finish() }
+    }
+
+    deinit {
+        workspaceEnvironment?.beginShutdown()
     }
 
     /// Opens a new or existing `PikraAgent` session (in-memory or JSONL-persisted).
@@ -80,7 +92,7 @@ public actor PikraAgent {
             throw PikraError.invalidArgument(message)
         }
 
-        return PikraAgent(session: sessionPtr, bridge: bridge)
+        return PikraAgent(session: sessionPtr, bridge: bridge, workspaceEnvironment: configuration.workspaceEnvironment)
     }
 
     private func requireSession() throws -> OpaquePointer {
@@ -270,9 +282,6 @@ public actor PikraAgent {
     /// Adds or replaces deferred tools while idle without mutating the resident `tools` array.
     public func upsertTools(_ tools: [PikraTool]) throws {
         let session = try requireSession()
-        if let collision = bridge.residentCollision(in: tools.map(\.name)) {
-            throw PikraError.invalidArgument("Cannot upsert tool '\(collision)': collides with a resident tool")
-        }
         let wireSpecs = tools.map { WireToolSpec(tool: $0, forceDeferred: true) }
         let json = try encodeJSONString(wireSpecs)
         var errorPtr: UnsafeMutablePointer<CChar>?
@@ -289,7 +298,8 @@ public actor PikraAgent {
     @discardableResult
     public func removeTools(named names: [String]) throws -> Int {
         let session = try requireSession()
-        let removableNames = names.filter { !bridge.isResidentTool($0) }
+        let residentNames = Set(try fetchInfo().residentTools.map(\.name))
+        let removableNames = names.filter { !residentNames.contains($0) }
         let json = try encodeJSONString(removableNames)
         var removed: Int = 0
         var errorPtr: UnsafeMutablePointer<CChar>?
@@ -405,6 +415,7 @@ public actor PikraAgent {
                 pikra_session_close(session, boxPtr, pikraVoidDoneTrampoline)
             }
         }
+        await workspaceEnvironment?.shutdown()
         handleBox.destroyNow()
     }
 

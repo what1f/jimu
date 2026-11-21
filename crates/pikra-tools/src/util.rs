@@ -215,19 +215,50 @@ pub(crate) fn uses_crlf(text: &str) -> bool {
             .all(|(i, _)| i > 0 && text.as_bytes()[i - 1] == b'\r')
 }
 
+#[cfg(feature = "fs")]
+pub(crate) fn read_regular_file(
+    path: &Path,
+    shown: &str,
+) -> Result<(Vec<u8>, fs::Metadata), String> {
+    use std::io::Read as _;
+
+    const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|err| format!("Could not open '{shown}': {err}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| format!("Could not access '{shown}': {err}"))?;
+    if !meta.is_file() {
+        return Err(format!("Cannot read '{shown}': expected a regular file"));
+    }
+    let size_error = || format!("Cannot read '{shown}': file exceeds 16 MiB");
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(size_error());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("Could not read '{shown}': {err}"))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(size_error());
+    }
+    Ok((bytes, meta))
+}
+
 #[cfg(feature = "patch")]
 pub(crate) fn read_editable_text(
     path: &Path,
     shown: &str,
 ) -> Result<(String, Permissions), String> {
-    let meta = fs::metadata(path).map_err(|err| format!("Could not access '{shown}': {err}"))?;
-    if !meta.is_file() {
-        return Err(format!("Cannot edit '{shown}': expected a regular file"));
-    }
-    if meta.len() > 16 * 1024 * 1024 {
-        return Err(format!("Cannot edit '{shown}': file exceeds 16 MiB"));
-    }
-    let bytes = fs::read(path).map_err(|err| format!("Could not read '{shown}': {err}"))?;
+    let (bytes, meta) = read_regular_file(path, shown)?;
     if bytes.contains(&0) {
         return Err(format!("Cannot edit binary file '{shown}'"));
     }
@@ -410,6 +441,13 @@ impl BoundedOutputBuffer {
             tail.drain(..drop_count);
         }
         tail.extend(bytes);
+    }
+
+    pub(crate) fn prefix(&self) -> (&str, bool) {
+        let prefix = std::str::from_utf8(&self.head).unwrap_or_else(|error| {
+            std::str::from_utf8(&self.head[..error.valid_up_to()]).unwrap()
+        });
+        (prefix, self.total_bytes > prefix.len())
     }
 
     /// Render captured bytes into UTF-8 text bounded by `budget` (at most `self.max_bytes`).

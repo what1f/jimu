@@ -1,7 +1,8 @@
 use crate::WorkspaceToolsConfig;
-use crate::util::{display_path, resolve_path, truncate_output};
+use crate::util::{display_path, read_regular_file, resolve_path, truncate_output};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
-use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
+use pikra_ai::{BoxFuture, CancelToken, ContentPart, ImageContent, ToolDefinition};
 use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_description};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -13,11 +14,21 @@ const BINARY_SNIFF_BYTES: usize = 8192;
 #[derive(Clone, Debug)]
 pub struct ReadTool {
     config: Arc<WorkspaceToolsConfig>,
+    plain_text: bool,
 }
 
 impl ReadTool {
     pub fn new(config: Arc<WorkspaceToolsConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            plain_text: false,
+        }
+    }
+
+    /// Return file text verbatim, or return the requested line slice without annotations.
+    pub fn with_plain_text(mut self) -> Self {
+        self.plain_text = true;
+        self
     }
 }
 
@@ -25,7 +36,7 @@ impl AgentTool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".into(),
-            description: "Read a UTF-8 text file from the workspace with optional 1-based line offset and line limit.".into(),
+            description: "Read a UTF-8 text file or image from the workspace with optional 1-based line offset and line limit.".into(),
             parameters: obj_schema([
                 (
                     "path",
@@ -67,6 +78,7 @@ impl AgentTool for ReadTool {
         _on_update: ToolProgressCallback,
     ) -> BoxFuture<'_, Result<AgentToolResult, String>> {
         let config = Arc::clone(&self.config);
+        let plain_text = self.plain_text;
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err("Operation aborted".into());
@@ -96,26 +108,19 @@ impl AgentTool for ReadTool {
             let resolved = resolve_path(&config.cwd, raw_path)?;
             let shown = display_path(&config.cwd, &resolved);
 
-            let meta = std::fs::metadata(&resolved)
-                .map_err(|e| format!("failed to stat '{shown}': {e}"))?;
-            if meta.is_dir() {
-                return Err(format!("cannot read '{shown}': path is a directory"));
-            }
-            if !meta.is_file() {
-                return Err(format!("cannot read '{shown}': path is not a regular file"));
-            }
-            if meta.len() > 16 * 1024 * 1024 {
-                return Err(format!(
-                    "cannot read '{shown}': file size ({} bytes) exceeds 16 MiB limit",
-                    meta.len()
-                ));
-            }
-
-            let bytes =
-                std::fs::read(&resolved).map_err(|e| format!("failed to read '{shown}': {e}"))?;
+            let (bytes, _) = read_regular_file(&resolved, &shown)?;
 
             if cancel.is_cancelled() {
                 return Err("Operation aborted".into());
+            }
+
+            if let Some(mime_type) = image_mime_type(&bytes) {
+                let mut result = AgentToolResult::text("");
+                result.content = vec![ContentPart::Image(ImageContent {
+                    data: STANDARD.encode(&bytes),
+                    mime_type: mime_type.into(),
+                })];
+                return Ok(result);
             }
 
             let sniff = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
@@ -132,6 +137,26 @@ impl AgentTool for ReadTool {
                     bytes.len()
                 )
             })?;
+
+            if plain_text {
+                if args["offset"].is_null() && args["limit"].is_null() {
+                    return Ok(AgentToolResult::text(text));
+                }
+                let limit = if args["limit"].is_null() {
+                    usize::MAX
+                } else {
+                    limit
+                };
+                let lines = text
+                    .split_inclusive('\n')
+                    .map(|line| match line.strip_suffix('\n') {
+                        Some(line) => line.strip_suffix('\r').unwrap_or(line),
+                        None => line,
+                    })
+                    .chain(text.ends_with('\n').then_some(""));
+                let slice = lines.skip(offset - 1).take(limit).collect::<Vec<_>>();
+                return Ok(AgentToolResult::text(slice.join("\n")));
+            }
 
             if text.is_empty() {
                 let mut res = AgentToolResult::text("(empty file)");
@@ -199,5 +224,29 @@ impl AgentTool for ReadTool {
             });
             Ok(res)
         })
+    }
+}
+
+fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
+        _ => None,
     }
 }

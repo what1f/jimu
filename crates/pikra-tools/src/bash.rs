@@ -2,7 +2,7 @@ use crate::WorkspaceToolsConfig;
 use crate::util::{BoundedOutputBuffer, display_path, resolve_path};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
-use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_description};
+use pikra_schema::{int_schema, num_schema, obj_schema, str_schema, with_bounds, with_description};
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ impl AgentTool for BashTool {
         ToolDefinition {
             name: "bash".into(),
             description:
-                "Run a shell command in the workspace directory with optional cwd and timeout_ms."
+                "Run a shell command in the workspace directory with an optional working directory and timeout."
                     .into(),
             parameters: obj_schema([
                 (
@@ -92,6 +92,11 @@ impl AgentTool for BashTool {
                         str_schema(),
                         "Working directory for the command (relative to workspace cwd or absolute).",
                     ),
+                    false,
+                ),
+                (
+                    "timeout",
+                    with_description(num_schema(), "Optional timeout in seconds (greater than 0 and at most 86400)."),
                     false,
                 ),
                 (
@@ -127,8 +132,8 @@ impl AgentTool for BashTool {
                 .get("command")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "missing required string argument: command".to_string())?;
-            if command.is_empty() {
-                return Err("command must not be empty".to_string());
+            if command.is_empty() || command.len() > 65_536 || command.contains('\0') {
+                return Err("Command must contain 1 to 65536 bytes without NUL".into());
             }
 
             let effective_cwd = match args.get("cwd").and_then(Value::as_str) {
@@ -145,7 +150,16 @@ impl AgentTool for BashTool {
             }
 
             let timeout_ms = match args.get("timeout_ms") {
-                None | Some(Value::Null) => config.default_bash_timeout_ms,
+                None | Some(Value::Null) => match args.get("timeout") {
+                    None | Some(Value::Null) => config.default_bash_timeout_ms,
+                    Some(value) => {
+                        let seconds = value
+                            .as_f64()
+                            .filter(|seconds| *seconds > 0.0 && *seconds <= 86_400.0)
+                            .ok_or("timeout must be greater than 0 and at most 86400 seconds")?;
+                        Some((seconds * 1000.0).ceil() as u64)
+                    }
+                },
                 Some(v) => Some(
                     v.as_u64()
                         .filter(|&n| n >= 1)
@@ -300,6 +314,15 @@ impl AgentTool for BashTool {
                 }
             };
 
+            let (output, output_truncated) = buffer.prefix();
+            let structured = |exit_code| {
+                json!({
+                    "exit_code": exit_code,
+                    "output": output,
+                    "output_truncated": output_truncated,
+                })
+            };
+
             match stop_kind {
                 StopReasonKind::Aborted => {
                     let notice = "Command aborted.";
@@ -326,6 +349,7 @@ impl AgentTool for BashTool {
                         "truncated": truncated,
                         "omitted_bytes": omitted_bytes,
                     });
+                    res.structured_content = Some(structured(124));
                     Ok(res)
                 }
                 StopReasonKind::Completed => {
@@ -340,6 +364,7 @@ impl AgentTool for BashTool {
                             "truncated": rendered.truncated,
                             "omitted_bytes": rendered.omitted_bytes,
                         });
+                        res.structured_content = Some(structured(0));
                         Ok(res)
                     } else {
                         let notice = match code {
@@ -355,6 +380,7 @@ impl AgentTool for BashTool {
                             "truncated": truncated,
                             "omitted_bytes": omitted_bytes,
                         });
+                        res.structured_content = Some(structured(shell_exit_code(&status)));
                         Ok(res)
                     }
                 }
@@ -411,4 +437,15 @@ fn render_with_notice(
         format!("{}\n{notice}", rendered.text)
     };
     (text, rendered.truncated, rendered.omitted_bytes)
+}
+
+fn shell_exit_code(status: &std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(1)
 }
