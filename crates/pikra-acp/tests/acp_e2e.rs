@@ -776,11 +776,7 @@ async fn cancellation_steering_mcp_and_compaction_use_the_same_session() {
             "bash",
             json!({"command":"printf should-not-run"}),
         ),
-        tool(
-            "echo",
-            "call_tool",
-            json!({"name":"mcp_local_echo","arguments":{"text":"MCP roundtrip"}}),
-        ),
+        tool("echo", "mcp_local_echo", json!({"text":"MCP roundtrip"})),
         text("MCP completed."),
         text("Conversation summary."),
         text("Started idle."),
@@ -911,11 +907,7 @@ done
         .await
         .unwrap();
     let requests = model.finish().await;
-    assert!(
-        requests[1]["messages"]
-            .to_string()
-            .contains("mcp_local_echo")
-    );
+    assert!(requests[1]["tools"].to_string().contains("mcp_local_echo"));
     assert!(requests[2].to_string().contains("MCP fixture received"));
     assert!(requests[2].to_string().contains("Include the tool result"));
     assert!(requests[3].to_string().contains("keep the tool outcome"));

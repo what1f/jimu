@@ -109,6 +109,12 @@ impl Metadata {
         additional_directories: Vec<PathBuf>,
     ) -> Self {
         let model = server.auth.default_model();
+        let mut thinking_level = server.config.thinking;
+        if let Some(allowed) = server.auth.thinking_levels(&model.provider, &model.id)
+            && !allowed.contains(&thinking_level)
+        {
+            thinking_level = allowed[0];
+        }
         let now = now_ms();
         Self {
             session_id: Uuid::now_v7().to_string(),
@@ -123,7 +129,7 @@ impl Metadata {
             model_id: model.id,
             api: model.api,
             base_url: model.base_url,
-            thinking_level: server.config.thinking,
+            thinking_level,
             fast: server.config.fast,
         }
     }
@@ -146,14 +152,19 @@ impl Metadata {
             SessionConfigSelectOption as Item,
         };
         let model_id = format!("{}/{}", self.provider, self.model_id);
-        let mut models: Vec<_> = auth
-            .models()
+        let catalog = auth.models();
+        let multi_provider = catalog
+            .first()
+            .is_some_and(|first| catalog.iter().any(|m| m.provider != first.provider));
+        let mut models: Vec<_> = catalog
             .into_iter()
             .map(|model| {
-                Item::new(
-                    model_key(&model),
-                    format!("{} · {}", model.name, model.provider),
-                )
+                let label = if multi_provider {
+                    format!("{} ({})", model.name, model.provider)
+                } else {
+                    model.name.clone()
+                };
+                Item::new(model_key(&model), label)
             })
             .collect();
         if !models.iter().any(|item| item.value.0.as_ref() == model_id) {
@@ -163,16 +174,29 @@ impl Metadata {
             .into_iter()
             .map(|mode| Item::new(mode.id(), mode.name()))
             .collect::<Vec<_>>();
-        let thoughts = [
-            ("off", "Off"),
-            ("low", "Low"),
-            ("medium", "Medium"),
-            ("high", "High"),
-            ("xhigh", "Extra high"),
-        ];
-        let levels = thoughts
-            .into_iter()
-            .map(|(id, name)| Item::new(id, name))
+        let allowed_levels = auth
+            .thinking_levels(&self.provider, &self.model_id)
+            .unwrap_or_else(|| {
+                vec![
+                    ThinkingLevel::Off,
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                    ThinkingLevel::Xhigh,
+                    ThinkingLevel::Max,
+                ]
+            });
+        let effective_thinking = if allowed_levels.contains(&self.thinking_level) {
+            self.thinking_level
+        } else {
+            allowed_levels[0]
+        };
+        let levels = allowed_levels
+            .iter()
+            .map(|&level| {
+                let (id, name) = thinking_choice(level);
+                Item::new(id, name)
+            })
             .collect::<Vec<_>>();
         let speed = if supports_boolean(capabilities) {
             Option::boolean("fast", "Fast mode", self.fast)
@@ -190,7 +214,7 @@ impl Metadata {
             Option::select(
                 "thought_level",
                 "Thinking",
-                thinking_id(self.thinking_level),
+                thinking_choice(effective_thinking).0,
                 levels,
             )
             .category(Category::ThoughtLevel),
@@ -224,16 +248,29 @@ impl Metadata {
                 self.model_id = model.id;
                 self.api = model.api;
                 self.base_url = model.base_url;
+                if let Some(allowed) = auth.thinking_levels(&self.provider, &self.model_id)
+                    && !allowed.contains(&self.thinking_level)
+                {
+                    self.thinking_level = allowed[0];
+                }
             }
             "thought_level" => {
-                self.thinking_level = match text {
+                let next = match text {
                     "off" => ThinkingLevel::Off,
+                    "minimal" => ThinkingLevel::Minimal,
                     "low" => ThinkingLevel::Low,
                     "medium" => ThinkingLevel::Medium,
                     "high" => ThinkingLevel::High,
                     "xhigh" => ThinkingLevel::Xhigh,
+                    "max" => ThinkingLevel::Max,
                     _ => return false,
                 };
+                if let Some(allowed) = auth.thinking_levels(&self.provider, &self.model_id)
+                    && !allowed.contains(&next)
+                {
+                    return false;
+                }
+                self.thinking_level = next;
             }
             "fast" => {
                 self.fast = match (value.as_bool(), text) {
@@ -256,13 +293,15 @@ fn supports_boolean(caps: &acp::ClientCapabilities) -> bool {
         .is_some_and(|options| options.boolean.is_some())
 }
 
-fn thinking_id(level: ThinkingLevel) -> &'static str {
+fn thinking_choice(level: ThinkingLevel) -> (&'static str, &'static str) {
     match level {
-        ThinkingLevel::Off | ThinkingLevel::None => "off",
-        ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
-        ThinkingLevel::Medium => "medium",
-        ThinkingLevel::High => "high",
-        ThinkingLevel::Xhigh | ThinkingLevel::Max => "xhigh",
+        ThinkingLevel::Off | ThinkingLevel::None => ("off", "Off"),
+        ThinkingLevel::Minimal => ("minimal", "Minimal"),
+        ThinkingLevel::Low => ("low", "Low"),
+        ThinkingLevel::Medium => ("medium", "Medium"),
+        ThinkingLevel::High => ("high", "High"),
+        ThinkingLevel::Xhigh => ("xhigh", "Extra high"),
+        ThinkingLevel::Max => ("max", "Max"),
     }
 }
 

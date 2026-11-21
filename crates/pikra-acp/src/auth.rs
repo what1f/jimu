@@ -4,7 +4,7 @@ use crate::{
     schema::v1 as acp,
 };
 use pikra_ai::{
-    ApiKind, CancelToken, HttpTransport, Model, ModelCost,
+    ApiKind, CancelToken, HttpTransport, Model, ModelCost, ThinkingLevel,
     oauth::{self, CodexCredentials},
 };
 use pikra_http::ReqwestTransport;
@@ -128,6 +128,8 @@ enum CustomModel {
         name: Option<String>,
         context_window: Option<u32>,
         supports_images: Option<bool>,
+        #[serde(default)]
+        thinking_levels: Option<Vec<ThinkingLevel>>,
     },
 }
 impl CustomModel {
@@ -470,10 +472,12 @@ impl Auth {
             if routes.get(&provider).is_some_and(|route| route.disabled) {
                 continue;
             }
-            if let Some(entry) = builtin(&provider) {
+            let route = routes.get(&provider);
+            let has_custom_models = route.is_some_and(|r| !r.models.is_empty());
+            if !has_custom_models && let Some(entry) = builtin(&provider) {
                 models.extend(entry.models.iter().map(|id| self.model(&provider, id)));
             }
-            if let Some(route) = routes.get(&provider) {
+            if let Some(route) = route {
                 for spec in &route.models {
                     let model = self.model(&provider, spec.id());
                     if !models
@@ -574,6 +578,18 @@ impl Auth {
         let routes = self.routes();
         let route = routes.get(provider).filter(|route| !route.disabled);
         self.build_model(provider, id, entry, route)
+    }
+
+    pub(crate) fn thinking_levels(&self, provider: &str, id: &str) -> Option<Vec<ThinkingLevel>> {
+        let routes = self.routes();
+        let route = routes.get(provider).filter(|route| !route.disabled)?;
+        match route.models.iter().find(|spec| spec.id() == id)? {
+            CustomModel::Spec {
+                thinking_levels: Some(levels),
+                ..
+            } if !levels.is_empty() => Some(levels.clone()),
+            _ => None,
+        }
     }
 
     pub(crate) fn resolve_call(
