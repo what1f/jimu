@@ -4,6 +4,7 @@ mod bm25;
 mod codemode;
 mod deferred;
 mod error;
+mod instructions;
 pub mod mcp;
 mod session;
 mod skill_context;
@@ -15,6 +16,10 @@ pub use deferred::{
     CALL_TOOL_NAME, CallToolGateway, DeferredToolRegistry, TOOL_SEARCH_NAME, ToolSearchTool,
 };
 pub use error::KitError;
+pub use instructions::{
+    DEFAULT_INSTRUCTION_MAX_BYTES, INSTRUCTIONS_CONTEXT_NAME, InstructionCatalog,
+    InstructionContextState, InstructionDiscoveryConfig, InstructionEntry, WalkBoundary,
+};
 pub use mcp::{
     JsonRpcErrorObject, JsonRpcId, JsonRpcResponse, MCP_PROTOCOL_VERSION, McpClient, McpError,
     McpInitializeResult, McpServerInfo, McpToolCallResult, McpToolInfo, McpToolRegistrationMode,

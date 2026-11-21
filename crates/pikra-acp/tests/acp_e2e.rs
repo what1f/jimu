@@ -450,6 +450,73 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
 }
 
 #[tokio::test]
+async fn additional_workspace_instructions_follow_new_load_and_resume() {
+    let model = ModelFixture::start(vec![text("OK"); 3]).await;
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let cwd = workspace.path().to_path_buf();
+    let scopes = ["new", "load", "resume"].map(|scope| {
+        let dir = cwd.join(scope);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), format!("instructions for {scope}")).unwrap();
+        dir
+    });
+    std::fs::write(
+        home.path().join("AGENTS.md"),
+        "instructions from data directory",
+    )
+    .unwrap();
+    Client
+        .v1()
+        .connect_with(
+            model.agent(home.path(), false),
+            async |cx: ConnectionTo<Agent>| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(
+                        NewSessionRequest::new(&cwd)
+                            .additional_directories(vec![scopes[0].clone()]),
+                    )
+                    .block_task()
+                    .await?
+                    .session_id;
+                ask(&cx, &session, "First").await?;
+                cx.send_request(
+                    LoadSessionRequest::new(session.clone(), &cwd)
+                        .additional_directories(vec![scopes[1].clone()]),
+                )
+                .block_task()
+                .await?;
+                ask(&cx, &session, "Second").await?;
+                cx.send_request(
+                    ResumeSessionRequest::new(session.clone(), &cwd)
+                        .additional_directories(vec![scopes[2].clone()]),
+                )
+                .block_task()
+                .await?;
+                ask(&cx, &session, "Third").await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    for (request, scope) in model.finish().await.iter().zip(["new", "load", "resume"]) {
+        let latest = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains("<project_instructions>"))
+            .unwrap();
+        assert!(latest.contains("instructions from data directory"));
+        assert!(latest.contains(&format!("instructions for {scope}")));
+    }
+}
+
+#[tokio::test]
 async fn persisted_sessions_replay_before_load_response_and_preserve_options() {
     let model = ModelFixture::start(vec![
         tool(

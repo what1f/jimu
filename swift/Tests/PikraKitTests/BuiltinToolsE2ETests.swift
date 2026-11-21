@@ -14,6 +14,76 @@ private func context(for tool: PikraTool) -> PikraToolCallContext {
     PikraToolCallContext(toolCallID: UUID().uuidString, toolName: tool.name)
 }
 
+@Test("Discover instructions with an unlimited or UTF-8-safe byte budget")
+func discoverInstructions() async throws {
+    try await inWorkspace { workspace in
+        let file = workspace.appendingPathComponent("AGENTS.override.md")
+        let fallback = workspace.appendingPathComponent("AGENTS.md")
+        let duplicate = workspace.appendingPathComponent("duplicate.md")
+        let content = "a" + String(repeating: "瑞", count: 12_000)
+        try content.write(to: file, atomically: true, encoding: .utf8)
+        try "fallback".write(to: fallback, atomically: true, encoding: .utf8)
+        try ("\u{FEFF}" + content + "\r\n").write(to: duplicate, atomically: true, encoding: .utf8)
+        var config = PikraInstructionDiscovery.Configuration(
+            cwd: workspace, walkBoundary: .currentDirOnly, includeUserInstructions: false,
+            extraFiles: [duplicate], maxBytes: nil
+        )
+        let unlimited = try PikraInstructionDiscovery.discover(config: config)
+        #expect(unlimited.entries.map(\.content) == [content])
+        #expect(unlimited.entries.first?.path.resolvingSymlinksInPath() == file.resolvingSymlinksInPath())
+        #expect(unlimited.totalBytes == content.utf8.count)
+        #expect(!unlimited.truncated)
+        config.maxBytes = 3
+        let limited = try PikraInstructionDiscovery.discover(config: config)
+        #expect(limited.entries.first?.content == "a")
+        #expect(limited.entries.first?.truncated == true)
+        #expect(limited.truncated)
+    }
+}
+
+@Test("Reload workspace instructions and carry them through compaction")
+func agentInstructionContext() async throws {
+    try await inWorkspace { workspace in
+        let file = workspace.appendingPathComponent("AGENTS.md")
+        try "first workspace rule".write(to: file, atomically: true, encoding: .utf8)
+        let reply: MockSSEClient.Handler = { _, _ in
+            MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Acknowledged."))
+        }
+        let client = MockSSEClient(handlers: Array(repeating: reply, count: 5))
+        var config = PikraConfiguration(
+            model: testModel(), cwd: workspace.path,
+            compaction: .init(keepRecentTokens: 1), httpClient: client
+        )
+        config.instructionDiscovery = .init(includeUserInstructions: false)
+        let agent = try await PikraAgent.open(configuration: config)
+        func prompt(_ text: String) async throws -> [String] {
+            var instructions: [String] = []
+            for try await event in try await agent.prompt(text) {
+                if case .contextAppended(let name, let content) = event, name == "instructions" {
+                    instructions.append(content)
+                }
+            }
+            return instructions
+        }
+        #expect(try await prompt("First task").first?.contains("first workspace rule") == true)
+        #expect(try await agent.reloadInstructions() == false)
+        try "revised workspace rule".write(to: file, atomically: true, encoding: .utf8)
+        #expect(try await agent.reloadInstructions())
+        #expect(try await prompt("Second task").first?.contains("revised workspace rule") == true)
+        let result = try await agent.compact()
+        try #require(result != nil)
+        #expect(try await prompt("After compaction").first?.contains("revised workspace rule") == true)
+        try FileManager.default.removeItem(at: file)
+        #expect(try await agent.reloadInstructions())
+        #expect(try await prompt("After removal").first?.contains("no longer apply") == true)
+        let requests = await client.recordedRequests()
+        try #require(requests.count == 5)
+        let compactedBody = String(decoding: requests[3].body, as: UTF8.self)
+        #expect(compactedBody.contains("revised workspace rule"))
+        await agent.close()
+    }
+}
+
 @Test("Apply a patch and search the new file with an overridden Rust grep tool")
 func patchAndGrepWorkspace() async throws {
     try await inWorkspace { workspace in

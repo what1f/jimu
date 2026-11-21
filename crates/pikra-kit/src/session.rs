@@ -3,6 +3,9 @@ use crate::deferred::{
     CALL_TOOL_NAME, CallToolGateway, DeferredToolRegistry, TOOL_SEARCH_NAME, ToolSearchTool,
 };
 use crate::error::KitError;
+use crate::instructions::{
+    InstructionCatalog, InstructionContextState, InstructionDiscoveryConfig,
+};
 use crate::mcp::{McpClient, McpToolRegistrationMode};
 use crate::skills::{SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillSearchTool};
 use crate::wakeup::{
@@ -26,7 +29,7 @@ use pikra_session::{
     baseline_to_system_message, context_block_to_agent_message,
 };
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -98,6 +101,7 @@ pub struct KitSessionConfig {
     pub fast: bool,
     pub skill_roots: Vec<PathBuf>,
     pub skill_discovery: SkillDiscoveryConfig,
+    pub instruction_discovery: Option<InstructionDiscoveryConfig>,
     /// Expose a resident skill search tool (default: true).
     pub enable_skill_search: bool,
     /// Resident schema budget for automatic placement. Explicit resident tools are pinned.
@@ -138,6 +142,7 @@ impl KitSessionConfig {
             fast: false,
             skill_roots: Vec::new(),
             skill_discovery: SkillDiscoveryConfig::default(),
+            instruction_discovery: None,
             enable_skill_search: true,
             auto_defer_threshold_bytes: None,
             pause_background_on_error: true,
@@ -189,6 +194,11 @@ impl KitSessionConfig {
 
     pub fn with_skill_discovery(mut self, discovery: SkillDiscoveryConfig) -> Self {
         self.skill_discovery = discovery;
+        self
+    }
+
+    pub fn with_instruction_discovery(mut self, discovery: InstructionDiscoveryConfig) -> Self {
+        self.instruction_discovery = Some(discovery);
         self
     }
 
@@ -323,6 +333,7 @@ pub struct KitSession {
     skills: Arc<Mutex<SkillCatalog>>,
     skill_discovery: SkillDiscoveryConfig,
     known_skills: Mutex<SkillContextState>,
+    instructions: Mutex<InstructionContextState>,
     auto_defer_threshold_bytes: Option<usize>,
     pause_background_on_error: bool,
     inbox: BackgroundInbox,
@@ -461,6 +472,12 @@ impl KitSession {
             .unwrap_or(config.fast);
 
         let known_skills = SkillContextState::from_branch(&session_manager);
+        let instructions = InstructionContextState::new(
+            config.instruction_discovery,
+            config.cwd.as_deref().map(Path::new),
+            &mut session_manager,
+            &reconstructed,
+        );
 
         let mut had_deferred_catalog = false;
         if let Some(catalog) = deferred_registry.format_catalog() {
@@ -499,6 +516,7 @@ impl KitSession {
             skills,
             skill_discovery,
             known_skills: Mutex::new(known_skills),
+            instructions: Mutex::new(instructions),
             auto_defer_threshold_bytes: config.auto_defer_threshold_bytes,
             pause_background_on_error: config.pause_background_on_error,
             inbox: BackgroundInbox::default(),
@@ -637,6 +655,23 @@ impl KitSession {
         let changed = !skills.has_same_visible_names(&discovered);
         *skills = discovered;
         changed
+    }
+
+    pub fn instructions(&self) -> InstructionCatalog {
+        self.instructions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .catalog()
+            .clone()
+    }
+
+    /// Refresh the instruction catalog and queue any change for the next prompt.
+    pub fn reload_instructions(&self) -> bool {
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        self.instructions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reload(&mut session)
     }
 
     // ---- Idle Configuration Updates (Zero Spurious Busy) ----
@@ -855,6 +890,10 @@ impl KitSession {
                 let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
                 session.fork(entry_id)?;
                 let reconstructed = session.reconstruct_context();
+                self.instructions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sync_branch(&mut session, &reconstructed);
                 let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
                 known.restore_fork(
                     &mut session,

@@ -24,6 +24,7 @@ impl RpcClientProc {
         let mut child = Command::new(env!("CARGO_BIN_EXE_pikra"))
             .args(args)
             .env("HOME", home.path())
+            .env("PIKRA_HOME", home.path().join(".pikra"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -155,12 +156,13 @@ async fn rpc_full_lifecycle_over_stdio_pipes() {
     std::fs::write(ws.join("input.txt"), "alpha-file-content").expect("write input.txt");
     std::fs::create_dir(ws.join(".git")).expect("set project root");
     let home = tempfile::tempdir().expect("fixture home");
+    let data_dir = home.path().join("data");
     for (root, name) in [
         (ws.join(".agents/skills"), "rpc-agents-skill"),
         (ws.join(".pikra/skills"), "rpc-project-skill"),
         (ws.join("extra-skills"), "rpc-extra-skill"),
         (home.path().join(".agents/skills"), "rpc-user-agents-skill"),
-        (home.path().join(".pikra/skills"), "rpc-user-pikra-skill"),
+        (data_dir.join("skills"), "rpc-user-pikra-skill"),
     ] {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).expect("create skill folder");
@@ -169,6 +171,21 @@ async fn rpc_full_lifecycle_over_stdio_pipes() {
             format!("---\nname: {name}\ndescription: RPC fixture\n---\n"),
         )
         .expect("write skill");
+    }
+    let extra_instructions = ws.join("extra.md");
+    let last_instructions = ws.join("last.md");
+    let instruction_sources = [
+        (
+            home.path().join(".agents/AGENTS.md"),
+            "neutral user instructions",
+        ),
+        (data_dir.join("AGENTS.md"), "data directory instructions"),
+        (ws.join("AGENTS.override.md"), "workspace instructions"),
+        (extra_instructions.clone(), "explicit instructions one"),
+        (last_instructions.clone(), "explicit instructions two"),
+    ];
+    for (file, text) in &instruction_sources {
+        std::fs::write(file, text).unwrap();
     }
     let extra_skills = ws.join("extra-skills");
 
@@ -315,6 +332,14 @@ export default function(pikra) {
             &ext_str,
             "--skill-dir",
             extra_skills.to_str().unwrap(),
+            "--pikra-home",
+            data_dir.to_str().unwrap(),
+            "--walk-boundary=cwd-only",
+            "--instruction-max-bytes=unlimited",
+            "--instruction-file",
+            extra_instructions.to_str().unwrap(),
+            "--instruction-file",
+            last_instructions.to_str().unwrap(),
         ],
         home,
     );
@@ -491,6 +516,15 @@ export default function(pikra) {
                 .any(|c| c.contains("<system-reminder name=\"workspace_env\">")),
             "expected <system-reminder> in request 1 messages: {req1_msgs:?}"
         );
+        let instructions = req1_msgs
+            .iter()
+            .find(|content| content.contains("<system-reminder name=\"instructions\">"))
+            .unwrap();
+        let positions: Vec<_> = instruction_sources
+            .iter()
+            .map(|(_, text)| instructions.find(text).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         let req2_str = serde_json::to_string(&bodies[1]).unwrap();
         assert!(req2_str.contains("[js-hook-ok]"));
         assert!(req2_str.contains("switch to beta"));
@@ -749,6 +783,7 @@ async fn rpc_review_regressions_defaults_init_oneshot_model_restore_and_async_co
     let oneshot_text = Command::new(env!("CARGO_BIN_EXE_pikra"))
         .args([
             "ask",
+            "--no-user-instructions",
             "--no-session",
             "--no-tools",
             "--provider",
@@ -777,6 +812,7 @@ async fn rpc_review_regressions_defaults_init_oneshot_model_restore_and_async_co
         .args([
             "--mode",
             "json",
+            "--no-instructions",
             "--no-session",
             "--no-tools",
             "--provider",

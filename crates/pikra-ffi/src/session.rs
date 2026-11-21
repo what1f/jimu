@@ -15,8 +15,9 @@ use pikra_ai::{
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
     CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, CallToolGateway, CodemodeExecTool,
-    DeferredToolRegistry, SKILL_SEARCH_NAME, SKILLS_CONTEXT_NAME, SkillCatalog, SkillContextState,
-    SkillDiscoveryConfig, SkillSearchTool, TOOL_SEARCH_NAME, ToolSchemaBudget, ToolSearchTool,
+    DeferredToolRegistry, InstructionContextState, SKILL_SEARCH_NAME, SKILLS_CONTEXT_NAME,
+    SkillCatalog, SkillContextState, SkillDiscoveryConfig, SkillSearchTool, TOOL_SEARCH_NAME,
+    ToolSchemaBudget, ToolSearchTool,
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
@@ -25,7 +26,7 @@ use pikra_session::{
 };
 use serde_json::Map;
 use std::ffi::{CString, c_char, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +88,7 @@ pub struct FfiSession {
     skills: Arc<Mutex<SkillCatalog>>,
     skill_discovery: Option<SkillDiscoveryConfig>,
     known_skills: Mutex<SkillContextState>,
+    instructions: Mutex<InstructionContextState>,
     had_deferred_catalog: Mutex<bool>,
     tool_callbacks: SendToolCallbacks,
     next_tool_call_id: Arc<AtomicU64>,
@@ -278,6 +280,12 @@ impl FfiSession {
             .unwrap_or(config.fast);
 
         let known_skills = SkillContextState::from_branch(&session_manager);
+        let instructions = InstructionContextState::new(
+            config.instruction_discovery,
+            config.cwd.as_deref().map(Path::new),
+            &mut session_manager,
+            &reconstructed,
+        );
 
         let mut had_deferred_catalog = false;
         if let Some(catalog) = deferred_registry.format_catalog() {
@@ -315,6 +323,7 @@ impl FfiSession {
             skills,
             skill_discovery,
             known_skills: Mutex::new(known_skills),
+            instructions: Mutex::new(instructions),
             had_deferred_catalog: Mutex::new(had_deferred_catalog),
             tool_callbacks: tool_cb,
             next_tool_call_id,
@@ -1097,6 +1106,10 @@ impl FfiSession {
                 .fork(entry_id)
                 .map_err(|e| (PikraStatus::ErrNotFound, e.to_string()))?;
             let reconstructed = session.reconstruct_context();
+            self.instructions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sync_branch(&mut session, &reconstructed);
             if self.skill_discovery.is_some() {
                 self.known_skills
                     .lock()
@@ -1188,6 +1201,19 @@ impl FfiSession {
         let discovered = SkillCatalog::discover_with_config(config);
         let changed = !skills.has_same_visible_names(&discovered);
         *skills = discovered;
+        Ok(changed)
+    }
+
+    pub(crate) fn reload_instructions(&self) -> Result<bool, (PikraStatus, String)> {
+        if self.is_closed() {
+            return Err((PikraStatus::ErrClosed, "session is closed".into()));
+        }
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = self
+            .instructions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reload(&mut session);
         Ok(changed)
     }
 }

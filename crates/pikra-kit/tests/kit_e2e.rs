@@ -12,10 +12,11 @@ use pikra_ai::{
     ToolDefinition,
 };
 use pikra_kit::{
-    BackgroundNotification, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, KitEvent, KitSession,
-    KitSessionConfig, KitToolSpec, KitTurnOrigin, McpClient, McpToolRegistrationMode,
-    SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillEnableRule, SkillSelector,
-    TOOL_SEARCH_NAME,
+    BackgroundNotification, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, INSTRUCTIONS_CONTEXT_NAME,
+    InstructionCatalog, InstructionDiscoveryConfig, KitEvent, KitSession, KitSessionConfig,
+    KitToolSpec, KitTurnOrigin, McpClient, McpToolRegistrationMode, SKILL_SEARCH_NAME,
+    SkillCatalog, SkillDiscoveryConfig, SkillEnableRule, SkillSelector, TOOL_SEARCH_NAME,
+    WalkBoundary,
 };
 #[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
 use pikra_kit::{StdioMcpConfig, StdioMcpTransport};
@@ -1154,6 +1155,204 @@ fn review_regressions_baseline_sync_compaction_guard_unpolled_stream_mcp_and_ski
 }
 
 #[test]
+fn instruction_discovery_scopes_and_normalizes_files_before_applying_budget() {
+    use std::fs;
+
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let user = home.join(".agents");
+    let custom = home.join("custom");
+    let repo = dir.path().join("repo");
+    let worktree = repo.join("worktree");
+    let leaf = worktree.join("leaf");
+    let additional = worktree.join("additional");
+    for path in [&user, &custom, &leaf, &additional, &repo.join(".git")] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let explicit = dir.path().join("explicit.md");
+    for (path, content) in [
+        (user.join("AGENTS.md"), "global"),
+        (custom.join("AGENTS.md"), "custom"),
+        (repo.join("AGENTS.md"), "\u{feff} shared\r\nrule\r\n"),
+        (worktree.join("AGENTS.md"), "shared\nrule"),
+        (worktree.join(".git"), "gitdir: ignored"),
+        (leaf.join("AGENTS.md"), "overridden"),
+        (leaf.join("AGENTS.override.md"), "leaf"),
+        (leaf.join("CLAUDE.md"), "custom filename"),
+        (additional.join("AGENTS.md"), "additional"),
+        (explicit.clone(), "a瑞b"),
+    ] {
+        fs::write(path, content).unwrap();
+    }
+    let mut config = InstructionDiscoveryConfig {
+        cwd: Some(leaf.clone()),
+        additional_directories: vec![additional],
+        home_dir_override: Some(home.clone()),
+        user_dirs: vec!["~/custom".into()],
+        extra_files: vec![explicit.clone()],
+        ..Default::default()
+    };
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("explicit-link.md");
+        std::os::unix::fs::symlink(&explicit, &link).unwrap();
+        config.extra_files.push(link);
+    }
+    let contents = |config: &_| {
+        InstructionCatalog::discover(config)
+            .entries()
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        contents(&config),
+        [
+            "global",
+            "custom",
+            "shared\nrule",
+            "leaf",
+            "additional",
+            "a瑞b"
+        ]
+    );
+    config.walk_boundary = WalkBoundary::FilesystemRoot;
+    assert_eq!(
+        contents(&config),
+        [
+            "global",
+            "custom",
+            " shared\nrule\n",
+            "leaf",
+            "additional",
+            "a瑞b"
+        ]
+    );
+    config.deduplicate_identical_content = false;
+    assert_eq!(
+        contents(&config),
+        [
+            "global",
+            "custom",
+            " shared\nrule\n",
+            "shared\nrule",
+            "leaf",
+            "additional",
+            "a瑞b"
+        ]
+    );
+    config.walk_boundary = WalkBoundary::CurrentDirOnly;
+    config.include_agents_dir = false;
+    assert_eq!(contents(&config), ["custom", "leaf", "additional", "a瑞b"]);
+    config.include_user_instructions = false;
+    config.additional_directories.clear();
+    config.extra_files.clear();
+    config.filenames = vec!["../AGENTS.md".into(), "CLAUDE.md".into()];
+    assert_eq!(contents(&config), ["custom filename"]);
+
+    let unmarked = dir.path().join("unmarked/leaf");
+    fs::create_dir_all(&unmarked).unwrap();
+    fs::write(dir.path().join("unmarked/AGENTS.md"), "outside").unwrap();
+    fs::write(unmarked.join("AGENTS.md"), "inside").unwrap();
+    config = InstructionDiscoveryConfig {
+        cwd: Some(unmarked),
+        include_user_instructions: false,
+        ..Default::default()
+    };
+    assert_eq!(contents(&config), ["inside"]);
+    config.project_root_markers = vec!["ROOT".into()];
+    fs::write(dir.path().join("unmarked/ROOT"), "").unwrap();
+    assert_eq!(contents(&config), ["outside", "inside"]);
+
+    config.cwd = None;
+    config.extra_files = vec![explicit];
+    config.max_bytes = Some(3);
+    let limited = InstructionCatalog::discover(&config);
+    assert_eq!(limited.entries()[0].content, "a");
+    assert!(limited.entries()[0].truncated && limited.truncated());
+    assert_eq!(limited.total_bytes(), 1);
+    config.max_bytes = None;
+    assert_eq!(contents(&config), ["a瑞b"]);
+    config.max_bytes = Some(0);
+    assert!(
+        InstructionCatalog::discover(&config)
+            .format_for_context()
+            .is_none()
+    );
+}
+
+#[test]
+fn instruction_context_is_refreshed_and_survives_compaction_fork_and_reopen() {
+    use pikra_session::{CompactionConfig, JsonlSessionStore};
+    use std::fs;
+
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("AGENTS.md");
+        fs::write(&file, "initial workspace guidance").unwrap();
+        let http = Arc::new(FauxTransport::new());
+        let provider = Arc::new(Client::new(http.clone()));
+        let mut config = KitSessionConfig::new(test_model())
+            .with_store(Arc::new(JsonlSessionStore::new(
+                dir.path().join("session.jsonl"),
+            )))
+            .with_compaction(CompactionConfig {
+                keep_recent_tokens: 1,
+                ..Default::default()
+            })
+            .with_instruction_discovery(InstructionDiscoveryConfig {
+                include_user_instructions: false,
+                ..Default::default()
+            });
+        config.cwd = Some(dir.path().display().to_string());
+        let session = KitSession::new(provider.clone(), config.clone()).unwrap();
+        assert_eq!(
+            session.instructions().entries()[0].content,
+            "initial workspace guidance"
+        );
+        assert!(!session.reload_instructions());
+        for id in ["first", "second", "summary", "after", "fork", "reopened"] {
+            http.enqueue_sse(openai_sse_text(id, "Acknowledged."));
+        }
+
+        session.prompt("First task").await.unwrap();
+        let first_leaf = session.leaf_id().unwrap();
+        fs::write(&file, "revised workspace guidance").unwrap();
+        assert!(session.reload_instructions());
+        assert!(!session.reload_instructions());
+        session.prompt("Second task").await.unwrap();
+        assert!(session.compact().await.unwrap().is_some());
+        session.prompt("After compaction").await.unwrap();
+        session.fork(&first_leaf).unwrap();
+        session.prompt("After fork").await.unwrap();
+        drop(session);
+
+        fs::remove_file(file).unwrap();
+        let session = KitSession::new(provider, config).unwrap();
+        assert!(session.instructions().is_empty());
+        session.prompt("After reopening").await.unwrap();
+        let requests = http.requests();
+        assert_prompt_prefix_identical(&requests[0], &requests[1]);
+        for index in [0, 1, 3, 4] {
+            let body = requests[index].body_json.to_string();
+            let guidance = if index == 0 {
+                "initial workspace guidance"
+            } else {
+                "revised workspace guidance"
+            };
+            assert!(body.contains(guidance), "{body}");
+            assert!(body.contains(&format!("name=\\\"{INSTRUCTIONS_CONTEXT_NAME}\\\"")));
+        }
+        assert!(
+            requests[5]
+                .body_json
+                .to_string()
+                .contains("Previously supplied project instructions no longer apply.")
+        );
+    });
+}
+
+#[test]
 fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
     use pikra_session::JsonlSessionStore;
     use std::{fs, path::Path};
@@ -1240,7 +1439,7 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
             ..SkillDiscoveryConfig::default()
         };
         let isolated = SkillCatalog::discover_with_config(&SkillDiscoveryConfig {
-            walk_ancestors: false,
+            walk_boundary: WalkBoundary::CurrentDirOnly,
             include_user_skills: false,
             ..discovery.clone()
         });

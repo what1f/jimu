@@ -636,6 +636,7 @@ impl Connection {
             if !req.options.is_empty() {
                 session.apply_metadata(&self.server, &next)?;
             }
+            session.kit.reload_instructions();
             if replay {
                 turn::replay(session, cancel).await?;
             }

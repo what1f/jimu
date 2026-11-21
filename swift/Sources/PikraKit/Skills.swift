@@ -35,6 +35,8 @@ public struct PikraSkillDiscovery: Sendable {
         }
 
         public var cwd: URL?
+        public var walkBoundary: PikraWalkBoundary
+        public var projectRootMarkers: [String]
         public var projectSkillDirs: [String]
         public var includeAgentsSkills: Bool
         public var includeUserSkills: Bool
@@ -45,7 +47,9 @@ public struct PikraSkillDiscovery: Sendable {
 
         public init(
             cwd: URL? = nil,
-            projectSkillDirs: [String] = [".pikra/skills"],
+            walkBoundary: PikraWalkBoundary = .projectRoot,
+            projectRootMarkers: [String] = [".git"],
+            projectSkillDirs: [String] = [],
             includeAgentsSkills: Bool = true,
             includeUserSkills: Bool = true,
             userSkillDirs: [String] = [],
@@ -54,6 +58,8 @@ public struct PikraSkillDiscovery: Sendable {
             maxCatalogBytes: UInt = 8192
         ) {
             self.cwd = cwd
+            self.walkBoundary = walkBoundary
+            self.projectRootMarkers = projectRootMarkers
             self.projectSkillDirs = projectSkillDirs
             self.includeAgentsSkills = includeAgentsSkills
             self.includeUserSkills = includeUserSkills
@@ -65,6 +71,8 @@ public struct PikraSkillDiscovery: Sendable {
 
         private enum CodingKeys: String, CodingKey {
             case cwd, rules
+            case walkBoundary = "walk_boundary"
+            case projectRootMarkers = "project_root_markers"
             case projectSkillDirs = "project_skill_dirs"
             case includeAgentsSkills = "include_agents_skills"
             case includeUserSkills = "include_user_skills"
@@ -76,6 +84,8 @@ public struct PikraSkillDiscovery: Sendable {
         public func encode(to encoder: any Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encodeIfPresent(cwd?.path, forKey: .cwd)
+            try container.encode(walkBoundary, forKey: .walkBoundary)
+            try container.encode(projectRootMarkers, forKey: .projectRootMarkers)
             try container.encode(projectSkillDirs, forKey: .projectSkillDirs)
             try container.encode(includeAgentsSkills, forKey: .includeAgentsSkills)
             try container.encode(includeUserSkills, forKey: .includeUserSkills)

@@ -186,7 +186,7 @@ pub(crate) fn stage_write(
     let stage = || -> std::io::Result<_> {
         fs::create_dir_all(parent)?;
         let mut file = tempfile::Builder::new()
-            .prefix(".pikra-tmp-")
+            .prefix(".agent-tmp-")
             .tempfile_in(parent)?;
         file.write_all(bytes)?;
         if let Some(permissions) = permissions {

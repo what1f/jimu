@@ -31,8 +31,8 @@ static NEXT_MONITOR: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub struct MonitorConfig {
     pub max_active: usize,
-    /// Relative paths resolve against the workspace. Defaults to .pikra/monitors
-    /// in the command's working directory.
+    /// Relative paths resolve against the workspace. Defaults to `agent-monitors`
+    /// in the system temporary directory.
     pub monitor_log_dir: Option<PathBuf>,
     pub coalesce_window: Duration,
     pub max_lines_per_minute: usize,
@@ -166,7 +166,7 @@ impl MonitorManager {
             .unwrap()
             .check_capacity(self.0.config.max_active)?;
 
-        let (cwd, process) = prepare_shell(
+        let (_, process) = prepare_shell(
             &self.0.workspace,
             &args.command,
             args.cwd.as_deref(),
@@ -175,7 +175,7 @@ impl MonitorManager {
         .await?;
         let log_dir = match &self.0.config.monitor_log_dir {
             Some(path) => self.0.workspace.cwd.join(path),
-            None => cwd.join(".pikra/monitors"),
+            None => std::env::temp_dir().join("agent-monitors"),
         };
         let log_dir =
             std::path::absolute(log_dir).map_err(|err| format!("Invalid log directory: {err}"))?;

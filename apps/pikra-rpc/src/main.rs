@@ -48,6 +48,8 @@ async fn run_acp(cli: args::CliArgs) -> ExitCode {
         pikra_home: cli.pikra_home.unwrap_or(defaults.pikra_home),
         persist_sessions: !cli.no_session,
         skill_dirs: cli.skill_dirs,
+        skill_walk_boundary: cli.skill_walk_boundary,
+        instruction_discovery: Some(cli.instruction_discovery),
         extensions: cli.extensions,
         enable_tools: !cli.no_tools,
         enable_codemode: cli.enable_codemode,

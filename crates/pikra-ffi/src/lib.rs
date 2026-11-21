@@ -828,12 +828,35 @@ pub unsafe extern "C" fn pikra_session_reload_skills(
     out_changed: *mut bool,
     out_error: *mut *mut c_char,
 ) -> PikraStatus {
+    session_reload(session, out_changed, out_error, FfiSession::reload_skills)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_session_reload_instructions(
+    session: *mut PikraSession,
+    out_changed: *mut bool,
+    out_error: *mut *mut c_char,
+) -> PikraStatus {
+    session_reload(
+        session,
+        out_changed,
+        out_error,
+        FfiSession::reload_instructions,
+    )
+}
+
+fn session_reload(
+    session: *mut PikraSession,
+    out_changed: *mut bool,
+    out_error: *mut *mut c_char,
+    reload: impl FnOnce(&FfiSession) -> Result<bool, (PikraStatus, String)>,
+) -> PikraStatus {
     catch_unwind(AssertUnwindSafe(|| {
         let s = match with_session(session, out_error) {
             Ok(s) => s,
             Err(code) => return code,
         };
-        match s.inner.reload_skills() {
+        match reload(&s.inner) {
             Ok(changed) => {
                 if !out_changed.is_null() {
                     // SAFETY: Caller provided writable `out_changed`.
@@ -848,6 +871,46 @@ pub unsafe extern "C" fn pikra_session_reload_skills(
         }
     }))
     .unwrap_or(PikraStatus::ErrInternal)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_discover_instructions(
+    config_json: *const c_char,
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let discover = || {
+            let json = unsafe { read_cstr(config_json, "config_json") }?;
+            let config = serde_json::from_str(json).map_err(|error| error.to_string())?;
+            let catalog = pikra_kit::InstructionCatalog::discover(&config);
+            let entries: Vec<_> = catalog
+                .entries()
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "path": entry.path.to_string_lossy(),
+                        "content": entry.content,
+                        "truncated": entry.truncated,
+                    })
+                })
+                .collect();
+            let json = serde_json::json!({
+                "entries": entries,
+                "total_bytes": catalog.total_bytes(),
+                "truncated": catalog.truncated(),
+                "prompt": catalog.format_for_context(),
+            });
+            CString::new(json.to_string()).map_err(|error| error.to_string())
+        };
+        match discover() {
+            Ok(json) => json.into_raw(),
+            Err(error) => {
+                unsafe { write_out_string(out_error, error) };
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
 }
 
 /* ---- Skill Discovery ---- */

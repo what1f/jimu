@@ -341,6 +341,15 @@ PikraStatus pikra_session_reload_skills(
     char **out_error
 );
 
+PikraStatus pikra_session_reload_instructions(
+    PikraSession *session,
+    bool *out_changed,
+    char **out_error
+);
+
+/* Returns the instruction catalog as JSON. Free the returned string with pikra_string_free. */
+char *pikra_discover_instructions(const char *config_json, char **out_error);
+
 /* ---- Skill Discovery ---- */
 
 char *pikra_discover_skills(

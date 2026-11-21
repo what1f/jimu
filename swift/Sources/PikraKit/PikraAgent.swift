@@ -404,6 +404,19 @@ public actor PikraAgent {
         return changed
     }
 
+    /// Refreshes instructions for the next prompt. Returns whether the catalog changed.
+    @discardableResult
+    public func reloadInstructions() throws -> Bool {
+        let session = try requireSession()
+        var changed = false
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let status = pikra_session_reload_instructions(session, &changed, &errorPtr)
+        if status != PIKRA_OK {
+            throw mapStatusError(status, message: takeOwnedCString(errorPtr))
+        }
+        return changed
+    }
+
     /// Cancels any active run, awaits full teardown, and frees all underlying Rust & bridge resources.
     public func close() async {
         guard !isClosed else { return }

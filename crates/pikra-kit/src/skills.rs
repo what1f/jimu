@@ -1,4 +1,5 @@
 use crate::bm25::{Document, score_documents};
+use crate::instructions::{WalkBoundary, ancestor_chain_root_to_leaf, discovery_home, expand_home};
 use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds};
@@ -47,7 +48,7 @@ pub struct SkillDiscoveryConfig {
     pub cwd: Option<PathBuf>,
     pub project_root_markers: Vec<String>,
     pub project_skill_dirs: Vec<String>,
-    pub walk_ancestors: bool,
+    pub walk_boundary: WalkBoundary,
     pub include_agents_skills: bool,
     pub include_user_skills: bool,
     pub user_skill_dirs: Vec<PathBuf>,
@@ -64,8 +65,8 @@ impl Default for SkillDiscoveryConfig {
         Self {
             cwd: None,
             project_root_markers: vec![".git".into()],
-            project_skill_dirs: vec![".pikra/skills".into()],
-            walk_ancestors: true,
+            project_skill_dirs: Vec::new(),
+            walk_boundary: WalkBoundary::ProjectRoot,
             include_agents_skills: true,
             include_user_skills: true,
             user_skill_dirs: Vec::new(),
@@ -81,21 +82,13 @@ impl Default for SkillDiscoveryConfig {
 
 impl SkillDiscoveryConfig {
     fn roots(&self) -> Vec<PathBuf> {
-        let home = self.home_dir_override.clone().or_else(|| {
-            ["HOME", "USERPROFILE"]
-                .into_iter()
-                .filter_map(std::env::var_os)
-                .find(|home| !home.is_empty())
-                .map(PathBuf::from)
-        });
-        let home = home.map(|path| fs::canonicalize(&path).unwrap_or(path));
         let mut roots = self.extra_roots.clone();
         if let Some(cwd) = &self.cwd {
-            let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
-            for dir in cwd.ancestors() {
-                if home.as_ref().is_some_and(|home| home.starts_with(dir)) {
-                    break;
-                }
+            for dir in
+                ancestor_chain_root_to_leaf(cwd, self.walk_boundary, &self.project_root_markers)
+                    .into_iter()
+                    .rev()
+            {
                 roots.extend(
                     self.project_skill_dirs
                         .iter()
@@ -104,24 +97,15 @@ impl SkillDiscoveryConfig {
                 if self.include_agents_skills {
                     roots.push(dir.join(".agents/skills"));
                 }
-                if !self.walk_ancestors
-                    || self
-                        .project_root_markers
-                        .iter()
-                        .any(|marker| dir.join(marker).exists())
-                {
-                    break;
-                }
             }
         }
         if self.include_user_skills {
-            roots.extend(self.user_skill_dirs.iter().filter_map(|path| {
-                if let Ok(relative) = path.strip_prefix("~") {
-                    home.as_ref().map(|home| home.join(relative))
-                } else {
-                    Some(path.clone())
-                }
-            }));
+            let home = discovery_home(self.home_dir_override.as_deref());
+            roots.extend(
+                self.user_skill_dirs
+                    .iter()
+                    .filter_map(|path| expand_home(path, home.as_deref())),
+            );
             if let Some(home) = home.filter(|_| self.include_agents_skills) {
                 roots.push(home.join(".agents/skills"));
             }

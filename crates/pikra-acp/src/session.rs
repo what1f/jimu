@@ -593,6 +593,8 @@ impl Session {
         opts.steering_mode = pikra_agent::QueueMode::All;
         opts.skill_discovery = SkillDiscoveryConfig {
             cwd: Some(meta.cwd.clone()),
+            walk_boundary: cfg.skill_walk_boundary,
+            project_skill_dirs: vec![".pikra/skills".into()],
             user_skill_dirs: vec![cfg.pikra_home.join("skills")],
             extra_roots: cfg
                 .skill_dirs
@@ -606,6 +608,14 @@ impl Session {
                 .collect(),
             ..Default::default()
         };
+        opts.instruction_discovery = cfg.instruction_discovery.clone().map(|mut discovery| {
+            discovery.cwd = Some(meta.cwd.clone());
+            discovery
+                .additional_directories
+                .extend(meta.additional_directories.iter().cloned());
+            discovery.user_dirs.insert(0, cfg.pikra_home.clone());
+            discovery
+        });
         opts.compaction.compaction_reserve_tokens = cfg.compact_tokens;
         opts.compaction_strategy = Some(compaction.clone());
         #[cfg(all(unix, not(target_os = "ios")))]

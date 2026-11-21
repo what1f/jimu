@@ -650,6 +650,7 @@ public struct PikraConfiguration: Sendable {
     public var samplingParams: [String: JSONValue]
     public var skillRoots: [URL]
     public var skillDiscovery: PikraSkillDiscovery.Configuration? = nil
+    public var instructionDiscovery: PikraInstructionDiscovery.Configuration? = nil
     /// Set a schema budget to defer additional tools when the deferred gateway is enabled.
     public var autoDeferThresholdBytes: UInt? = nil
     /// Receives background events for this environment and shuts it down when the agent closes.

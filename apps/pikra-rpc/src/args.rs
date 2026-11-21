@@ -1,4 +1,6 @@
+use pikra_acp::args::{parse_instruction_max_bytes, parse_walk_boundary};
 use pikra_ai::{ApiKind, ThinkingLevel};
+use pikra_kit::{InstructionDiscoveryConfig, WalkBoundary};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,8 @@ pub struct CliArgs {
     pub session: Option<PathBuf>,
     pub no_session: bool,
     pub skill_dirs: Vec<PathBuf>,
+    pub skill_walk_boundary: WalkBoundary,
+    pub instruction_discovery: InstructionDiscoveryConfig,
     pub extensions: Vec<PathBuf>,
     pub no_tools: bool,
     pub enable_codemode: bool,
@@ -70,8 +74,13 @@ SESSION & WORKSPACE OPTIONS:
   --cwd <dir>               Workspace directory (default: current directory)
   --session <jsonl_path>    Persist/resume append-only JSONL session file
   --no-session              Run with an ephemeral in-memory session
-  --pikra-home <dir>        Override the data directory in ACP mode
+  --pikra-home <dir>        Override the data directory
   --skill-dir <dir>         Skill directory to discover (repeatable)
+  --walk-boundary <project-root|filesystem-root|cwd-only>
+  --instruction-max-bytes <bytes|none>  Maximum instruction bytes (default: 32768)
+  --instruction-file <path> Include an instruction file (repeatable)
+  --no-user-instructions    Skip user instructions
+  --no-instructions         Disable instruction discovery
   --extension <js_path>     QuickJS extension file or directory (repeatable)
   --no-tools                Disable built-in workspace tools
   --enable-codemode         Enable QuickJS codemode `exec` tool
@@ -134,6 +143,8 @@ where
     let mut session: Option<PathBuf> = None;
     let mut no_session = false;
     let mut skill_dirs: Vec<PathBuf> = Vec::new();
+    let mut instructions = InstructionDiscoveryConfig::default();
+    let mut instructions_enabled = true;
     let mut extensions: Vec<PathBuf> = Vec::new();
     let mut no_tools = false;
     let mut enable_codemode = false;
@@ -271,6 +282,29 @@ where
                 let val = take_value(flag, inline_val, &mut i, &raw)?;
                 skill_dirs.push(PathBuf::from(val));
             }
+            "--walk-boundary" => {
+                instructions.walk_boundary =
+                    parse_walk_boundary(&take_value(flag, inline_val, &mut i, &raw)?)?;
+            }
+            "--instruction-max-bytes" => {
+                instructions.max_bytes =
+                    parse_instruction_max_bytes(&take_value(flag, inline_val, &mut i, &raw)?)?;
+            }
+            "--instruction-file" => {
+                instructions
+                    .extra_files
+                    .push(PathBuf::from(take_value(flag, inline_val, &mut i, &raw)?));
+            }
+            "--no-user-instructions" | "--no-instructions" => {
+                if inline_val.is_some() {
+                    return Err(format!("`{flag}` does not take a value"));
+                }
+                if flag == "--no-user-instructions" {
+                    instructions.include_user_instructions = false;
+                } else {
+                    instructions_enabled = false;
+                }
+            }
             "--extension" => {
                 let val = take_value(flag, inline_val, &mut i, &raw)?;
                 extensions.push(PathBuf::from(val));
@@ -348,9 +382,6 @@ where
     if let (CliMode::Acp, Some(_)) = (effective_mode, &session) {
         return Err("Use --pikra-home or --no-session in ACP mode.".into());
     }
-    if effective_mode != CliMode::Acp && pikra_home.is_some() {
-        return Err("--pikra-home requires ACP mode.".into());
-    }
 
     let prompt = if positionals.is_empty() {
         None
@@ -370,6 +401,9 @@ where
             .map_err(|err| format!("failed to determine current directory: {err}"))?,
     };
 
+    if !instructions_enabled {
+        instructions.max_bytes = Some(0);
+    }
     Ok(CliAction::Run(Box::new(CliArgs {
         mode: effective_mode,
         cwd: resolved_cwd,
@@ -382,6 +416,8 @@ where
         session,
         no_session,
         skill_dirs,
+        skill_walk_boundary: instructions.walk_boundary,
+        instruction_discovery: instructions,
         extensions,
         no_tools,
         enable_codemode,

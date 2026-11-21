@@ -18,8 +18,8 @@ use pikra_codemode::CodemodeSandboxOptions;
 use pikra_http::ReqwestTransport;
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
-    CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool, DeferredToolRegistry, SkillCatalog,
-    SkillDiscoveryConfig,
+    CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool, DeferredToolRegistry, InstructionContextState,
+    InstructionDiscoveryConfig, SkillCatalog, SkillDiscoveryConfig,
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
@@ -263,6 +263,7 @@ struct ActiveCompactionTask {
 }
 
 struct SessionRuntimeState {
+    instructions: InstructionContextState,
     session: Arc<Mutex<SessionManager>>,
     agent: Arc<Agent>,
     session_file: Option<PathBuf>,
@@ -278,6 +279,7 @@ pub struct RpcRuntime {
     deferred_registry: Arc<DeferredToolRegistry>,
     js_runtime: Option<Arc<JsExtensionRuntime>>,
     skill_discovery: SkillDiscoveryConfig,
+    instruction_discovery: InstructionDiscoveryConfig,
     #[cfg(all(unix, not(target_os = "ios")))]
     background_tools: Option<(ProcessSessionManager, MonitorManager)>,
     no_session: bool,
@@ -357,12 +359,20 @@ impl RpcRuntime {
             )));
         }
 
+        let pikra_home = args
+            .pikra_home
+            .clone()
+            .unwrap_or_else(|| pikra_acp::AcpConfig::default().pikra_home);
         let skill_discovery = SkillDiscoveryConfig {
             cwd: Some(args.cwd.clone()),
+            walk_boundary: args.skill_walk_boundary,
+            project_skill_dirs: vec![".pikra/skills".into()],
             extra_roots: args.skill_dirs.clone(),
-            user_skill_dirs: vec![PathBuf::from("~/.pikra/skills")],
+            user_skill_dirs: vec![pikra_home.join("skills")],
             ..SkillDiscoveryConfig::default()
         };
+        let mut instruction_discovery = args.instruction_discovery.clone();
+        instruction_discovery.user_dirs.push(pikra_home);
 
         let js_runtime = if args.extensions.is_empty() {
             None
@@ -414,7 +424,7 @@ impl RpcRuntime {
         };
 
         let explicit_model_override = args.provider.is_some() || args.model.is_some();
-        let (session_manager, agent) = build_session_and_agent(
+        let (session_manager, agent, instructions) = build_session_and_agent(
             Arc::clone(&provider),
             api_key_resolver.clone(),
             store,
@@ -423,6 +433,7 @@ impl RpcRuntime {
             &resident,
             js_runtime.as_ref(),
             &skill_discovery,
+            &instruction_discovery,
             compaction.clone(),
             initial_model,
             !explicit_model_override,
@@ -448,11 +459,13 @@ impl RpcRuntime {
             deferred_registry,
             js_runtime,
             skill_discovery,
+            instruction_discovery,
             #[cfg(all(unix, not(target_os = "ios")))]
             background_tools,
             no_session: args.no_session,
             compaction_config: Mutex::new(compaction),
             state: Mutex::new(SessionRuntimeState {
+                instructions,
                 session: Arc::new(Mutex::new(session_manager)),
                 agent: Arc::new(agent),
                 session_file,
@@ -1454,7 +1467,7 @@ impl RpcRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        let (session_manager, agent) = build_session_and_agent(
+        let (session_manager, agent, instructions) = build_session_and_agent(
             Arc::clone(&self.provider),
             self.api_key_resolver.clone(),
             store,
@@ -1463,6 +1476,7 @@ impl RpcRuntime {
             &tools,
             self.js_runtime.as_ref(),
             &self.skill_discovery,
+            &self.instruction_discovery,
             compaction,
             current_model,
             false,
@@ -1492,6 +1506,7 @@ impl RpcRuntime {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.session = Arc::new(Mutex::new(session_manager));
             guard.agent = Arc::new(agent);
+            guard.instructions = instructions;
             guard.session_file = new_file.clone();
         }
 
@@ -1534,7 +1549,7 @@ impl RpcRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        let (session_manager, agent) = build_session_and_agent(
+        let (session_manager, agent, instructions) = build_session_and_agent(
             Arc::clone(&self.provider),
             self.api_key_resolver.clone(),
             store,
@@ -1543,6 +1558,7 @@ impl RpcRuntime {
             &tools,
             self.js_runtime.as_ref(),
             &self.skill_discovery,
+            &self.instruction_discovery,
             compaction,
             current_model,
             true,
@@ -1587,6 +1603,7 @@ impl RpcRuntime {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.session = Arc::new(Mutex::new(session_manager));
             guard.agent = Arc::new(agent);
+            guard.instructions = instructions;
             guard.session_file = Some(path.clone());
         }
 
@@ -1599,14 +1616,20 @@ impl RpcRuntime {
     }
 
     fn handle_fork(&self, entry_id: &str) -> Result<serde_json::Value, String> {
-        let session = self.current_session();
-        let agent = self.current_agent();
-        let (from_leaf_id, reconstructed) = {
+        let (from_leaf_id, reconstructed, agent) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let SessionRuntimeState {
+                session,
+                agent,
+                instructions,
+                ..
+            } = &mut *state;
             let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
             let from = sess.leaf_id().map(ToString::to_string);
             sess.fork(entry_id).map_err(|e| e.to_string())?;
             let recon = sess.reconstruct_context();
-            (from, recon)
+            instructions.sync_branch(&mut sess, &recon);
+            (from, recon, Arc::clone(agent))
         };
         self.deferred_registry.clear_seen_schemas();
         agent
@@ -1878,6 +1901,7 @@ fn build_session_and_agent(
     resident_tools: &[Arc<dyn AgentTool>],
     js_runtime: Option<&Arc<JsExtensionRuntime>>,
     skill_discovery: &SkillDiscoveryConfig,
+    instruction_discovery: &InstructionDiscoveryConfig,
     compaction: CompactionConfig,
     fallback_model: Model,
     should_restore_model: bool,
@@ -1890,7 +1914,7 @@ fn build_session_and_agent(
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     parent_session: Option<String>,
-) -> Result<(SessionManager, Agent), String> {
+) -> Result<(SessionManager, Agent, InstructionContextState), String> {
     let resident_defs: Vec<ToolDefinition> =
         resident_tools.iter().map(|t| t.definition()).collect();
     let mut session_cfg = SessionConfig::new(base_system_prompt, resident_defs)
@@ -1901,6 +1925,12 @@ fn build_session_and_agent(
     let mut session_manager = SessionManager::open(store, session_cfg)
         .map_err(|err| format!("failed to open session: {err}"))?;
     let reconstructed = session_manager.reconstruct_context();
+    let instructions = InstructionContextState::new(
+        Some(instruction_discovery.clone()),
+        Some(cwd),
+        &mut session_manager,
+        &reconstructed,
+    );
     let session_id = session_manager.session_id().to_string();
 
     let effective_model = if should_restore_model {
@@ -1954,7 +1984,7 @@ fn build_session_and_agent(
     agent_cfg.initial_messages = reconstructed.messages;
 
     let agent = Agent::new(provider, agent_cfg);
-    Ok((session_manager, agent))
+    Ok((session_manager, agent, instructions))
 }
 
 fn flush_js_errors(js_runtime: Option<&Arc<JsExtensionRuntime>>, writer: &JsonlWriter) {

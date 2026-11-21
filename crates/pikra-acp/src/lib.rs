@@ -14,6 +14,7 @@ pub use rpc::{serve_io, serve_stdio};
 pub use server::AcpServer;
 
 use pikra_ai::{ApiKind, HttpTransport, StreamProvider, ThinkingLevel};
+use pikra_kit::{InstructionDiscoveryConfig, WalkBoundary};
 use std::{path::PathBuf, sync::Arc};
 
 /// Defaults and dependencies for an ACP server. Each client opens its own sessions.
@@ -28,6 +29,8 @@ pub struct AcpConfig {
     pub pikra_home: PathBuf,
     pub persist_sessions: bool,
     pub skill_dirs: Vec<PathBuf>,
+    pub skill_walk_boundary: WalkBoundary,
+    pub instruction_discovery: Option<InstructionDiscoveryConfig>,
     pub extensions: Vec<PathBuf>,
     pub enable_tools: bool,
     pub enable_codemode: bool,
@@ -56,6 +59,8 @@ impl Default for AcpConfig {
                 .map_or_else(|| home.join(".pikra"), PathBuf::from),
             persist_sessions: true,
             skill_dirs: Vec::new(),
+            skill_walk_boundary: WalkBoundary::default(),
+            instruction_discovery: Some(InstructionDiscoveryConfig::default()),
             extensions: Vec::new(),
             enable_tools: true,
             enable_codemode: false,

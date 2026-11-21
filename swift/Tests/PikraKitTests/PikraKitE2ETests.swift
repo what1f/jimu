@@ -61,7 +61,7 @@ private final class CancellableGate: @unchecked Sendable {
 
 // MARK: - Deterministic Mock OpenAI Completions SSE Client
 
-private actor MockSSEClient: PikraHTTPClient {
+actor MockSSEClient: PikraHTTPClient {
     typealias Handler = @Sendable (PikraHTTPRequest, Int) async throws -> PikraHTTPResponse
 
     private var requests: [PikraHTTPRequest] = []
@@ -189,7 +189,7 @@ private func canonicalJSON(_ value: Any) throws -> Data {
     try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
 }
 
-private func testModel(
+func testModel(
     id: String = "mock-model-v1",
     contextWindow: UInt32 = 128_000,
     maxOutputTokens: UInt32 = 8_192

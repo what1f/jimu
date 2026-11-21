@@ -99,6 +99,7 @@ struct WireSessionConfig: Encodable {
     let samplingParams: [String: JSONValue]
     let skillRoots: [String]
     let skillDiscovery: PikraSkillDiscovery.Configuration?
+    let instructionDiscovery: PikraInstructionDiscovery.Configuration?
     let autoDeferThresholdBytes: UInt?
     let enableDeferredGateway: Bool
     let enableCodemode: Bool
@@ -126,6 +127,7 @@ struct WireSessionConfig: Encodable {
         case samplingParams = "sampling_params"
         case skillRoots = "skill_roots"
         case skillDiscovery = "skill_discovery"
+        case instructionDiscovery = "instruction_discovery"
         case autoDeferThresholdBytes = "auto_defer_threshold_bytes"
         case enableDeferredGateway = "enable_deferred_gateway"
         case enableCodemode = "enable_codemode"
@@ -154,6 +156,7 @@ struct WireSessionConfig: Encodable {
         self.samplingParams = config.samplingParams
         self.skillRoots = config.skillRoots.map(\.path)
         self.skillDiscovery = config.skillDiscovery
+        self.instructionDiscovery = config.instructionDiscovery
         self.autoDeferThresholdBytes = config.autoDeferThresholdBytes
         self.enableDeferredGateway = config.enableDeferredGateway
         self.enableCodemode = config.enableCodemode

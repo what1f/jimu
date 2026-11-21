@@ -203,6 +203,7 @@ pub struct FfiSessionConfig {
     #[serde(default)]
     pub skill_roots: Vec<String>,
     pub skill_discovery: Option<pikra_kit::SkillDiscoveryConfig>,
+    pub instruction_discovery: Option<pikra_kit::InstructionDiscoveryConfig>,
     pub auto_defer_threshold_bytes: Option<usize>,
     #[serde(default = "default_true")]
     pub enable_deferred_gateway: bool,
