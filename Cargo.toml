@@ -13,6 +13,7 @@ members = [
     "crates/pikra-kit",
     "crates/pikra-ffi",
     "crates/pikra-testkit",
+    "crates/pikra-acp",
     "apps/pikra-rpc",
 ]
 
@@ -52,6 +53,8 @@ pikra-tools = { path = "crates/pikra-tools" }
 pikra-kit = { path = "crates/pikra-kit", default-features = false }
 pikra-ffi = { path = "crates/pikra-ffi" }
 pikra-testkit = { path = "crates/pikra-testkit" }
+pikra-acp = { path = "crates/pikra-acp" }
+agent-client-protocol-schema = { version = "1.21.0", default-features = false, features = ["unstable"] }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }

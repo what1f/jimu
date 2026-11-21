@@ -1826,7 +1826,7 @@ impl RpcRuntime {
                         }
                     }
                 }
-                CliMode::Rpc => {}
+                CliMode::Rpc | CliMode::Acp => {}
             }
         }
 

@@ -30,8 +30,45 @@ async fn main() -> ExitCode {
         }
         CliAction::Run(cli) => match cli.mode {
             CliMode::Rpc => run_rpc(*cli).await,
+            CliMode::Acp => run_acp(*cli).await,
             CliMode::Json | CliMode::Text => run_oneshot(*cli).await,
         },
+    }
+}
+
+async fn run_acp(cli: args::CliArgs) -> ExitCode {
+    let defaults = pikra_acp::AcpConfig::default();
+    let config = pikra_acp::AcpConfig {
+        cwd: defaults.cwd.join(cli.cwd),
+        provider: cli.provider,
+        model: cli.model,
+        api: cli.api,
+        base_url: cli.base_url,
+        api_key_env: cli.api_key_env,
+        pikra_home: cli.pikra_home.unwrap_or(defaults.pikra_home),
+        persist_sessions: !cli.no_session,
+        skill_dirs: cli.skill_dirs,
+        extensions: cli.extensions,
+        enable_tools: !cli.no_tools,
+        enable_codemode: cli.enable_codemode,
+        compact_tokens: cli.compact_tokens,
+        context_window: cli.context_window,
+        thinking: cli.thinking,
+        fast: cli.fast,
+        system_prompt: cli.system_prompt,
+        ..defaults
+    };
+    let result = match cli.prompt.as_deref() {
+        Some("login") => pikra_acp::args::login(&config).await,
+        Some("logout") => pikra_acp::args::logout(&config).await,
+        _ => pikra_acp::serve_stdio(config).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

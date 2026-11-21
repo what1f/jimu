@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliMode {
     Rpc,
+    Acp,
     Json,
     Text,
 }
@@ -12,6 +13,7 @@ pub enum CliMode {
 pub struct CliArgs {
     pub mode: CliMode,
     pub cwd: PathBuf,
+    pub pikra_home: Option<PathBuf>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api: Option<ApiKind>,
@@ -44,11 +46,13 @@ pikra - Headless Pikra agent CLI & JSONL RPC server
 
 USAGE:
   pikra --mode rpc [OPTIONS]
+  pikra --mode acp [OPTIONS]
   pikra ask [OPTIONS] <PROMPT>
 
 MODES:
-  --mode <rpc|json|text>    Execution mode (default: rpc; text for `ask`)
+  --mode <rpc|acp|json|text>    Execution mode (default: rpc; text for `ask`)
   --rpc                     Shorthand for --mode rpc
+  --acp                     Shorthand for --mode acp
   --json                    Shorthand for --mode json
 
 MODEL & PROVIDER OPTIONS:
@@ -66,6 +70,7 @@ SESSION & WORKSPACE OPTIONS:
   --cwd <dir>               Workspace directory (default: current directory)
   --session <jsonl_path>    Persist/resume append-only JSONL session file
   --no-session              Run with an ephemeral in-memory session
+  --pikra-home <dir>        Override the data directory in ACP mode
   --skill-dir <dir>         Skill directory to discover (repeatable)
   --extension <js_path>     QuickJS extension file or directory (repeatable)
   --no-tools                Disable built-in workspace tools
@@ -120,6 +125,7 @@ where
     let mut mode: Option<CliMode> = None;
     let mut is_ask = false;
     let mut cwd: Option<PathBuf> = None;
+    let mut pikra_home = None;
     let mut provider: Option<String> = None;
     let mut model: Option<String> = None;
     let mut api: Option<ApiKind> = None;
@@ -200,11 +206,12 @@ where
                 let val = take_value(flag, inline_val, &mut i, &raw)?;
                 mode = Some(match val.as_str() {
                     "rpc" => CliMode::Rpc,
+                    "acp" => CliMode::Acp,
                     "json" => CliMode::Json,
                     "text" => CliMode::Text,
                     other => {
                         return Err(format!(
-                            "unsupported --mode `{other}` (expected rpc, json, or text)"
+                            "unsupported --mode `{other}` (expected rpc, acp, json, or text)"
                         ));
                     }
                 });
@@ -215,6 +222,12 @@ where
                 }
                 mode = Some(CliMode::Rpc);
             }
+            "--acp" => {
+                if inline_val.is_some() {
+                    return Err("`--acp` does not take a value".to_string());
+                }
+                mode = Some(CliMode::Acp);
+            }
             "--json" => {
                 if inline_val.is_some() {
                     return Err("`--json` does not take a value".to_string());
@@ -224,6 +237,9 @@ where
             "--cwd" => {
                 let val = take_value(flag, inline_val, &mut i, &raw)?;
                 cwd = Some(PathBuf::from(val));
+            }
+            "--pikra-home" => {
+                pikra_home = Some(PathBuf::from(take_value(flag, inline_val, &mut i, &raw)?));
             }
             "--provider" => {
                 provider = Some(take_value(flag, inline_val, &mut i, &raw)?);
@@ -323,13 +339,26 @@ where
         );
     }
 
+    if effective_mode == CliMode::Acp
+        && !positionals.is_empty()
+        && !matches!(positionals.as_slice(), [action] if action == "login" || action == "logout")
+    {
+        return Err("ACP mode accepts login or logout as an optional command.".into());
+    }
+    if let (CliMode::Acp, Some(_)) = (effective_mode, &session) {
+        return Err("Use --pikra-home or --no-session in ACP mode.".into());
+    }
+    if effective_mode != CliMode::Acp && pikra_home.is_some() {
+        return Err("--pikra-home requires ACP mode.".into());
+    }
+
     let prompt = if positionals.is_empty() {
         None
     } else {
         Some(positionals.join(" "))
     };
 
-    if effective_mode != CliMode::Rpc && prompt.is_none() {
+    if matches!(effective_mode, CliMode::Json | CliMode::Text) && prompt.is_none() {
         return Err(
             "one-shot mode requires a prompt argument (e.g. `pikra ask \"Hello\"`)".to_string(),
         );
@@ -344,6 +373,7 @@ where
     Ok(CliAction::Run(Box::new(CliArgs {
         mode: effective_mode,
         cwd: resolved_cwd,
+        pikra_home,
         provider,
         model,
         api,

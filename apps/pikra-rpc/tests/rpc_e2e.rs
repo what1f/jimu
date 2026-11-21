@@ -1000,3 +1000,42 @@ async fn rpc_reports_persistence_error_when_session_file_unwritable() {
     assert!(proc.close_stdin_and_wait().await.success());
     server.abort();
 }
+
+#[tokio::test]
+async fn acp_modes_initialize_over_stdio() {
+    for flags in [&["--mode", "acp"][..], &["--acp"][..]] {
+        let mut peer = RpcClientProc::spawn(flags);
+        peer.send_json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}
+        }))
+        .await;
+        let response = peer.next_record().await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["protocolVersion"], 1);
+        assert_eq!(response["result"]["agentInfo"]["name"], "pikra-acp");
+        if flags.len() == 2 {
+            peer.send_raw_bytes(b" \t\n{broken}\n").await;
+            let malformed = peer.next_record().await;
+            assert_eq!(malformed["error"]["code"], -32700);
+            peer.send_json(&json!([])).await;
+            assert_eq!(peer.next_record().await["error"]["code"], -32600);
+            peer.send_json(&json!([
+                {"jsonrpc":"2.0","method":"_ignored"},
+                {"jsonrpc":"2.0","id":2,"method":"_unknown"},
+                {"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"relative"}},
+                {"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"unused","prompt":[]}},
+                {"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":4}}
+            ])).await;
+            let batch = peer.next_record().await;
+            let codes: Vec<_> = batch
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|reply| reply["error"]["code"].as_i64().unwrap())
+                .collect();
+            assert_eq!(codes, [-32601, -32602, -32800]);
+        }
+        assert!(peer.close_stdin_and_wait().await.success());
+    }
+}
