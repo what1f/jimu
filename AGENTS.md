@@ -64,7 +64,7 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
    - 动态工具增减一律走延迟网关（`deferred_tools` 上下文块 + `tool_search` + `call_tool`），绝不改写顶层 `tools` 数组。
 2. **动态上下文与 Skills 增量更新**：
    - `set_context(name, text)` 同名同值严格去重，变化时只在两轮之间以 `<system-reminder>` 追加在对话末尾，绝不回改头部系统指令。
-   - **Skills 增量 Diff**：仅在新开会话和压缩后发送一次完整 `<available_skills>`（受 8KB 预算保护）；会话中途增删 Skill 只在末尾追加 `# Skills changed` 增删增量，单纯修改已有 `SKILL.md` 正文静默不刷屏（模型通过 `read` 直接读最新磁盘文件）。
+   - **Skills 增量 Diff**：仅在新开会话和压缩后发送一次完整 `<available_skills>`（全量渲染所有可见 Skills，不做预算截断或路径别名压缩）；会话中途增删 Skill 只在末尾追加 `# Skills changed` 增删增量，单纯修改已有 `SKILL.md` 正文静默不刷屏（模型通过 `read` 直接读最新磁盘文件）。
 3. **压缩（Compaction）与 Token 估算**：
    - 自动压缩生成摘要时，原样复用父请求完整前缀并在末尾追加摘要指令，最大化命中服务端缓存读取。
    - Token 估算必须排除图片原始 base64 字节（单图按固定常量如 `1_200` tokens 计），输出预留上限封顶，防止 128k 输出上限模型过早触发压缩。

@@ -101,7 +101,7 @@ flowchart TD
 所有动态能力均围绕「已发送前缀字节恒定」设计：
 1. **常驻与延迟严格分池**：顶层 `tools` 数组在会话建立时锁定顺序；外部 MCP 工具或超预算工具自动进入 `DeferredToolRegistry`，通过常驻的 `tool_search`（BM25 分词相关性排序）按需拉取参数定义，通过 `call_tool` 执行（事件流自动透出内部真实工具名供 UI 展示）或在 `exec`（QuickJS 沙盒）中批量编排。
 2. **无品牌硬编码的 `AGENTS.md` 与 Skills 多级发现**：
-   - 库层只内置中立规范（`.agents/skills`、`~/.agents`、`AGENTS.override.md` > `AGENTS.md`），零 `.pikra` 写死路径，所有自定义目录、回溯边界（`ProjectRoot` 停 `.git` / `FilesystemRoot` 爬到 `/` / `CurrentDirOnly`）与体积上限（默认指令 `32 KiB` 可设 `None`、Skills 目录 `8 KiB`）均交由宿主覆盖；多份正文完全一致的 `AGENTS.md` 自动去重不重复加载。
+   - 库层只内置中立规范（`.agents/skills`、`~/.agents`、`AGENTS.override.md` > `AGENTS.md`），零 `.pikra` 写死路径，所有自定义目录、回溯边界（`ProjectRoot` 停 `.git` / `FilesystemRoot` 爬到 `/` / `CurrentDirOnly`）与指令体积上限（默认指令 `32 KiB` 可设 `None`）均交由宿主覆盖；多份正文完全一致的 `AGENTS.md` 自动去重不重复加载；所有可见 Skills 全量渲染进 `<available_skills>`（不截断、不做路径别名压缩）。
    - **首轮与压缩后保真，中途只发增删 Diff**：`AGENTS.md` 走具名上下文块，压缩后自动保留防遗忘；会话运行中若新增或删除 Skill，只在末尾追加 `# Skills changed` 增量块，修改已有 `SKILL.md` 正文静默不刷屏。
 3. **压缩复用父前缀**：自动压缩摘要请求直接复用上一轮完整消息与工具前缀，仅在尾部追加摘要指令，最大化命中缓存读取。
 

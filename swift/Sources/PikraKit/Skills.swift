@@ -43,7 +43,6 @@ public struct PikraSkillDiscovery: Sendable {
         public var userSkillDirs: [String]
         public var extraRoots: [URL]
         public var rules: [Rule]
-        public var maxCatalogBytes: UInt
 
         public init(
             cwd: URL? = nil,
@@ -54,8 +53,7 @@ public struct PikraSkillDiscovery: Sendable {
             includeUserSkills: Bool = true,
             userSkillDirs: [String] = [],
             extraRoots: [URL] = [],
-            rules: [Rule] = [],
-            maxCatalogBytes: UInt = 8192
+            rules: [Rule] = []
         ) {
             self.cwd = cwd
             self.walkBoundary = walkBoundary
@@ -66,7 +64,6 @@ public struct PikraSkillDiscovery: Sendable {
             self.userSkillDirs = userSkillDirs
             self.extraRoots = extraRoots
             self.rules = rules
-            self.maxCatalogBytes = maxCatalogBytes
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -78,7 +75,6 @@ public struct PikraSkillDiscovery: Sendable {
             case includeUserSkills = "include_user_skills"
             case userSkillDirs = "user_skill_dirs"
             case extraRoots = "extra_roots"
-            case maxCatalogBytes = "max_catalog_bytes"
         }
 
         public func encode(to encoder: any Encoder) throws {
@@ -92,7 +88,6 @@ public struct PikraSkillDiscovery: Sendable {
             try container.encode(userSkillDirs, forKey: .userSkillDirs)
             try container.encode(extraRoots.map(\.path), forKey: .extraRoots)
             try container.encode(rules, forKey: .rules)
-            try container.encode(maxCatalogBytes, forKey: .maxCatalogBytes)
         }
     }
 

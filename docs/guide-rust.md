@@ -173,7 +173,6 @@ let skill_cfg = SkillDiscoveryConfig {
         selector: SkillSelector::ByName("legacy-helper".into()),
         enabled: false,
     }],
-    max_catalog_bytes: 8 * 1024,
     ..Default::default()
 };
 ```

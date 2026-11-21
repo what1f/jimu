@@ -7,7 +7,7 @@ use crate::instructions::{
     InstructionCatalog, InstructionContextState, InstructionDiscoveryConfig,
 };
 use crate::mcp::{McpClient, McpToolRegistrationMode};
-use crate::skills::{SKILL_SEARCH_NAME, SkillCatalog, SkillDiscoveryConfig, SkillSearchTool};
+use crate::skills::{SkillCatalog, SkillDiscoveryConfig};
 use crate::wakeup::{
     Activity, ActivityGuard, BackgroundEventSender, BackgroundInbox, KitTurnOrigin, SharedKitDriver,
 };
@@ -104,8 +104,6 @@ pub struct KitSessionConfig {
     pub skill_roots: Vec<PathBuf>,
     pub skill_discovery: SkillDiscoveryConfig,
     pub instruction_discovery: Option<InstructionDiscoveryConfig>,
-    /// Expose a resident skill search tool (default: true).
-    pub enable_skill_search: bool,
     /// Resident schema budget for automatic placement. Explicit resident tools are pinned.
     /// When omitted, tools explicitly marked Auto use an 8 KiB budget.
     pub auto_defer_threshold_bytes: Option<usize>,
@@ -148,7 +146,6 @@ impl KitSessionConfig {
             skill_roots: Vec::new(),
             skill_discovery: SkillDiscoveryConfig::default(),
             instruction_discovery: None,
-            enable_skill_search: true,
             auto_defer_threshold_bytes: None,
             pause_background_on_error: true,
             enable_deferred_gateway: true,
@@ -414,13 +411,6 @@ impl KitSession {
             }
         }
         deferred_registry.upsert(deferred);
-        if config.enable_skill_search
-            && !resident
-                .iter()
-                .any(|tool| tool.definition().name == SKILL_SEARCH_NAME)
-        {
-            resident.push(Arc::new(SkillSearchTool::shared(Arc::clone(&skills))));
-        }
 
         // Always keep built-in deferred gateway resident (when enabled) so adding/removing
         // deferred tools later NEVER mutates the leading resident `tools` array!

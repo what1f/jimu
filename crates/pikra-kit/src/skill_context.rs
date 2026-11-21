@@ -148,17 +148,12 @@ fn queue_skill_context(
                 .get(&skill.name)
                 .is_none_or(|prev_path| prev_path.as_str() != skill.file_path.to_string_lossy())
         };
-        let has_additions = catalog.visible().any(is_added_or_moved);
-        if has_additions || !removed.is_empty() {
+        let added = catalog.format_visible(is_added_or_moved);
+        if added.is_some() || !removed.is_empty() {
             let mut diff = String::from("# Skills changed");
-            if has_additions {
+            if let Some(added) = added {
                 diff.push('\n');
-                let added = catalog.format_visible(is_added_or_moved);
-                diff.push_str(
-                    added
-                        .as_deref()
-                        .unwrap_or("Use skill_search to find additional skills."),
-                );
+                diff.push_str(&added);
             }
             for name in removed {
                 diff.push_str(&format!(

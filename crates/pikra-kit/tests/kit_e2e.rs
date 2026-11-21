@@ -14,9 +14,8 @@ use pikra_ai::{
 use pikra_kit::{
     BackgroundNotification, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, INSTRUCTIONS_CONTEXT_NAME,
     InstructionCatalog, InstructionDiscoveryConfig, KitEvent, KitSession, KitSessionConfig,
-    KitToolSpec, KitTurnOrigin, McpClient, McpToolRegistrationMode, SKILL_SEARCH_NAME,
-    SkillCatalog, SkillDiscoveryConfig, SkillEnableRule, SkillSelector, TOOL_SEARCH_NAME,
-    WalkBoundary,
+    KitToolSpec, KitTurnOrigin, McpClient, McpToolRegistrationMode, SkillCatalog,
+    SkillDiscoveryConfig, SkillEnableRule, SkillSelector, TOOL_SEARCH_NAME, WalkBoundary,
 };
 #[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
 use pikra_kit::{StdioMcpConfig, StdioMcpTransport};
@@ -1353,7 +1352,7 @@ fn instruction_context_is_refreshed_and_survives_compaction_fork_and_reopen() {
 }
 
 #[test]
-fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
+fn scoped_skills_reload_reopen_and_compact_without_prefix_drift() {
     use pikra_session::JsonlSessionStore;
     use std::{fs, path::Path};
 
@@ -1418,7 +1417,6 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
             std::os::unix::fs::symlink(&extra, extra.join("recursive")).unwrap();
         }
 
-        let catalog_budget = extra.to_string_lossy().len() + 420;
         let discovery = SkillDiscoveryConfig {
             cwd: Some(cwd),
             project_skill_dirs: vec![".dora/skills".into()],
@@ -1434,8 +1432,6 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
                     enabled: false,
                 },
             ],
-            max_catalog_bytes: catalog_budget,
-            shorten_paths: true,
             ..SkillDiscoveryConfig::default()
         };
         let isolated = SkillCatalog::discover_with_config(&SkillDiscoveryConfig {
@@ -1463,28 +1459,37 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
         assert!(catalog.get("managed").is_some());
         assert!(catalog.get("out-of-repo").is_none() && catalog.get("blocked").is_none());
         assert_eq!(catalog.get("a-build").unwrap().file_path, keep);
-        assert_eq!(catalog.search("部署发布", 1)[0].name, "bundled");
         let xml = catalog.format_for_context().unwrap();
-        assert!(xml.len() <= catalog_budget && xml.contains("<truncated count="));
-        assert!(xml.contains("<skill_root alias=\"r0\">") && xml.contains("r0/a-build.md"));
-        assert!(!xml.contains("bundled") && !xml.contains("manual-only"));
+        assert!(xml.starts_with("<available_skills>\n"));
+        assert!(!xml.contains("<truncated") && !xml.contains("alias=\"r0\""));
+        assert!(xml.contains(&format!("<location>{}</location>", keep.to_string_lossy())));
+        assert!(xml.contains(&format!(
+            "<description>{}</description>",
+            "部署发布与运维".repeat(80)
+        )));
+        assert!(
+            xml.contains("<name>bundled</name>")
+                && !xml.contains("manual-only")
+                && !xml.contains("frontmatter-only")
+        );
 
-        http.enqueue_sse(openai_sse_tool_call(
-            "ss1",
-            "search",
-            SKILL_SEARCH_NAME,
-            &json!({"query":"部署发布"}),
-        ));
-        http.enqueue_sse(openai_sse_text("ss2", "Found the bundled skill."));
-        let messages = session
+        http.enqueue_sse(openai_sse_text("ss1", "Loaded mentions."));
+        let _ = session
             .prompt("请用$manual-only 和 $frontmatter-only。")
             .await
             .unwrap();
-        assert!(messages.iter().any(|message| matches!(message,
-            pikra_agent::AgentMessage::Llm(Message::ToolResult(result))
-            if matches!(&result.content[0], ContentPart::Text(text) if text.text.contains("bundled")))));
         let first = &http.requests()[0];
         let wire = first.body_json.to_string();
+        assert!(
+            !first.body_json["tools"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .any(|t| t["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("skill"))
+        );
         for name in ["manual-only", "frontmatter-only"] {
             assert!(wire.contains(&format!("<skill_mention name=\\\"{name}\\\"")));
         }
@@ -1499,7 +1504,7 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
         http.enqueue_sse(openai_sse_text("ss3", "Still here."));
         session.prompt("Continue.").await.unwrap();
         assert!(
-            !http.requests()[2]
+            !http.requests()[1]
                 .body_json
                 .to_string()
                 .contains("# Skills changed")
@@ -1512,7 +1517,7 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
         http.enqueue_sse(openai_sse_text("ss4", "Received changes."));
         session.prompt("What changed?").await.unwrap();
         let requests = http.requests();
-        let diff = requests[3].body_json.to_string();
+        let diff = requests[2].body_json.to_string();
         assert!(
             diff.contains("# Skills changed")
                 && diff.contains("The b-release skill has been removed")

@@ -443,8 +443,29 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
         && matches!(update.fields.content.as_deref(), Some([ToolCallContent::Terminal(_)])))
     ));
     let requests = model.finish().await;
-    assert!(requests[0].to_string().contains("image_url"));
-    assert!(requests[0].to_string().contains("context text"));
+    let tool_names: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| {
+            t["function"]["name"]
+                .as_str()
+                .or_else(|| t["name"].as_str())
+        })
+        .collect();
+    assert!(tool_names.contains(&"read") && tool_names.contains(&"exec_command"));
+    #[cfg(not(target_os = "ios"))]
+    assert!(tool_names.contains(&"monitor"));
+    assert!(
+        !tool_names.contains(&"sleep") && !tool_names.iter().any(|name| name.contains("skill")),
+        "unexpected ACP tools: {tool_names:?}"
+    );
+    let first_req = requests[0].to_string();
+    assert!(
+        first_req.contains("<available_skills>") && first_req.contains("<name>check-buffer</name>")
+    );
+    assert!(first_req.contains("image_url"));
+    assert!(first_req.contains("context text"));
     assert!(requests[1].to_string().contains("unsaved"));
     assert!(requests[3].to_string().contains("terminal output"));
 }

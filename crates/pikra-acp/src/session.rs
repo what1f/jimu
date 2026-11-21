@@ -19,8 +19,7 @@ use pikra_session::{
     SessionStore,
 };
 use pikra_tools::{
-    BuiltinToolSet, SleepTool, WakeGate, WebFetchConfig, WebFetchTool, WorkspaceTools,
-    WorkspaceToolsConfig,
+    BuiltinToolSet, WebFetchConfig, WebFetchTool, WorkspaceTools, WorkspaceToolsConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -760,15 +759,15 @@ impl Session {
                         }
                     })
                 }));
-            let gate = WakeGate::new();
             let mut tools = WorkspaceTools::build(workspace.clone());
             #[cfg(not(target_os = "ios"))]
             {
                 use pikra_tools::{
                     BackgroundEventCallback, BackgroundToolEvent, ExecCommandTool, MonitorManager,
-                    MonitorTool, ProcessSessionManager, WriteStdinTool,
+                    MonitorTool, ProcessSessionManager, WakeGate, WriteStdinTool,
                     format_background_events_xml,
                 };
+                let gate = WakeGate::new();
                 let bg_slot = Arc::clone(&bg_sender);
                 let bg_callback: BackgroundEventCallback = Arc::new(move |event| {
                     let Some(sender) = bg_slot.get() else {
@@ -816,7 +815,6 @@ impl Session {
                 tools.push(Arc::new(MonitorTool::new(monitors.clone())));
                 local_processes = Some((processes, monitors));
             }
-            tools.push(Arc::new(SleepTool::new(gate)));
             tools.push(Arc::new(WebFetchTool::new(
                 server.transport.clone(),
                 WebFetchConfig::default(),
@@ -841,7 +839,7 @@ impl Session {
                 .iter()
                 .map(|spec| spec.tool.definition().name)
                 .collect();
-            names.extend(["exec", "call_tool", "tool_search", "skill_search"].map(str::to_owned));
+            names.extend(["exec", "call_tool", "tool_search"].map(str::to_owned));
             for tool in extension.tools() {
                 if !names.insert(tool.definition().name) {
                     return Err(failed(

@@ -14,7 +14,7 @@
   - 前后台统一终端与监听：支持 PTY 交互与自动转后台的 `exec_command` + `write_stdin`、按行防抖与刷屏熔断唤醒的 `monitor`、可提前打断的 `sleep`；
   - 网页正文提纯：移植自 Defuddle + Turndown + 站点路由（含 X 推文/长文）的 `web_fetch`（内置 SSRF 内网拦截，桌面走系统根证书 `reqwest`，苹果端自动走无痕 `URLSession`）；
   - 支持按工具覆盖名称、描述与裁剪参数 Schema，未引用工具在 App 链接打包时自动死代码剔除。
-- **可扩展 Skills 与动态工具编排 (`pikra-kit` + `pikra-codemode`)**：默认兼容 `.agents/skills`（支持向上回溯仓库根与 Kitter 软链接）及自定义品牌目录，内置 8KB 预算保护、BM25 `tool_search`、超阈值自动转延迟与受限 QuickJS 批量工具编排沙盒。
+- **可扩展 Skills 与动态工具编排 (`pikra-kit` + `pikra-codemode`)**：默认兼容 `.agents/skills`（支持向上回溯仓库根与 Kitter 软链接）及自定义品牌目录，全量注入可见 `<available_skills>` 与增量 Diff、BM25 `tool_search`、超阈值自动转延迟与受限 QuickJS 批量工具编排沙盒。
 
 ---
 

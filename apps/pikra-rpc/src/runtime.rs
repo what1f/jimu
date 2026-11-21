@@ -19,8 +19,8 @@ use pikra_http::ReqwestTransport;
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
     BackgroundInbox, BackgroundNotification, CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool,
-    DeferredToolRegistry, InstructionContextState, InstructionDiscoveryConfig, SKILL_SEARCH_NAME,
-    SkillCatalog, SkillDiscoveryConfig, SkillSearchTool,
+    DeferredToolRegistry, InstructionContextState, InstructionDiscoveryConfig, SkillCatalog,
+    SkillDiscoveryConfig,
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
@@ -305,7 +305,6 @@ struct BuiltSessionTools {
     background_tools: Option<(ProcessSessionManager, MonitorManager)>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_session_tools(
     cwd: &PathBuf,
     transport: &Arc<ReqwestTransport>,
@@ -313,8 +312,6 @@ fn build_session_tools(
     enable_codemode: bool,
     js_runtime: Option<&Arc<JsExtensionRuntime>>,
     deferred_registry: &Arc<DeferredToolRegistry>,
-    skills: &Arc<Mutex<SkillCatalog>>,
-    skill_discovery: &SkillDiscoveryConfig,
     inbox: &BackgroundInbox,
 ) -> BuiltSessionTools {
     let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
@@ -391,20 +388,6 @@ fn build_session_tools(
             Arc::clone(transport) as Arc<dyn pikra_ai::HttpTransport>,
             WebFetchConfig::default(),
         )));
-    }
-
-    let has_skills = skills
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .format_for_context()
-        .is_some()
-        || !skill_discovery.extra_roots.is_empty();
-    if (!no_tools || has_skills)
-        && !resident
-            .iter()
-            .any(|tool| tool.definition().name == SKILL_SEARCH_NAME)
-    {
-        resident.push(Arc::new(SkillSearchTool::shared(Arc::clone(skills))));
     }
 
     if let Some(rt) = js_runtime {
@@ -500,7 +483,6 @@ impl RpcRuntime {
         };
 
         let skills_catalog = SkillCatalog::discover_with_config(&skill_discovery);
-        let skills_handle = Arc::new(Mutex::new(skills_catalog.clone()));
         let inbox = Arc::new(BackgroundInbox::default());
         let built_tools = build_session_tools(
             &args.cwd,
@@ -509,8 +491,6 @@ impl RpcRuntime {
             args.enable_codemode,
             js_runtime.as_ref(),
             &deferred_registry,
-            &skills_handle,
-            &skill_discovery,
             &inbox,
         );
         let resident = built_tools.resident;
@@ -1614,7 +1594,6 @@ impl RpcRuntime {
             .clone();
 
         let skills_catalog = SkillCatalog::discover_with_config(&self.skill_discovery);
-        let skills_handle = Arc::new(Mutex::new(skills_catalog.clone()));
         let fresh_inbox = Arc::new(BackgroundInbox::default());
         let built_tools = build_session_tools(
             &self.cwd,
@@ -1623,8 +1602,6 @@ impl RpcRuntime {
             self.enable_codemode,
             self.js_runtime.as_ref(),
             &self.deferred_registry,
-            &skills_handle,
-            &self.skill_discovery,
             &fresh_inbox,
         );
         let tools = built_tools.resident;
@@ -1726,7 +1703,6 @@ impl RpcRuntime {
             .clone();
 
         let skills_catalog = SkillCatalog::discover_with_config(&self.skill_discovery);
-        let skills_handle = Arc::new(Mutex::new(skills_catalog.clone()));
         let fresh_inbox = Arc::new(BackgroundInbox::default());
         let built_tools = build_session_tools(
             &self.cwd,
@@ -1735,8 +1711,6 @@ impl RpcRuntime {
             self.enable_codemode,
             self.js_runtime.as_ref(),
             &self.deferred_registry,
-            &skills_handle,
-            &self.skill_discovery,
             &fresh_inbox,
         );
         let tools = built_tools.resident;

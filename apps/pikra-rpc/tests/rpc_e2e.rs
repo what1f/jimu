@@ -1153,17 +1153,17 @@ async fn acp_modes_initialize_over_stdio() {
 }
 
 #[tokio::test]
-async fn review_batch2_rpc_meta_follow_up_hidden_and_skill_search_registered() {
+async fn review_batch2_rpc_meta_follow_up_hidden_and_clean_skills_tools() {
     let tmp = tempfile::tempdir().unwrap();
-    let skill_root = tmp.path().join("skills");
-    std::fs::create_dir_all(skill_root.join("demo")).unwrap();
+    let skills_dir = tmp.path().join("skills");
+    std::fs::create_dir_all(skills_dir.join("demo")).unwrap();
     std::fs::write(
-        skill_root.join("demo/SKILL.md"),
+        skills_dir.join("demo/SKILL.md"),
         "---\nname: demo\ndescription: Demo skill\n---\nDemo body\n",
     )
     .unwrap();
 
-    let skill_dir_str = skill_root.to_string_lossy().to_string();
+    let skill_dir_str = skills_dir.to_string_lossy().to_string();
     let mut proc = RpcClientProc::spawn(&[
         "--mode",
         "rpc",
@@ -1180,7 +1180,7 @@ async fn review_batch2_rpc_meta_follow_up_hidden_and_skill_search_registered() {
         "--no-session",
     ]);
 
-    // 1. skill_search must be registered when skills are discovered/configured.
+    // 1. Skills are rendered directly into <available_skills>; no extra skill search tool is registered.
     proc.send_json(&json!({ "id": "st1", "type": "get_state" }))
         .await;
     let (st_resp, _) = proc.read_response_for("st1").await;
@@ -1192,8 +1192,8 @@ async fn review_batch2_rpc_meta_follow_up_hidden_and_skill_search_registered() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(
-        tools.contains(&"skill_search"),
-        "expected skill_search in tools: {tools:?}"
+        !tools.iter().any(|name| name.contains("skill")) && tools.contains(&"read"),
+        "unexpected tools: {tools:?}"
     );
 
     // 2. is_meta: true follow_up must NOT be leaked by clear_queue (while normal follow_up is).
@@ -1220,7 +1220,7 @@ async fn review_batch2_rpc_meta_follow_up_hidden_and_skill_search_registered() {
     assert_eq!(clr_resp["success"], true);
     assert_eq!(clr_resp["data"]["follow_up"], json!(["visible-followup"]));
 
-    // 3. new_session rebuilds session tools cleanly (still exposes skill_search).
+    // 3. new_session rebuilds session tools cleanly.
     proc.send_json(&json!({ "id": "ns", "type": "new_session" }))
         .await;
     assert_eq!(proc.read_response_for("ns").await.0["success"], true);
@@ -1233,7 +1233,7 @@ async fn review_batch2_rpc_meta_follow_up_hidden_and_skill_search_registered() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert!(tools2.contains(&"skill_search"));
+    assert!(!tools2.iter().any(|name| name.contains("skill")) && tools2.contains(&"read"));
 
     assert!(proc.close_stdin_and_wait().await.success());
 }

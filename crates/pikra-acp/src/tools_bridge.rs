@@ -145,9 +145,9 @@ impl Bridge {
 
     fn local_permission(&self, name: &str) -> Option<Permission> {
         match name {
-            "skill_search" | "tool_search" | "exec" | "call_tool" => None, // Their delegated tools pass through this middleware.
+            "tool_search" | "exec" | "call_tool" => None, // Their delegated tools pass through this middleware.
             _ if !self.is_builtin(name) => Some(Permission::Tool(name.into())),
-            "read" | "find" | "grep" | "web_fetch" | "sleep" => None,
+            "read" | "find" | "grep" | "web_fetch" => None,
             "write" | "edit" | "apply_patch" => Some(Permission::Files),
             _ => Some(Permission::Execute),
         }
@@ -900,9 +900,7 @@ pub(crate) fn presentation(name: &str) -> (acp::ToolKind, &str) {
         "exec_command" => (Execute, "Run command"),
         "write_stdin" => (Execute, "Send terminal input"),
         "monitor" => (Execute, "Monitor command"),
-        "sleep" => (Other, "Wait"),
         "web_fetch" => (Fetch, "Open webpage"),
-        "skill_search" => (Search, "Find skills"),
         "tool_search" => (Search, "Find tools"),
         "exec" => (Execute, "Run tools"),
         _ => (Other, name),

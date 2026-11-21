@@ -1504,7 +1504,7 @@ struct PikraKitE2ETests {
         await agent.close()
     }
 
-    @Test("Tool output redaction, workspace tool background lifecycle, reopen baseline and skill_search")
+    @Test("Tool output redaction, workspace tool background lifecycle, reopen baseline and full skills catalog")
     func reviewBatch1SwiftRegressions() async throws {
         // 1. PikraToolOutput.content.didSet clears structuredContent on plain-text or truncated redaction,
         // while keeping JSON-preserving object redactions synchronized.
@@ -1580,7 +1580,7 @@ struct PikraKitE2ETests {
         }
 
         // 3. Reopening a persisted session keeps baseline.tools resident in original order despite
-        // a smaller autoDeferThresholdBytes, and skillRoots-only sessions register skill_search.
+        // a smaller autoDeferThresholdBytes, and skillRoots-only sessions inject <available_skills> cleanly.
         let journalURL = tmpDir.appendingPathComponent("reopen.jsonl")
         let skillRoot = tmpDir.appendingPathComponent("skills", isDirectory: true)
         let demoSkillDir = skillRoot.appendingPathComponent("demo", isDirectory: true)
@@ -1636,9 +1636,9 @@ struct PikraKitE2ETests {
         }
         let firstNames = try extractToolNames(bodies[0])
         let secondNames = try extractToolNames(bodies[1])
-        #expect(firstNames.contains("skill_search"))
-        #expect(firstNames.contains("alpha_tool"))
-        #expect(firstNames.contains("beta_tool"))
+        #expect(firstNames == ["alpha_tool", "beta_tool", "tool_search", "call_tool"])
         #expect(firstNames == secondNames)
+        let firstBody = String(decoding: bodies[0], as: UTF8.self)
+        #expect(firstBody.contains("<available_skills>") && firstBody.contains("<name>demo</name>"))
     }
 }

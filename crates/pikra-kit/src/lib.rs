@@ -33,7 +33,6 @@ pub use session::{
 };
 pub use skill_context::{SKILLS_CONTEXT_NAME, SkillContextState};
 pub use skills::{
-    SKILL_SEARCH_NAME, Skill, SkillCatalog, SkillDiagnostic, SkillDiscoveryConfig, SkillEnableRule,
-    SkillSearchTool, SkillSelector,
+    Skill, SkillCatalog, SkillDiagnostic, SkillDiscoveryConfig, SkillEnableRule, SkillSelector,
 };
 pub use wakeup::{BackgroundEventSender, BackgroundInbox, BackgroundNotification, KitTurnOrigin};

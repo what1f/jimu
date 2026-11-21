@@ -15,9 +15,8 @@ use pikra_ai::{
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
     CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, CallToolGateway, CodemodeExecTool,
-    DeferredToolRegistry, InstructionContextState, SKILL_SEARCH_NAME, SKILLS_CONTEXT_NAME,
-    SkillCatalog, SkillContextState, SkillDiscoveryConfig, SkillSearchTool, TOOL_SEARCH_NAME,
-    ToolSchemaBudget, ToolSearchTool,
+    DeferredToolRegistry, InstructionContextState, SKILLS_CONTEXT_NAME, SkillCatalog,
+    SkillContextState, SkillDiscoveryConfig, TOOL_SEARCH_NAME, ToolSchemaBudget, ToolSearchTool,
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
@@ -163,13 +162,7 @@ impl FfiSession {
             .auto_defer_threshold_bytes
             .filter(|_| config.enable_deferred_gateway);
         let reserved = |name: &str| {
-            [
-                TOOL_SEARCH_NAME,
-                CALL_TOOL_NAME,
-                CODEMODE_EXEC_TOOL_NAME,
-                SKILL_SEARCH_NAME,
-            ]
-            .contains(&name)
+            [TOOL_SEARCH_NAME, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME].contains(&name)
         };
 
         if let Some(baseline_names) = baseline_tool_names {
@@ -252,7 +245,6 @@ impl FfiSession {
         } else {
             None
         };
-        let enable_skill_search = skill_discovery.is_some();
         let skills = Arc::new(Mutex::new(
             skill_discovery
                 .as_ref()
@@ -282,13 +274,6 @@ impl FfiSession {
         }
 
         deferred_registry.upsert(deferred);
-        if enable_skill_search
-            && !resident
-                .iter()
-                .any(|t| t.definition().name == SKILL_SEARCH_NAME)
-        {
-            resident.push(Arc::new(SkillSearchTool::shared(skills.clone())));
-        }
 
         // Keep deferred gateway resident when enabled so dynamic deferred tool updates
         // NEVER mutate the top-level resident `tools` array (prompt cache stability).

@@ -1,14 +1,8 @@
-use crate::bm25::{Document, score_documents};
 use crate::instructions::{WalkBoundary, ancestor_chain_root_to_leaf, discovery_home, expand_home};
-use pikra_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
-use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
-use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 /// Discovered skill descriptor loaded from a SKILL.md or standalone Markdown file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,8 +50,6 @@ pub struct SkillDiscoveryConfig {
     pub extra_roots: Vec<PathBuf>,
     pub bundled_roots: Vec<PathBuf>,
     pub rules: Vec<SkillEnableRule>,
-    pub max_catalog_bytes: usize,
-    pub shorten_paths: bool,
 }
 
 impl Default for SkillDiscoveryConfig {
@@ -74,8 +66,6 @@ impl Default for SkillDiscoveryConfig {
             extra_roots: Vec::new(),
             bundled_roots: Vec::new(),
             rules: Vec::new(),
-            max_catalog_bytes: 8192,
-            shorten_paths: false,
         }
     }
 }
@@ -119,10 +109,7 @@ impl SkillDiscoveryConfig {
 #[derive(Debug, Clone)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,
-    skill_roots: Vec<PathBuf>,
     diagnostics: Vec<SkillDiagnostic>,
-    max_catalog_bytes: usize,
-    shorten_paths: bool,
 }
 
 impl Default for SkillCatalog {
@@ -146,10 +133,7 @@ impl SkillCatalog {
         let mut scanner = SkillScanner {
             catalog: Self {
                 skills: Vec::new(),
-                skill_roots: Vec::new(),
                 diagnostics: Vec::new(),
-                max_catalog_bytes: config.max_catalog_bytes,
-                shorten_paths: config.shorten_paths,
             },
             rules: config
                 .rules
@@ -172,8 +156,7 @@ impl SkillCatalog {
             if root.is_dir() {
                 scanner.scan_dir(&root, &root);
             } else if is_markdown_file(&root) {
-                let parent = root.parent().filter(|path| !path.as_os_str().is_empty());
-                scanner.collect_file(&root, parent.unwrap_or(Path::new(".")));
+                scanner.collect_file(&root);
             }
         }
         scanner.catalog
@@ -189,11 +172,6 @@ impl SkillCatalog {
 
     pub fn get(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|skill| skill.name == name)
-    }
-
-    /// Search all enabled skills, including those that require an explicit invocation.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<Skill> {
-        search_matching(query, limit, self.skills.iter())
     }
 
     /// Find enabled skills in mention order, including manual-only skills.
@@ -235,159 +213,36 @@ impl SkillCatalog {
             .filter(|skill| !skill.disable_model_invocation)
     }
 
-    /// Render a bounded index. The search tool can still find omitted skills.
+    /// Render all visible skills into an `<available_skills>` XML catalog.
     pub fn format_for_context(&self) -> Option<String> {
         self.format_visible(|_| true)
     }
 
     pub(crate) fn empty_context(&self) -> &'static str {
-        const EMPTY: &str = "<available_skills>\n</available_skills>";
-        if EMPTY.len() <= self.max_catalog_bytes {
-            EMPTY
-        } else {
-            ""
-        }
+        "<available_skills>\n</available_skills>"
     }
 
     pub(crate) fn format_visible(&self, include: impl Fn(&Skill) -> bool) -> Option<String> {
-        let entries: Vec<_> = self
-            .skills
-            .iter()
-            .zip(&self.skill_roots)
-            .filter(|(skill, _)| !skill.disable_model_invocation && include(skill))
-            .collect();
-        if entries.is_empty() {
+        let visible: Vec<_> = self.visible().filter(|skill| include(skill)).collect();
+        if visible.is_empty() {
             return None;
         }
-
-        let budget = self.max_catalog_bytes;
-        let mut catalog = CatalogRows::new(&entries, usize::MAX, false);
-        if self.shorten_paths || catalog.size() >= budget - budget / 4 {
-            let aliased = CatalogRows::new(&entries, usize::MAX, true);
-            if self.shorten_paths || aliased.size() < catalog.size() {
-                catalog = aliased;
-            }
+        let mut xml = String::from("<available_skills>\n");
+        for skill in visible {
+            xml.push_str("  <skill>\n");
+            xml.push_str(&format!("    <name>{}</name>\n", escape_xml(&skill.name)));
+            xml.push_str(&format!(
+                "    <description>{}</description>\n",
+                escape_xml(&skill.description)
+            ));
+            xml.push_str(&format!(
+                "    <location>{}</location>\n",
+                escape_xml(&skill.file_path.to_string_lossy())
+            ));
+            xml.push_str("  </skill>\n");
         }
-        let use_aliases = !catalog.roots.is_empty();
-        for max_chars in [256, 128, 64, 24] {
-            if catalog.size() <= budget {
-                break;
-            }
-            catalog = CatalogRows::new(&entries, max_chars, use_aliases);
-        }
-        catalog.render(budget)
-    }
-}
-
-fn search_matching<'a>(
-    query: &str,
-    limit: usize,
-    skills: impl Iterator<Item = &'a Skill>,
-) -> Vec<Skill> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let skills: Vec<_> = skills.collect();
-    let documents: Vec<_> = skills
-        .iter()
-        .map(|skill| Document {
-            name: &skill.name,
-            description: &skill.description,
-            properties: "",
-        })
-        .collect();
-    score_documents(query, &documents)
-        .into_iter()
-        .take(limit)
-        .map(|i| skills[i].clone())
-        .collect()
-}
-
-struct CatalogRows {
-    rows: Vec<(String, Option<usize>)>,
-    roots: Vec<String>,
-}
-
-impl CatalogRows {
-    const OPEN: &str = "<available_skills>\n";
-    const CLOSE: &str = "</available_skills>";
-
-    fn new(entries: &[(&Skill, &PathBuf)], max_chars: usize, shorten_paths: bool) -> Self {
-        let mut counts = HashMap::new();
-        for (_, root) in entries {
-            *counts.entry(*root).or_insert(0usize) += 1;
-        }
-        let mut roots = Vec::new();
-        let mut aliases = HashMap::new();
-        let rows = entries.iter().map(|(skill, root)| {
-            let description = match skill.description.char_indices().nth(max_chars) {
-                Some((index, _)) => skill.description[..index].to_owned(),
-                None => skill.description.clone(),
-            };
-            let (location, alias) = match skill.file_path.strip_prefix(root) {
-                Ok(relative) if shorten_paths && counts[root] > 1 => {
-                    let alias = *aliases.entry(*root).or_insert_with(|| {
-                        let index = roots.len();
-                        roots.push(format!("<skill_root alias=\"r{index}\">{}</skill_root>\n", escape_xml(&root.to_string_lossy())));
-                        index
-                    });
-                    (format!("r{alias}/{}", relative.to_string_lossy()), Some(alias))
-                }
-                _ => (skill.file_path.to_string_lossy().into_owned(), None),
-            };
-            let row = format!("  <skill><name>{}</name><description>{}</description><location>{}</location></skill>\n",
-                escape_xml(&skill.name), escape_xml(&description), escape_xml(&location));
-            (row, alias)
-        }).collect();
-        Self { rows, roots }
-    }
-
-    fn size(&self) -> usize {
-        Self::OPEN.len()
-            + Self::CLOSE.len()
-            + self.rows.iter().map(|(row, _)| row.len()).sum::<usize>()
-            + self.roots.iter().map(String::len).sum::<usize>()
-    }
-
-    fn render(&self, budget: usize) -> Option<String> {
-        let notice = |omitted| {
-            format!(
-                "<truncated count=\"{omitted}\">Use skill_search to find additional skills.</truncated>\n"
-            )
-        };
-        let needs_truncation = self.size() > budget;
-        let mut size = Self::OPEN.len() + Self::CLOSE.len();
-        let mut included = 0;
-        let mut used_roots = 0;
-        for (index, (row, alias)) in self.rows.iter().enumerate() {
-            let root_size = alias
-                .filter(|&i| i == used_roots)
-                .map_or(0, |i| self.roots[i].len());
-            let omitted = self.rows.len() - index - 1;
-            let notice_size = if omitted > 0 {
-                notice(omitted).len()
-            } else {
-                0
-            };
-            if needs_truncation && size + row.len() + root_size + notice_size > budget {
-                break;
-            }
-            size += row.len() + root_size;
-            used_roots += usize::from(root_size != 0);
-            included += 1;
-        }
-        let mut xml = Self::OPEN.to_owned();
-        for root in &self.roots[..used_roots] {
-            xml.push_str(root);
-        }
-        for (row, _) in &self.rows[..included] {
-            xml.push_str(row);
-        }
-        if included < self.rows.len() {
-            xml.push_str(&notice(self.rows.len() - included));
-        }
-        xml.push_str(Self::CLOSE);
-        (xml.len() <= budget).then_some(xml)
+        xml.push_str("</available_skills>");
+        Some(xml)
     }
 }
 
@@ -431,7 +286,7 @@ impl SkillScanner {
         };
         let skill = dir.join("SKILL.md");
         if skill.is_file() {
-            self.collect_file(&skill, root);
+            self.collect_file(&skill);
             return;
         }
         let mut paths: Vec<_> = entries
@@ -448,12 +303,12 @@ impl SkillScanner {
             if path.is_dir() {
                 self.scan_dir(&path, root);
             } else if dir == root && is_markdown_file(&path) {
-                self.collect_file(&path, root);
+                self.collect_file(&path);
             }
         }
     }
 
-    fn collect_file(&mut self, path: &Path, root: &Path) {
+    fn collect_file(&mut self, path: &Path) {
         let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !self.seen_paths.insert(canonical.clone()) {
             return;
@@ -508,7 +363,6 @@ impl SkillScanner {
             .filter(|text| !text.trim().is_empty())
             .or_else(|| extract_fallback_description(parsed.body))
             .unwrap_or_else(|| name.clone());
-        self.catalog.skill_roots.push(root.to_path_buf());
         self.catalog.skills.push(Skill {
             name,
             description,
@@ -708,69 +562,4 @@ pub(crate) fn escape_xml(input: &str) -> String {
         }
     }
     out
-}
-
-pub const SKILL_SEARCH_NAME: &str = "skill_search";
-
-/// Searches implicitly invocable skills and returns their full file paths.
-pub struct SkillSearchTool {
-    catalog: Arc<Mutex<SkillCatalog>>,
-}
-
-impl SkillSearchTool {
-    pub fn new(catalog: SkillCatalog) -> Self {
-        Self::shared(Arc::new(Mutex::new(catalog)))
-    }
-
-    pub fn shared(catalog: Arc<Mutex<SkillCatalog>>) -> Self {
-        Self { catalog }
-    }
-}
-
-impl AgentTool for SkillSearchTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: SKILL_SEARCH_NAME.into(),
-            description:
-                "Find available skills by name or description and return their file paths.".into(),
-            parameters: obj_schema([
-                ("query", str_schema(), true),
-                (
-                    "limit",
-                    with_bounds(int_schema(), Some(1.0), Some(20.0)),
-                    false,
-                ),
-            ]),
-        }
-    }
-
-    fn execute(
-        &self,
-        _tool_call_id: String,
-        args: Value,
-        _cancel: CancelToken,
-        _on_update: ToolProgressCallback,
-    ) -> BoxFuture<'_, Result<AgentToolResult, String>> {
-        Box::pin(async move {
-            let query = args["query"]
-                .as_str()
-                .ok_or("A search query is required.")?;
-            let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
-            let catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
-            let matches: Vec<_> = search_matching(query, limit, catalog.visible())
-                .into_iter()
-                .map(|skill| {
-                    json!({
-                        "name": skill.name,
-                        "description": skill.description,
-                        "location": skill.file_path.to_string_lossy(),
-                    })
-                })
-                .collect();
-            let payload = json!({ "skills": matches });
-            let mut result = AgentToolResult::text(payload.to_string());
-            result.structured_content = Some(payload);
-            Ok(result)
-        })
-    }
 }
