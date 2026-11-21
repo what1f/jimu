@@ -43,6 +43,8 @@ pub struct CodexAuthorizationRequest {
 pub struct ParsedAuthInput {
     pub code: Option<String>,
     pub state: Option<String>,
+    /// True when the input was structured (URL, query string, or `code#state`) and MUST carry a matching `state`.
+    pub requires_state: bool,
 }
 
 /// OpenAI Codex OAuth credentials (ChatGPT subscription).
@@ -199,32 +201,7 @@ fn encode_form_pairs(pairs: &[(&str, &str)]) -> String {
 }
 
 fn fill_random_bytes(dest: &mut [u8]) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::fs::File;
-        use std::io::Read;
-        let mut f =
-            File::open("/dev/urandom").map_err(|e| format!("failed to open /dev/urandom: {e}"))?;
-        f.read_exact(dest)
-            .map_err(|e| format!("failed to read random bytes from /dev/urandom: {e}"))
-    }
-    #[cfg(not(unix))]
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        let mut offset = 0usize;
-        while offset < dest.len() {
-            let mut hasher = Sha256::new();
-            hasher.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-            hasher.update(now_ms().to_le_bytes());
-            hasher.update((dest.as_ptr() as usize).to_le_bytes());
-            let digest = hasher.finalize();
-            let take = (dest.len() - offset).min(digest.len());
-            dest[offset..offset + take].copy_from_slice(&digest[..take]);
-            offset += take;
-        }
-        Ok(())
-    }
+    getrandom::fill(dest).map_err(|e| format!("failed to obtain OS cryptographic randomness: {e}"))
 }
 
 fn encode_hex_lower(bytes: &[u8]) -> String {
@@ -295,7 +272,10 @@ pub fn start_codex_authorization(
 }
 
 fn parse_query_params(query: &str) -> ParsedAuthInput {
-    let mut out = ParsedAuthInput::default();
+    let mut out = ParsedAuthInput {
+        requires_state: true,
+        ..ParsedAuthInput::default()
+    };
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
@@ -325,22 +305,30 @@ pub fn parse_authorization_input(input: &str) -> ParsedAuthInput {
         return parse_query_params(query);
     }
 
-    if !value.contains("://")
-        && let Some((code, state)) = value.split_once('#')
-    {
+    if value.contains("://") {
         return ParsedAuthInput {
-            code: (!code.is_empty()).then(|| code.to_string()),
-            state: (!state.is_empty()).then(|| state.to_string()),
+            code: None,
+            state: None,
+            requires_state: true,
         };
     }
 
-    if value.contains("code=") {
+    if let Some((code, state)) = value.split_once('#') {
+        return ParsedAuthInput {
+            code: (!code.is_empty()).then(|| code.to_string()),
+            state: (!state.is_empty()).then(|| state.to_string()),
+            requires_state: true,
+        };
+    }
+
+    if value.contains("code=") || value.contains("state=") {
         return parse_query_params(value);
     }
 
     ParsedAuthInput {
         code: Some(value.to_string()),
         state: None,
+        requires_state: false,
     }
 }
 
@@ -506,8 +494,8 @@ fn credentials_from_token_json(
         .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
         .map(|secs| now_ms().saturating_add(secs.saturating_mul(1000)));
 
-    let account_id = extract_account_id(&access_token)
-        .or_else(|| fallback_account.map(ToString::to_string));
+    let account_id =
+        extract_account_id(&access_token).or_else(|| fallback_account.map(ToString::to_string));
 
     CodexCredentials {
         access_token,
@@ -528,7 +516,11 @@ pub async fn exchange_codex_code(
     cancel: CancelToken,
 ) -> Result<CodexCredentials, TransportError> {
     let parsed = parse_authorization_input(callback_input);
-    if let Some(state) = parsed.state.as_deref()
+    if parsed.requires_state {
+        if parsed.state.as_deref() != Some(auth.state.as_str()) {
+            return Err(TransportError::Network("OAuth state mismatch".into()));
+        }
+    } else if let Some(state) = parsed.state.as_deref()
         && state != auth.state
     {
         return Err(TransportError::Network("OAuth state mismatch".into()));
@@ -735,14 +727,25 @@ pub async fn fetch_codex_models(
             .or_else(|| item.get("supportsFast"))
             .and_then(Value::as_bool)
             .unwrap_or_else(|| {
-                item.get("service_tiers")
+                let has_priority_tier = item
+                    .get("service_tiers")
                     .and_then(Value::as_array)
                     .is_some_and(|tiers| {
                         tiers.iter().any(|t| {
                             t.as_str()
+                                .or_else(|| t.get("id").and_then(Value::as_str))
                                 .is_some_and(|s| s.eq_ignore_ascii_case("priority"))
                         })
-                    })
+                    });
+                let has_fast_speed_tier = item
+                    .get("additional_speed_tiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tiers| {
+                        tiers
+                            .iter()
+                            .any(|t| t.as_str().is_some_and(|s| s.eq_ignore_ascii_case("fast")))
+                    });
+                has_priority_tier || has_fast_speed_tier
             });
 
         models.push(CodexCatalogModel {

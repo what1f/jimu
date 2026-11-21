@@ -10,6 +10,7 @@ pub struct Skill {
     pub file_path: PathBuf,
     pub base_dir: PathBuf,
     pub disable_model_invocation: bool,
+    pub revision: String,
 }
 
 /// Non-fatal diagnostic encountered while scanning skill roots.
@@ -231,12 +232,14 @@ fn collect_file(
         return;
     }
 
+    let revision = pikra_ai::transform::short_hash(&raw);
     skills.push(Skill {
         name,
         description,
         file_path: path.to_path_buf(),
         base_dir,
         disable_model_invocation: parsed.disable_model_invocation,
+        revision,
     });
 }
 
@@ -344,7 +347,8 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter<'_> {
             "name" => name = Some(value),
             "description" => description = Some(value),
             "disable-model-invocation" | "disable_model_invocation" => {
-                disable_model_invocation = matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
+                disable_model_invocation =
+                    matches!(value.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
             }
             _ => {}
         }

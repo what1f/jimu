@@ -47,7 +47,10 @@ impl<'a> ValidateCtx<'a> {
     }
 
     fn key_pair(node: &Value, value: &Value) -> (usize, usize) {
-        (node as *const Value as usize, value as *const Value as usize)
+        (
+            node as *const Value as usize,
+            value as *const Value as usize,
+        )
     }
 
     fn check(&mut self, node: &'a Value, value: &Value) -> bool {
@@ -93,7 +96,9 @@ impl<'a> ValidateCtx<'a> {
         }
 
         if let Some(enum_vals) = map.get("enum").and_then(Value::as_array)
-            && !enum_vals.iter().any(|candidate| json_equal(value, candidate))
+            && !enum_vals
+                .iter()
+                .any(|candidate| json_equal(value, candidate))
         {
             return false;
         }
@@ -209,13 +214,7 @@ impl<'a> ValidateCtx<'a> {
         true
     }
 
-    fn walk(
-        &mut self,
-        node: &'a Value,
-        value: &Value,
-        path: &str,
-        out: &mut Vec<ValidationIssue>,
-    ) {
+    fn walk(&mut self, node: &'a Value, value: &Value, path: &str, out: &mut Vec<ValidationIssue>) {
         match node {
             Value::Bool(true) => return,
             Value::Bool(false) => {
@@ -275,7 +274,9 @@ impl<'a> ValidateCtx<'a> {
         }
 
         if let Some(enum_vals) = map.get("enum").and_then(Value::as_array)
-            && !enum_vals.iter().any(|candidate| json_equal(value, candidate))
+            && !enum_vals
+                .iter()
+                .any(|candidate| json_equal(value, candidate))
         {
             out.push(ValidationIssue {
                 path: path.to_string(),
@@ -490,7 +491,10 @@ impl<'a> ValidateCtx<'a> {
     }
 
     fn resolve_if_ref(&self, node: &'a Value) -> &'a Value {
-        if let Some(ref_str) = node.as_object().and_then(|m| m.get("$ref")).and_then(Value::as_str)
+        if let Some(ref_str) = node
+            .as_object()
+            .and_then(|m| m.get("$ref"))
+            .and_then(Value::as_str)
             && let Ok(target) = resolve_pointer(self.root, ref_str)
         {
             return target;
@@ -577,12 +581,7 @@ fn check_string(schema: &Map<String, Value>, s: &str) -> bool {
     true
 }
 
-fn walk_string(
-    schema: &Map<String, Value>,
-    s: &str,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
+fn walk_string(schema: &Map<String, Value>, s: &str, path: &str, out: &mut Vec<ValidationIssue>) {
     let min_len = schema.get("minLength");
     let max_len = schema.get("maxLength");
     if min_len.is_some() || max_len.is_some() {

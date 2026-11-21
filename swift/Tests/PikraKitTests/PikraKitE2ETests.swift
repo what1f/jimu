@@ -793,9 +793,12 @@ struct PikraKitE2ETests {
             .replacingOccurrences(of: "=", with: "")
         #expect(queryMap["code_challenge"] == expectedChallenge)
 
-        // State mismatch must throw
+        // State mismatch or missing state in callback URL must throw
         await #expect(throws: PikraCodexOAuthError.stateMismatch) {
             _ = try await oauth.completeAuthorization(auth, callback: "http://localhost:1455/auth/callback?code=abc&state=wrong")
+        }
+        await #expect(throws: PikraCodexOAuthError.stateMismatch) {
+            _ = try await oauth.completeAuthorization(auth, callback: "http://localhost:1455/auth/callback?code=abc")
         }
 
         // Complete via full callback URL
@@ -813,15 +816,21 @@ struct PikraKitE2ETests {
         let exchangedHash = try await oauth.completeAuthorization(auth, callback: "auth_code_hash#\(auth.state)")
         #expect(exchangedHash.accountID == "acct_initial_123")
 
-        // Coalesce concurrent refreshes through PikraCodexSubscription
+        // Coalesce concurrent refreshes through PikraCodexSubscription (persisting refreshed credentials in store)
         actor SavedCreds {
+            var current: PikraCodexCredentials
             var list: [PikraCodexCredentials] = []
-            func append(_ c: PikraCodexCredentials) { list.append(c) }
+            init(initial: PikraCodexCredentials) { self.current = initial }
+            func load() -> PikraCodexCredentials { current }
+            func append(_ c: PikraCodexCredentials) {
+                current = c
+                list.append(c)
+            }
             func all() -> [PikraCodexCredentials] { list }
         }
-        let savedCreds = SavedCreds()
+        let savedCreds = SavedCreds(initial: exchanged)
         let subscription = PikraCodexSubscription(
-            credentials: { exchanged },
+            credentials: { await savedCreds.load() },
             onRefresh: { updated in await savedCreds.append(updated) },
             httpClient: oauthMockClient
         )
@@ -840,13 +849,29 @@ struct PikraKitE2ETests {
         #expect(await savedCreds.all().count == 1)
         #expect(await oauthMockClient.recordedRequests().count == 3)
 
-        // Wire subscription.requestAuthorizer into PikraAgent and verify dynamic headers on outbound LLM request
+        // Wire subscription.requestAuthorizer into PikraAgent (Codex endpoint) and verify dynamic headers + cross-origin protection
+        let codexChunks = [
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r_codex_1\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"Authorized ok\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r_codex_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"total_tokens\":16}}}\n\n",
+        ]
         let llmClient = MockSSEClient(handlers: [
-            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Authorized ok")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: codexChunks) },
         ])
+        let codexModel = PikraModel(
+            id: "gpt-5.4",
+            name: "GPT-5.4",
+            provider: "openai-codex",
+            api: .openaiCodexResponses,
+            baseURL: PikraCodexOAuth.codexBaseURL,
+            contextWindow: 128_000,
+            maxOutputTokens: 8_192,
+            supportsImages: true,
+            supportsReasoning: true
+        )
         let agent = try await PikraAgent.open(
             configuration: PikraConfiguration(
-                model: testModel(),
+                model: codexModel,
                 systemPrompt: "Auth test",
                 httpClient: llmClient,
                 authorizeRequest: subscription.requestAuthorizer
@@ -865,6 +890,16 @@ struct PikraKitE2ETests {
         #expect(headerMap["chatgpt-account-id"] == "acct_initial_123")
         #expect(headerMap["openai-beta"] == "responses=experimental")
         #expect(headerMap["originator"] == "pikra")
+
+        // Switching to a non-Codex host MUST reject attaching ChatGPT bearer tokens before hitting network
+        try await agent.setModel(testModel())
+        let blockedEvents = try await collectEvents(try await agent.prompt("Should not leak token"))
+        if case .turnEnded(let reason, _, _) = blockedEvents.last {
+            #expect(reason == .error)
+        } else {
+            Issue.record("Expected blocked cross-origin request to end in .error")
+        }
+        #expect(await llmClient.recordedRequests().count == 1)
 
         await agent.close()
     }

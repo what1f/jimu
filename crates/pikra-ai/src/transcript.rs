@@ -44,7 +44,8 @@ impl TranscriptContext {
                     for (name, value) in &sys.sections {
                         match value {
                             Some(text) => {
-                                if let Some(existing) = sections.iter_mut().find(|(k, _)| k == name) {
+                                if let Some(existing) = sections.iter_mut().find(|(k, _)| k == name)
+                                {
                                     existing.1 = text.clone();
                                 } else {
                                     sections.push((name.clone(), text.clone()));

@@ -39,9 +39,12 @@ pub(crate) async fn atomic_write_file(target: &Path, bytes: &[u8]) -> Result<(),
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|e| format!("failed to create parent directories for '{}': {e}", target.display()))?;
+    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+        format!(
+            "failed to create parent directories for '{}': {e}",
+            target.display()
+        )
+    })?;
 
     let existing_perms = tokio::fs::metadata(target)
         .await
@@ -79,10 +82,12 @@ async fn write_and_rename(
         opts.mode(0o600);
     }
 
-    let mut file = opts
-        .open(tmp_path)
-        .await
-        .map_err(|e| format!("failed to create temporary file for '{}': {e}", target.display()))?;
+    let mut file = opts.open(tmp_path).await.map_err(|e| {
+        format!(
+            "failed to create temporary file for '{}': {e}",
+            target.display()
+        )
+    })?;
 
     file.write_all(bytes)
         .await
@@ -95,7 +100,12 @@ async fn write_and_rename(
     if let Some(perms) = existing_perms {
         tokio::fs::set_permissions(tmp_path, perms)
             .await
-            .map_err(|e| format!("failed to preserve permissions on '{}': {e}", target.display()))?;
+            .map_err(|e| {
+                format!(
+                    "failed to preserve permissions on '{}': {e}",
+                    target.display()
+                )
+            })?;
     }
 
     tokio::fs::rename(tmp_path, target)
@@ -178,7 +188,8 @@ pub fn truncate_output(text: &str, max_bytes: usize) -> TruncatedOutput {
     let tail_budget = avail - head_budget;
 
     let head_end = floor_char_boundary(text, head_budget);
-    let tail_start = ceil_char_boundary(text, original_bytes.saturating_sub(tail_budget)).max(head_end);
+    let tail_start =
+        ceil_char_boundary(text, original_bytes.saturating_sub(tail_budget)).max(head_end);
     let omitted_bytes = tail_start.saturating_sub(head_end);
 
     let marker = if padded {

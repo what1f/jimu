@@ -6,7 +6,7 @@ use crate::types::{
     TaskCheckpoint,
 };
 use pikra_session::SessionEntry;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,12 +52,12 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
 
 CREATE TABLE IF NOT EXISTS completed_tools (
     conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-    tool_call_id TEXT NOT NULL,
     assistant_entry_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
     tool_name TEXT NOT NULL,
     record_json TEXT NOT NULL,
     completed_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (conversation_id, tool_call_id)
+    PRIMARY KEY (conversation_id, assistant_entry_id, tool_call_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_completed_tools_assistant
@@ -126,7 +126,7 @@ impl SqliteDurableStore {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         }
-        Self::configure_and_init(&conn)?;
+        Self::configure_and_init(&conn, true)?;
         Ok(Self {
             conn: Mutex::new(conn),
             path: Some(path),
@@ -136,7 +136,7 @@ impl SqliteDurableStore {
     /// Open an isolated `:memory:` SQLite database.
     pub fn open_in_memory() -> Result<Self, DurableError> {
         let conn = Connection::open_in_memory()?;
-        Self::configure_and_init(&conn)?;
+        Self::configure_and_init(&conn, false)?;
         Ok(Self {
             conn: Mutex::new(conn),
             path: None,
@@ -147,13 +147,14 @@ impl SqliteDurableStore {
         self.path.as_deref()
     }
 
-    fn configure_and_init(conn: &Connection) -> Result<(), DurableError> {
-        conn.execute_batch(
+    fn configure_and_init(conn: &Connection, durable_fsync: bool) -> Result<(), DurableError> {
+        let sync_mode = if durable_fsync { "FULL" } else { "NORMAL" };
+        conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = {sync_mode};
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )?;
+             PRAGMA busy_timeout = 5000;"
+        ))?;
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(())
     }
@@ -392,14 +393,15 @@ impl DurableStore for SqliteDurableStore {
     fn get_completed_tool(
         &self,
         conversation_id: &str,
+        assistant_entry_id: &str,
         tool_call_id: &str,
     ) -> Result<Option<CompletedToolRecord>, DurableError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json: Option<String> = conn
             .query_row(
                 "SELECT record_json FROM completed_tools
-                 WHERE conversation_id = ?1 AND tool_call_id = ?2",
-                params![conversation_id, tool_call_id],
+                 WHERE conversation_id = ?1 AND assistant_entry_id = ?2 AND tool_call_id = ?3",
+                params![conversation_id, assistant_entry_id, tool_call_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -508,32 +510,44 @@ impl DurableStore for SqliteDurableStore {
         }))
     }
 
-    fn peek_unconsumed_signal(
+    fn peek_next_unconsumed_signal(
         &self,
         conversation_id: &str,
         signal_key: &str,
+        exclude_signal_ids: &[String],
+        max_received_at_ms: Option<u64>,
     ) -> Result<Option<SignalRecord>, DurableError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let row = conn
-            .query_row(
-                "SELECT conversation_id, signal_id, signal_key, payload_json, received_at_ms, consumed_at_ms
-                 FROM signals
-                 WHERE conversation_id = ?1 AND signal_key = ?2 AND consumed_at_ms IS NULL
-                 ORDER BY seq ASC LIMIT 1",
-                params![conversation_id, signal_key],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(Self::decode_signal).transpose()
+        query_next_unconsumed_signal(
+            &conn,
+            conversation_id,
+            signal_key,
+            exclude_signal_ids,
+            max_received_at_ms,
+        )
+    }
+
+    fn commit_or_peek_signal(
+        &self,
+        tx: CommitBatch,
+        signal_key: &str,
+        exclude_signal_ids: &[String],
+        max_received_at_ms: Option<u64>,
+    ) -> Result<Result<CommitReceipt, SignalRecord>, DurableError> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(sig) = query_next_unconsumed_signal(
+            &db_tx,
+            &tx.conversation_id,
+            signal_key,
+            exclude_signal_ids,
+            max_received_at_ms,
+        )? {
+            return Ok(Err(sig));
+        }
+        let receipt = execute_commit_in_tx(&db_tx, tx)?;
+        db_tx.commit()?;
+        Ok(Ok(receipt))
     }
 
     fn list_signals(&self, conversation_id: &str) -> Result<Vec<SignalRecord>, DurableError> {
@@ -610,211 +624,313 @@ impl DurableStore for SqliteDurableStore {
     fn commit(&self, tx: CommitBatch) -> Result<CommitReceipt, DurableError> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = execute_commit_in_tx(&db_tx, tx)?;
+        db_tx.commit()?;
+        Ok(receipt)
+    }
+}
 
-        if let Some(conv) = &tx.upsert_conversation {
-            let model_json = serde_json::to_string(&conv.active_model)?;
-            db_tx.execute(
-                "INSERT INTO conversations (
-                    conversation_id, session_id, head_entry_id, status,
-                    active_model_json, system_prompt, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(conversation_id) DO UPDATE SET
-                    session_id = excluded.session_id,
-                    head_entry_id = excluded.head_entry_id,
-                    status = excluded.status,
-                    active_model_json = excluded.active_model_json,
-                    system_prompt = excluded.system_prompt,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![
-                    &conv.conversation_id,
-                    &conv.session_id,
-                    &conv.head_entry_id,
-                    conv.status.as_str(),
-                    &model_json,
-                    &conv.system_prompt,
-                    conv.created_at_ms as i64,
-                    tx.now_ms as i64,
-                ],
-            )?;
+fn query_next_unconsumed_signal(
+    conn: &Connection,
+    conversation_id: &str,
+    signal_key: &str,
+    exclude_signal_ids: &[String],
+    max_received_at_ms: Option<u64>,
+) -> Result<Option<SignalRecord>, DurableError> {
+    let max_ts = max_received_at_ms.map(|v| v as i64).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id, signal_id, signal_key, payload_json, received_at_ms, consumed_at_ms
+         FROM signals
+         WHERE conversation_id = ?1
+           AND signal_key = ?2
+           AND consumed_at_ms IS NULL
+           AND received_at_ms <= ?3
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map(params![conversation_id, signal_key, max_ts], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })?;
+    for r in rows {
+        let tuple = r?;
+        if !exclude_signal_ids.iter().any(|id| id == &tuple.1) {
+            return SqliteDurableStore::decode_signal(tuple).map(Some);
         }
+    }
+    Ok(None)
+}
 
-        let current_head: Option<Option<String>> = db_tx
+fn validate_sqlite_batch_ids(tx: &CommitBatch) -> Result<(), DurableError> {
+    if let Some(conv) = &tx.upsert_conversation
+        && conv.conversation_id != tx.conversation_id
+    {
+        return Err(DurableError::InvalidState(format!(
+            "CommitBatch conversation_id mismatch in upsert_conversation: expected {}, got {}",
+            tx.conversation_id, conv.conversation_id
+        )));
+    }
+    if let Some(sub) = &tx.upsert_submission
+        && sub.conversation_id != tx.conversation_id
+    {
+        return Err(DurableError::InvalidState(format!(
+            "CommitBatch conversation_id mismatch in upsert_submission: expected {}, got {}",
+            tx.conversation_id, sub.conversation_id
+        )));
+    }
+    for tool_rec in &tx.record_completed_tools {
+        if tool_rec.conversation_id != tx.conversation_id {
+            return Err(DurableError::InvalidState(format!(
+                "CommitBatch conversation_id mismatch in record_completed_tools: expected {}, got {}",
+                tx.conversation_id, tool_rec.conversation_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn execute_commit_in_tx(
+    db_tx: &rusqlite::Transaction<'_>,
+    tx: CommitBatch,
+) -> Result<CommitReceipt, DurableError> {
+    validate_sqlite_batch_ids(&tx)?;
+
+    if tx.require_no_checkpoint {
+        let existing_cp: Option<String> = db_tx
             .query_row(
-                "SELECT head_entry_id FROM conversations WHERE conversation_id = ?1",
+                "SELECT checkpoint_json FROM task_checkpoints WHERE conversation_id = ?1",
                 params![&tx.conversation_id],
                 |r| r.get(0),
             )
             .optional()?;
-        let mut head_entry_id = match current_head {
-            Some(h) => h,
-            None => return Err(DurableError::ConversationNotFound(tx.conversation_id)),
-        };
-
-        if let Some(status) = tx.update_status {
-            db_tx.execute(
-                "UPDATE conversations SET status = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
-                params![status.as_str(), tx.now_ms as i64, &tx.conversation_id],
-            )?;
+        if let Some(cp_json) = existing_cp {
+            let active_sub_id = serde_json::from_str::<TaskCheckpoint>(&cp_json)
+                .map(|cp| cp.submission_id().to_string())
+                .unwrap_or_default();
+            return Err(DurableError::ConversationBusy {
+                conversation_id: tx.conversation_id,
+                active_submission_id: active_sub_id,
+            });
         }
+    }
 
-        if let Some(model) = &tx.update_model {
-            let model_json = serde_json::to_string(model)?;
-            db_tx.execute(
-                "UPDATE conversations SET active_model_json = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
-                params![&model_json, tx.now_ms as i64, &tx.conversation_id],
-            )?;
-        }
+    if let Some(conv) = &tx.upsert_conversation {
+        let model_json = serde_json::to_string(&conv.active_model)?;
+        db_tx.execute(
+            "INSERT INTO conversations (
+                conversation_id, session_id, head_entry_id, status,
+                active_model_json, system_prompt, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                head_entry_id = excluded.head_entry_id,
+                status = excluded.status,
+                active_model_json = excluded.active_model_json,
+                system_prompt = excluded.system_prompt,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                &conv.conversation_id,
+                &conv.session_id,
+                &conv.head_entry_id,
+                conv.status.as_str(),
+                &model_json,
+                &conv.system_prompt,
+                conv.created_at_ms as i64,
+                tx.now_ms as i64,
+            ],
+        )?;
+    }
 
-        let mut last_seq: i64 = db_tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM transcript_entries WHERE conversation_id = ?1",
+    let current_head: Option<Option<String>> = db_tx
+        .query_row(
+            "SELECT head_entry_id FROM conversations WHERE conversation_id = ?1",
             params![&tx.conversation_id],
             |r| r.get(0),
+        )
+        .optional()?;
+    let mut head_entry_id = match current_head {
+        Some(h) => h,
+        None => return Err(DurableError::ConversationNotFound(tx.conversation_id)),
+    };
+
+    if let Some(expected_head) = &tx.expected_head_entry_id
+        && &head_entry_id != expected_head
+    {
+        return Err(DurableError::Conflict {
+            conversation_id: tx.conversation_id,
+            key: "__head_entry_id__".into(),
+            expected: None,
+            actual: None,
+        });
+    }
+
+    if let Some(status) = tx.update_status {
+        db_tx.execute(
+            "UPDATE conversations SET status = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
+            params![status.as_str(), tx.now_ms as i64, &tx.conversation_id],
         )?;
+    }
 
-        if !tx.append_entries.is_empty() {
-            for entry in &tx.append_entries {
-                last_seq += 1;
-                let entry_json = serde_json::to_string(entry)?;
-                db_tx.execute(
-                    "INSERT INTO transcript_entries (
-                        conversation_id, seq, entry_id, parent_id, entry_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        &tx.conversation_id,
-                        last_seq,
-                        &entry.id,
-                        &entry.parent_id,
-                        &entry_json,
-                    ],
-                )?;
-                head_entry_id = Some(entry.id.clone());
-            }
+    if let Some(model) = &tx.update_model {
+        let model_json = serde_json::to_string(model)?;
+        db_tx.execute(
+            "UPDATE conversations SET active_model_json = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
+            params![&model_json, tx.now_ms as i64, &tx.conversation_id],
+        )?;
+    }
+
+    let mut last_seq: i64 = db_tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM transcript_entries WHERE conversation_id = ?1",
+        params![&tx.conversation_id],
+        |r| r.get(0),
+    )?;
+
+    if !tx.append_entries.is_empty() {
+        for entry in &tx.append_entries {
+            last_seq += 1;
+            let entry_json = serde_json::to_string(entry)?;
             db_tx.execute(
-                "UPDATE conversations SET head_entry_id = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
-                params![&head_entry_id, tx.now_ms as i64, &tx.conversation_id],
-            )?;
-        } else {
-            db_tx.execute(
-                "UPDATE conversations SET updated_at_ms = ?1 WHERE conversation_id = ?2",
-                params![tx.now_ms as i64, &tx.conversation_id],
-            )?;
-        }
-
-        if let Some(sub) = &tx.upsert_submission {
-            let state_json = serde_json::to_string(&sub.state)?;
-            db_tx.execute(
-                "INSERT INTO submissions (
-                    conversation_id, submission_id, user_entry_id, state_json, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(conversation_id, submission_id) DO UPDATE SET
-                    user_entry_id = excluded.user_entry_id,
-                    state_json = excluded.state_json,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![
-                    &sub.conversation_id,
-                    &sub.submission_id,
-                    &sub.user_entry_id,
-                    &state_json,
-                    sub.created_at_ms as i64,
-                    sub.updated_at_ms as i64,
-                ],
-            )?;
-        }
-
-        match &tx.checkpoint {
-            CheckpointMutation::Unchanged => {}
-            CheckpointMutation::Set(cp) => {
-                let cp_json = serde_json::to_string(cp)?;
-                db_tx.execute(
-                    "INSERT INTO task_checkpoints (conversation_id, checkpoint_json, updated_at_ms)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(conversation_id) DO UPDATE SET
-                        checkpoint_json = excluded.checkpoint_json,
-                        updated_at_ms = excluded.updated_at_ms",
-                    params![&tx.conversation_id, &cp_json, tx.now_ms as i64],
-                )?;
-            }
-            CheckpointMutation::Clear => {
-                db_tx.execute(
-                    "DELETE FROM task_checkpoints WHERE conversation_id = ?1",
-                    params![&tx.conversation_id],
-                )?;
-            }
-        }
-
-        for tool_rec in &tx.record_completed_tools {
-            let rec_json = serde_json::to_string(tool_rec)?;
-            db_tx.execute(
-                "INSERT INTO completed_tools (
-                    conversation_id, tool_call_id, assistant_entry_id, tool_name, record_json, completed_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(conversation_id, tool_call_id) DO NOTHING",
-                params![
-                    &tool_rec.conversation_id,
-                    &tool_rec.tool_call_id,
-                    &tool_rec.assistant_entry_id,
-                    &tool_rec.tool_name,
-                    &rec_json,
-                    tool_rec.completed_at_ms as i64,
-                ],
-            )?;
-        }
-
-        for sig_id in &tx.consume_signal_ids {
-            db_tx.execute(
-                "UPDATE signals SET consumed_at_ms = ?1
-                 WHERE conversation_id = ?2 AND signal_id = ?3 AND consumed_at_ms IS NULL",
-                params![tx.now_ms as i64, &tx.conversation_id, sig_id],
-            )?;
-        }
-
-        let mut document_revisions = Vec::with_capacity(tx.document_writes.len());
-        for write in &tx.document_writes {
-            let actual: Option<u64> = db_tx
-                .query_row(
-                    "SELECT revision FROM documents WHERE conversation_id = ?1 AND doc_key = ?2",
-                    params![&tx.conversation_id, &write.key],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?
-                .map(|v| v.max(0) as u64);
-
-            if actual != write.expected_revision {
-                return Err(DurableError::Conflict {
-                    conversation_id: tx.conversation_id,
-                    key: write.key.clone(),
-                    expected: write.expected_revision,
-                    actual,
-                });
-            }
-
-            let next_rev = actual.unwrap_or(0) + 1;
-            let val_json = serde_json::to_string(&write.value)?;
-            db_tx.execute(
-                "INSERT INTO documents (conversation_id, doc_key, revision, value_json, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(conversation_id, doc_key) DO UPDATE SET
-                    revision = excluded.revision,
-                    value_json = excluded.value_json,
-                    updated_at_ms = excluded.updated_at_ms",
+                "INSERT INTO transcript_entries (
+                    conversation_id, seq, entry_id, parent_id, entry_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     &tx.conversation_id,
-                    &write.key,
-                    next_rev as i64,
-                    &val_json,
-                    tx.now_ms as i64,
+                    last_seq,
+                    &entry.id,
+                    &entry.parent_id,
+                    &entry_json,
                 ],
             )?;
-            document_revisions.push((write.key.clone(), next_rev));
+            head_entry_id = Some(entry.id.clone());
+        }
+        db_tx.execute(
+            "UPDATE conversations SET head_entry_id = ?1, updated_at_ms = ?2 WHERE conversation_id = ?3",
+            params![&head_entry_id, tx.now_ms as i64, &tx.conversation_id],
+        )?;
+    } else {
+        db_tx.execute(
+            "UPDATE conversations SET updated_at_ms = ?1 WHERE conversation_id = ?2",
+            params![tx.now_ms as i64, &tx.conversation_id],
+        )?;
+    }
+
+    if let Some(sub) = &tx.upsert_submission {
+        let state_json = serde_json::to_string(&sub.state)?;
+        db_tx.execute(
+            "INSERT INTO submissions (
+                conversation_id, submission_id, user_entry_id, state_json, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(conversation_id, submission_id) DO UPDATE SET
+                user_entry_id = excluded.user_entry_id,
+                state_json = excluded.state_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                &tx.conversation_id,
+                &sub.submission_id,
+                &sub.user_entry_id,
+                &state_json,
+                sub.created_at_ms as i64,
+                sub.updated_at_ms as i64,
+            ],
+        )?;
+    }
+
+    match &tx.checkpoint {
+        CheckpointMutation::Unchanged => {}
+        CheckpointMutation::Set(cp) => {
+            let cp_json = serde_json::to_string(cp)?;
+            db_tx.execute(
+                "INSERT INTO task_checkpoints (conversation_id, checkpoint_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                    checkpoint_json = excluded.checkpoint_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![&tx.conversation_id, &cp_json, tx.now_ms as i64],
+            )?;
+        }
+        CheckpointMutation::Clear => {
+            db_tx.execute(
+                "DELETE FROM task_checkpoints WHERE conversation_id = ?1",
+                params![&tx.conversation_id],
+            )?;
+        }
+    }
+
+    for tool_rec in &tx.record_completed_tools {
+        let rec_json = serde_json::to_string(tool_rec)?;
+        db_tx.execute(
+            "INSERT INTO completed_tools (
+                conversation_id, assistant_entry_id, tool_call_id, tool_name, record_json, completed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(conversation_id, assistant_entry_id, tool_call_id) DO NOTHING",
+            params![
+                &tx.conversation_id,
+                &tool_rec.assistant_entry_id,
+                &tool_rec.tool_call_id,
+                &tool_rec.tool_name,
+                &rec_json,
+                tool_rec.completed_at_ms as i64,
+            ],
+        )?;
+    }
+
+    for sig_id in &tx.consume_signal_ids {
+        db_tx.execute(
+            "UPDATE signals SET consumed_at_ms = ?1
+             WHERE conversation_id = ?2 AND signal_id = ?3 AND consumed_at_ms IS NULL",
+            params![tx.now_ms as i64, &tx.conversation_id, sig_id],
+        )?;
+    }
+
+    let mut document_revisions = Vec::with_capacity(tx.document_writes.len());
+    for write in &tx.document_writes {
+        let actual: Option<u64> = db_tx
+            .query_row(
+                "SELECT revision FROM documents WHERE conversation_id = ?1 AND doc_key = ?2",
+                params![&tx.conversation_id, &write.key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v.max(0) as u64);
+
+        if actual != write.expected_revision {
+            return Err(DurableError::Conflict {
+                conversation_id: tx.conversation_id,
+                key: write.key.clone(),
+                expected: write.expected_revision,
+                actual,
+            });
         }
 
-        db_tx.commit()?;
-
-        Ok(CommitReceipt {
-            conversation_id: tx.conversation_id,
-            head_entry_id,
-            last_seq: last_seq.max(0) as u64,
-            document_revisions,
-        })
+        let next_rev = actual.unwrap_or(0) + 1;
+        let val_json = serde_json::to_string(&write.value)?;
+        db_tx.execute(
+            "INSERT INTO documents (conversation_id, doc_key, revision, value_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(conversation_id, doc_key) DO UPDATE SET
+                revision = excluded.revision,
+                value_json = excluded.value_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                &tx.conversation_id,
+                &write.key,
+                next_rev as i64,
+                &val_json,
+                tx.now_ms as i64,
+            ],
+        )?;
+        document_revisions.push((write.key.clone(), next_rev));
     }
+
+    Ok(CommitReceipt {
+        conversation_id: tx.conversation_id,
+        head_entry_id,
+        last_seq: last_seq.max(0) as u64,
+        document_revisions,
+    })
 }

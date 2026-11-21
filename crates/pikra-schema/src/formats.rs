@@ -135,9 +135,9 @@ fn is_date_time(s: &str) -> bool {
             }
             if second == 60 {
                 let sign: i32 = if bytes[pos] == b'+' { 1 } else { -1 };
-                let utc_min =
-                    (hour as i32 * 60 + minute as i32 - sign * (off_h as i32 * 60 + off_m as i32))
-                        .rem_euclid(24 * 60);
+                let utc_min = (hour as i32 * 60 + minute as i32
+                    - sign * (off_h as i32 * 60 + off_m as i32))
+                    .rem_euclid(24 * 60);
                 return utc_min == 23 * 60 + 59;
             }
             true
@@ -207,7 +207,10 @@ fn is_valid_domain(domain: &str) -> bool {
         if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
             return false;
         }
-        if !bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
             return false;
         }
         last_label = label;
@@ -267,7 +270,13 @@ fn is_valid_uri_chars(rest: &str) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b <= 0x20 || b >= 0x7f || matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'^' | b'`') {
+        if b <= 0x20
+            || b >= 0x7f
+            || matches!(
+                b,
+                b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'^' | b'`'
+            )
+        {
             return false;
         }
         if b == b'%' {

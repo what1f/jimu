@@ -8,7 +8,9 @@ use crate::types::{
 use futures_channel::mpsc as async_mpsc;
 use rquickjs::context::EvalOptions;
 use rquickjs::prelude::Opt;
-use rquickjs::{Context, Ctx, Error as JsError, Exception, Function, Object, Persistent, Runtime, Value};
+use rquickjs::{
+    Context, Ctx, Error as JsError, Exception, Function, Object, Persistent, Runtime, Value,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -208,7 +210,8 @@ fn run_vm_thread(
 
     // Run inside a nested function so all `Persistent` handles are guaranteed to drop
     // before `context` and `runtime`.
-    if let Err(terminal) = run_vm_session(&runtime, &context, &config, &host_rx, &shared, deadline) {
+    if let Err(terminal) = run_vm_session(&runtime, &context, &config, &host_rx, &shared, deadline)
+    {
         shared.send_terminal(terminal);
     }
 
@@ -224,70 +227,98 @@ fn run_vm_session(
     shared: &Arc<VmShared>,
     deadline: Option<Instant>,
 ) -> Result<(), VmEvent> {
-    let tools_json = serde_json::to_string(&config.tools)
-        .map_err(|err| VmEvent::SandboxError(format!("failed to serialize tool declarations: {err}")))?;
-    let store_json = serde_json::to_string(&config.store)
-        .map_err(|err| VmEvent::SandboxError(format!("failed to serialize store snapshot: {err}")))?;
+    let tools_json = serde_json::to_string(&config.tools).map_err(|err| {
+        VmEvent::SandboxError(format!("failed to serialize tool declarations: {err}"))
+    })?;
+    let store_json = serde_json::to_string(&config.store).map_err(|err| {
+        VmEvent::SandboxError(format!("failed to serialize store snapshot: {err}"))
+    })?;
     let prelude_source = build_prelude_source();
 
     // 1. Evaluate prelude, install globals, compile user script, and invoke `run(fn)`.
-    let (settle_fn, stalled_fn) = context.with(|ctx| -> Result<(Persistent<Function<'static>>, Persistent<Function<'static>>), VmEvent> {
-        let bridge_shared = shared.clone();
-        let bridge = Function::new(
-            ctx.clone(),
-            move |kind: String, a: Opt<Value<'_>>, b: Opt<Value<'_>>, c: Opt<Value<'_>>| {
-                handle_bridge(&bridge_shared, &kind, a.0, b.0, c.0);
-            },
-        )
-        .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
+    let (settle_fn, stalled_fn) = context.with(
+        |ctx| -> Result<(Persistent<Function<'static>>, Persistent<Function<'static>>), VmEvent> {
+            let bridge_shared = shared.clone();
+            let bridge = Function::new(
+                ctx.clone(),
+                move |kind: String, a: Opt<Value<'_>>, b: Opt<Value<'_>>, c: Opt<Value<'_>>| {
+                    handle_bridge(&bridge_shared, &kind, a.0, b.0, c.0);
+                },
+            )
+            .map_err(|err| {
+                classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline)
+            })?;
 
-        let mut prelude_opts = EvalOptions::default();
-        prelude_opts.global = true;
-        prelude_opts.strict = true;
-        prelude_opts.filename = Some("codemode-prelude.js".to_string());
+            let mut prelude_opts = EvalOptions::default();
+            prelude_opts.global = true;
+            prelude_opts.strict = true;
+            prelude_opts.filename = Some("codemode-prelude.js".to_string());
 
-        let prelude_fn: Function<'_> = ctx
-            .eval_with_options(prelude_source, prelude_opts)
-            .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
+            let prelude_fn: Function<'_> = ctx
+                .eval_with_options(prelude_source, prelude_opts)
+                .map_err(|err| {
+                    classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline)
+                })?;
 
-        let api: Object<'_> = prelude_fn
-            .call((bridge, tools_json, store_json))
-            .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
+            let api: Object<'_> =
+                prelude_fn
+                    .call((bridge, tools_json, store_json))
+                    .map_err(|err| {
+                        classify_rquickjs_error(
+                            &ctx,
+                            err,
+                            &config.abort,
+                            &config.cancelled,
+                            deadline,
+                        )
+                    })?;
 
-        let settle: Function<'_> = api
-            .get("settle")
-            .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
-        let run: Function<'_> = api
-            .get("run")
-            .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
-        let stalled: Function<'_> = api
-            .get("stalled")
-            .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
+            let settle: Function<'_> = api.get("settle").map_err(|err| {
+                classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline)
+            })?;
+            let run: Function<'_> = api.get("run").map_err(|err| {
+                classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline)
+            })?;
+            let stalled: Function<'_> = api.get("stalled").map_err(|err| {
+                classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline)
+            })?;
 
-        let wrapped_code = format!("(async (tools, console) => {{{}\n}})", config.code);
-        let mut script_opts = EvalOptions::default();
-        script_opts.global = true;
-        script_opts.strict = true;
-        script_opts.filename = Some("codemode.js".to_string());
+            let wrapped_code = format!("(async (tools, console) => {{{}\n}})", config.code);
+            let mut script_opts = EvalOptions::default();
+            script_opts.global = true;
+            script_opts.strict = true;
+            script_opts.filename = Some("codemode.js".to_string());
 
-        let user_fn: Function<'_> = ctx
-            .eval_with_options(wrapped_code, script_opts)
-            .map_err(|err| classify_rquickjs_error(&ctx, err, &config.abort, &config.cancelled, deadline))?;
+            let user_fn: Function<'_> =
+                ctx.eval_with_options(wrapped_code, script_opts)
+                    .map_err(|err| {
+                        classify_rquickjs_error(
+                            &ctx,
+                            err,
+                            &config.abort,
+                            &config.cancelled,
+                            deadline,
+                        )
+                    })?;
 
-        if let Err(err) = run.call::<_, ()>((user_fn,))
-            && !shared.is_done()
-        {
-            return Err(classify_rquickjs_error(
-                &ctx,
-                err,
-                &config.abort,
-                &config.cancelled,
-                deadline,
-            ));
-        }
+            if let Err(err) = run.call::<_, ()>((user_fn,))
+                && !shared.is_done()
+            {
+                return Err(classify_rquickjs_error(
+                    &ctx,
+                    err,
+                    &config.abort,
+                    &config.cancelled,
+                    deadline,
+                ));
+            }
 
-        Ok((Persistent::save(&ctx, settle), Persistent::save(&ctx, stalled)))
-    })?;
+            Ok((
+                Persistent::save(&ctx, settle),
+                Persistent::save(&ctx, stalled),
+            ))
+        },
+    )?;
 
     if shared.is_done() {
         return Ok(());
@@ -332,10 +363,9 @@ fn run_vm_session(
 
         if shared.pending_calls.load(Ordering::Acquire) == 0 {
             let is_stalled = context.with(|ctx| -> Result<bool, VmEvent> {
-                let stalled = stalled_fn
-                    .clone()
-                    .restore(&ctx)
-                    .map_err(|err| VmEvent::SandboxError(format!("failed to restore stalled(): {err}")))?;
+                let stalled = stalled_fn.clone().restore(&ctx).map_err(|err| {
+                    VmEvent::SandboxError(format!("failed to restore stalled(): {err}"))
+                })?;
                 match stalled.call::<_, bool>(()) {
                     Ok(v) => Ok(v),
                     Err(_) if shared.is_done() => Ok(false),
@@ -388,10 +418,9 @@ fn apply_host_msg(
         HostMsg::ToolResult { id, ok, payload } => {
             shared.release_call(id);
             context.with(|ctx| -> Result<(), VmEvent> {
-                let settle = settle_fn
-                    .clone()
-                    .restore(&ctx)
-                    .map_err(|err| VmEvent::SandboxError(format!("failed to restore settle(): {err}")))?;
+                let settle = settle_fn.clone().restore(&ctx).map_err(|err| {
+                    VmEvent::SandboxError(format!("failed to restore settle(): {err}"))
+                })?;
                 let res = match payload {
                     Some(p) => settle.call::<_, ()>((id as f64, ok, p)),
                     None => settle.call::<_, ()>((id as f64, ok)),
@@ -446,9 +475,9 @@ fn drain_job_batch(
                 if let Some(reason) = check_interrupt(abort, cancelled, deadline) {
                     return Err(reason);
                 }
-                let event = job_err
-                    .0
-                    .with(|ctx| classify_caught_value(&ctx, ctx.catch(), abort, cancelled, deadline));
+                let event = job_err.0.with(|ctx| {
+                    classify_caught_value(&ctx, ctx.catch(), abort, cancelled, deadline)
+                });
                 return Err(event);
             }
         }
@@ -633,8 +662,7 @@ fn parse_script_error_json(raw: &str) -> CodemodeError {
 
 fn is_oom_error(name: Option<&str>, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    (name == Some("InternalError") && lower.contains("out of memory"))
-        || lower == "out of memory"
+    (name == Some("InternalError") && lower.contains("out of memory")) || lower == "out of memory"
 }
 
 fn classify_rquickjs_error(
@@ -676,8 +704,7 @@ fn classify_caught_value(
             return VmEvent::OutOfMemory(message);
         }
         if name.as_deref() == Some("InternalError") && message.eq_ignore_ascii_case("interrupted") {
-            return check_interrupt(abort, cancelled, deadline)
-                .unwrap_or(VmEvent::Aborted);
+            return check_interrupt(abort, cancelled, deadline).unwrap_or(VmEvent::Aborted);
         }
 
         let head = match &name {

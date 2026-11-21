@@ -119,8 +119,16 @@ async fn workspace_write_read_edit_find_e2e() {
     fs::create_dir_all(root.join("target/debug")).unwrap();
     fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
     fs::write(root.join(".git/config"), "UNIQUE_NEEDLE in git\n").unwrap();
-    fs::write(root.join("target/debug/out.rs"), "UNIQUE_NEEDLE in target\n").unwrap();
-    fs::write(root.join("node_modules/pkg/index.js"), "UNIQUE_NEEDLE in node_modules\n").unwrap();
+    fs::write(
+        root.join("target/debug/out.rs"),
+        "UNIQUE_NEEDLE in target\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("node_modules/pkg/index.js"),
+        "UNIQUE_NEEDLE in node_modules\n",
+    )
+    .unwrap();
     fs::write(root.join("blob.bin"), [0x89, b'P', b'N', b'G', 0x00, 0xFF]).unwrap();
     fs::write(root.join("empty.txt"), "").unwrap();
     fs::write(root.join("crlf.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
@@ -260,7 +268,9 @@ async fn workspace_write_read_edit_find_e2e() {
     // Turn 6: final assistant text.
     provider.enqueue_events(turn_events(
         &model,
-        vec![AssistantBlock::Text(TextContent::plain("Workspace verified."))],
+        vec![AssistantBlock::Text(TextContent::plain(
+            "Workspace verified.",
+        ))],
         StopReason::Stop,
     ));
 
@@ -336,7 +346,10 @@ async fn workspace_write_read_edit_find_e2e() {
     assert_eq!(calls.len(), 6);
     let first_sys = serde_json::to_vec(&calls[0].context.messages[0]).unwrap();
     for call in &calls[1..] {
-        assert_eq!(serde_json::to_vec(&call.context.messages[0]).unwrap(), first_sys);
+        assert_eq!(
+            serde_json::to_vec(&call.context.messages[0]).unwrap(),
+            first_sys
+        );
     }
 }
 
@@ -418,7 +431,11 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     let msgs = agent.prompt("check bash env and truncation").await.unwrap();
     let results = tool_results_from(&msgs);
     let by_id = |id: &str| -> &ToolResultMessage {
-        results.iter().copied().find(|r| r.tool_call_id == id).unwrap()
+        results
+            .iter()
+            .copied()
+            .find(|r| r.tool_call_id == id)
+            .unwrap()
     };
 
     let env_res = by_id("c_env");
@@ -433,11 +450,23 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
         "truncated output exceeded budget: {} > {max_output_bytes}",
         trunc_text.len()
     );
-    assert!(trunc_text.starts_with("HEAD_开始_"), "missing UTF-8 head: {trunc_text:?}");
-    assert!(trunc_text.ends_with("_结束_TAIL"), "missing UTF-8 tail: {trunc_text:?}");
-    assert!(trunc_text.contains("[... truncated "), "missing truncation marker: {trunc_text:?}");
+    assert!(
+        trunc_text.starts_with("HEAD_开始_"),
+        "missing UTF-8 head: {trunc_text:?}"
+    );
+    assert!(
+        trunc_text.ends_with("_结束_TAIL"),
+        "missing UTF-8 tail: {trunc_text:?}"
+    );
+    assert!(
+        trunc_text.contains("[... truncated "),
+        "missing truncation marker: {trunc_text:?}"
+    );
     assert!(trunc_text.contains(" bytes ...]"));
-    assert!(!trunc_text.contains('\u{FFFD}'), "UTF-8 char was corrupted: {trunc_text:?}");
+    assert!(
+        !trunc_text.contains('\u{FFFD}'),
+        "UTF-8 char was corrupted: {trunc_text:?}"
+    );
 
     let nonzero_res = by_id("c_nonzero");
     assert!(nonzero_res.is_error);
@@ -479,7 +508,9 @@ async fn bash_env_provider_utf8_truncation_and_process_group_cancel() {
     // Run 3 after abort: proves agent settles cleanly without spurious busy error.
     provider.enqueue_events(turn_events(
         &model,
-        vec![AssistantBlock::Text(TextContent::plain("recovered cleanly"))],
+        vec![AssistantBlock::Text(TextContent::plain(
+            "recovered cleanly",
+        ))],
         StopReason::Stop,
     ));
 

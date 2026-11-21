@@ -45,9 +45,12 @@ impl StreamProvider for Client {
         options: SimpleStreamOptions,
     ) -> AssistantEventStream {
         match &model.api {
-            ApiKind::OpenaiResponses => {
-                openai_responses::stream(self.transport.clone(), model.clone(), context.clone(), options)
-            }
+            ApiKind::OpenaiResponses => openai_responses::stream(
+                self.transport.clone(),
+                model.clone(),
+                context.clone(),
+                options,
+            ),
             ApiKind::OpenaiCodexResponses => openai_codex_responses::stream(
                 self.transport.clone(),
                 model.clone(),

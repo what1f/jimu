@@ -1,7 +1,9 @@
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
-use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_description, CompiledSchema};
-use serde_json::{json, Value};
+use pikra_schema::{
+    CompiledSchema, int_schema, obj_schema, str_schema, with_bounds, with_description,
+};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -343,7 +345,8 @@ impl CallToolGateway {
 
 impl AgentTool for CallToolGateway {
     fn definition(&self) -> ToolDefinition {
-        let name_schema = with_description(str_schema(), "Exact name of the deferred tool to call.");
+        let name_schema =
+            with_description(str_schema(), "Exact name of the deferred tool to call.");
         let args_schema = with_description(
             json!({ "type": "object" }),
             "JSON object of arguments to pass to the deferred tool.",
@@ -410,12 +413,8 @@ impl AgentTool for CallToolGateway {
                 )));
             };
 
-            let dummy_model = pikra_ai::Model::new(
-                "gateway",
-                "gateway",
-                pikra_ai::ApiKind::OpenaiResponses,
-                "",
-            );
+            let dummy_model =
+                pikra_ai::Model::new("gateway", "gateway", pikra_ai::ApiKind::OpenaiResponses, "");
             let dummy_assistant = pikra_ai::AssistantMessage {
                 content: Vec::new(),
                 api: dummy_model.api.clone(),

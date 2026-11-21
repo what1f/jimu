@@ -7,10 +7,10 @@ use pikra_ai::{
 use pikra_js::{HookKind, JsExtensionConfig, JsExtensionError, JsExtensionRuntime};
 use pikra_schema::{obj_schema, str_schema};
 use pikra_testkit::FauxProvider;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::fs;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
 fn test_model() -> Model {
@@ -378,7 +378,10 @@ export default function (pikra) {
 
     let turn1_msgs = block_on(agent.prompt("run v1")).expect("turn 1 succeeds");
     let turn1_tools = tool_result_texts(&turn1_msgs);
-    assert_eq!(turn1_tools, vec![("tc_v1".into(), false, "v1:world".into())]);
+    assert_eq!(
+        turn1_tools,
+        vec![("tc_v1".into(), false, "v1:world".into())]
+    );
 
     // Update extension file on disk to v2 with new tool behavior + new hook rules.
     fs::write(
@@ -472,7 +475,10 @@ export default function (pikra) {
         }),
         _ => false,
     });
-    assert!(saw_transformed_user, "expected transform_context v2 marker in turn 2 request");
+    assert!(
+        saw_transformed_user,
+        "expected transform_context v2 marker in turn 2 request"
+    );
 }
 
 #[test]
@@ -544,9 +550,11 @@ pikra.registerTool({
         errors.len() >= 2,
         "expected timeout errors from prepare_request and before_tool_call, got: {errors:?}"
     );
-    assert!(errors
-        .iter()
-        .all(|e| matches!(e, JsExtensionError::Timeout { timeout_ms: 50 })));
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(e, JsExtensionError::Timeout { timeout_ms: 50 }))
+    );
 
     // `before_tool_call` timeout fails safe by blocking the tool call rather than panicking or hanging.
     let tool_results = tool_result_texts(&msgs);

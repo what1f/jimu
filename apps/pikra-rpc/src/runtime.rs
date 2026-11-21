@@ -17,20 +17,20 @@ use pikra_ai::{
 use pikra_codemode::CodemodeSandboxOptions;
 use pikra_http::ReqwestTransport;
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
-use pikra_kit::{CodemodeExecTool, DeferredToolRegistry, SkillCatalog, CODEMODE_EXEC_TOOL_NAME};
+use pikra_kit::{CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool, DeferredToolRegistry, SkillCatalog};
 use pikra_session::{
-    context_block_to_agent_message, CompactionConfig, CompactionResult, JsonlSessionStore,
-    MemorySessionStore, SessionConfig, SessionEntryPayload, SessionEvent, SessionManager,
-    SessionStore,
+    CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
+    SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
+    context_block_to_agent_message,
 };
 use pikra_tools::{WorkspaceTools, WorkspaceToolsConfig};
-use serde_json::{json, Map};
+use serde_json::{Map, json};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -198,9 +198,9 @@ impl RpcRuntime {
         let api_key_resolver: ApiKeyResolver = Arc::new(move |provider_id: &str| {
             let provider_owned = provider_id.to_string();
             let env_owned = explicit_env.clone();
-            Box::pin(async move {
-                resolve_api_key_for_provider(&provider_owned, env_owned.as_deref())
-            })
+            Box::pin(
+                async move { resolve_api_key_for_provider(&provider_owned, env_owned.as_deref()) },
+            )
         });
 
         let provider_name = args
@@ -329,13 +329,7 @@ impl RpcRuntime {
     }
 
     fn current_session(&self) -> Arc<Mutex<SessionManager>> {
-        Arc::clone(
-            &self
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .session,
-        )
+        Arc::clone(&self.state.lock().unwrap_or_else(|e| e.into_inner()).session)
     }
 
     async fn reap_finished_run_locked(&self, guard: &mut Option<ActiveRunTask>) {
@@ -691,9 +685,10 @@ impl RpcRuntime {
                     return;
                 }
                 let res = match &self.js_runtime {
-                    Some(rt) => rt.reload().map(|()| {
-                        json!({ "extensions": rt.loaded_extensions() })
-                    }).map_err(|e| e.to_string()),
+                    Some(rt) => rt
+                        .reload()
+                        .map(|()| json!({ "extensions": rt.loaded_extensions() }))
+                        .map_err(|e| e.to_string()),
                     None => Ok(json!({ "extensions": Vec::<String>::new() })),
                 };
                 self.send_result(id, command_name, res);
@@ -1632,17 +1627,13 @@ async fn run_compaction_task(
 
     let tokens_before = prepared.input.tokens_before;
     is_compacting.store(true, Ordering::Release);
-    *compaction_cancel
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(cancel);
+    *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
 
     writer.send_json(&SessionEvent::CompactionStart { tokens_before });
 
     let exec_result = SessionManager::execute_prepared_compaction(&**provider, prepared).await;
 
-    *compaction_cancel
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+    *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
     is_compacting.store(false, Ordering::Release);
 
     let output = exec_result.map_err(|e| e.to_string())?;

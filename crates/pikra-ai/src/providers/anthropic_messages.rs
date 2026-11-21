@@ -118,7 +118,10 @@ fn convert_tools(tools: &[ToolDefinition], cache_control: Option<&Value>) -> Vec
 
             let mut obj = Map::new();
             obj.insert("name".into(), Value::String(tool.name.clone()));
-            obj.insert("description".into(), Value::String(tool.description.clone()));
+            obj.insert(
+                "description".into(),
+                Value::String(tool.description.clone()),
+            );
             obj.insert("input_schema".into(), Value::Object(input_schema));
             if idx + 1 == len
                 && let Some(cc) = cache_control
@@ -314,7 +317,10 @@ pub fn build_request_body(
         if let Some(cc) = &cache_control {
             sys_block.insert("cache_control".into(), cc.clone());
         }
-        body.insert("system".into(), Value::Array(vec![Value::Object(sys_block)]));
+        body.insert(
+            "system".into(),
+            Value::Array(vec![Value::Object(sys_block)]),
+        );
     }
 
     if !resolved.tools.is_empty() {
@@ -374,9 +380,16 @@ pub fn build_request_body(
 }
 
 enum OpenBlock {
-    Text { content_index: usize },
-    Thinking { content_index: usize },
-    ToolUse { content_index: usize, raw_args: String },
+    Text {
+        content_index: usize,
+    },
+    Thinking {
+        content_index: usize,
+    },
+    ToolUse {
+        content_index: usize,
+        raw_args: String,
+    },
 }
 
 pub fn stream(
@@ -529,8 +542,11 @@ pub fn stream(
                     match cb_type {
                         "text" => {
                             let content_index = output.content.len();
-                            let initial_text =
-                                cb.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                            let initial_text = cb
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
                             output
                                 .content
                                 .push(AssistantBlock::Text(TextContent::plain(initial_text)));
@@ -549,11 +565,13 @@ pub fn stream(
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
                                 .map(ToString::to_string);
-                            output.content.push(AssistantBlock::Thinking(ThinkingContent {
-                                thinking: initial_thinking,
-                                thinking_signature: initial_sig,
-                                redacted: false,
-                            }));
+                            output
+                                .content
+                                .push(AssistantBlock::Thinking(ThinkingContent {
+                                    thinking: initial_thinking,
+                                    thinking_signature: initial_sig,
+                                    redacted: false,
+                                }));
                             open_blocks.insert(index, OpenBlock::Thinking { content_index });
                             sink.send(AssistantMessageEvent::ThinkingStart { content_index });
                         }
@@ -564,11 +582,13 @@ pub fn stream(
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            output.content.push(AssistantBlock::Thinking(ThinkingContent {
-                                thinking: "[Reasoning redacted]".into(),
-                                thinking_signature: Some(data),
-                                redacted: true,
-                            }));
+                            output
+                                .content
+                                .push(AssistantBlock::Thinking(ThinkingContent {
+                                    thinking: "[Reasoning redacted]".into(),
+                                    thinking_signature: Some(data),
+                                    redacted: true,
+                                }));
                             open_blocks.insert(index, OpenBlock::Thinking { content_index });
                             sink.send(AssistantMessageEvent::ThinkingStart { content_index });
                         }

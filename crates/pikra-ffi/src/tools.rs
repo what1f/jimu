@@ -5,7 +5,7 @@ use futures_util::future::select;
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use serde_json::Value;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -160,10 +160,9 @@ impl AgentTool for FfiAgentTool {
 
             let args_str = serde_json::to_string(&args)
                 .map_err(|e| format!("failed to serialize tool args: {e}"))?;
-            let call_id_c = CString::new(tool_call_id)
-                .map_err(|e| format!("invalid tool_call_id: {e}"))?;
-            let name_c =
-                CString::new(name).map_err(|e| format!("invalid tool_name: {e}"))?;
+            let call_id_c =
+                CString::new(tool_call_id).map_err(|e| format!("invalid tool_call_id: {e}"))?;
+            let name_c = CString::new(name).map_err(|e| format!("invalid tool_name: {e}"))?;
             let args_c =
                 CString::new(args_str).map_err(|e| format!("invalid tool args JSON: {e}"))?;
 
@@ -192,13 +191,8 @@ impl AgentTool for FfiAgentTool {
                 });
             }
 
-            if !callbacks.fire_execute(
-                call_handle_id,
-                &call_id_c,
-                &name_c,
-                &args_c,
-                completion_ptr,
-            ) {
+            if !callbacks.fire_execute(call_handle_id, &call_id_c, &name_c, &args_c, completion_ptr)
+            {
                 // SAFETY: Callback was null, so ownership never transferred to host.
                 let dropped = unsafe { Box::from_raw(completion_ptr) };
                 dropped.complete(Err("host tool execute callback not configured".to_string()));

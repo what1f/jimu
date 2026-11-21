@@ -273,10 +273,7 @@ fn emit_tool_execution_end(
     });
 }
 
-fn emit_tool_result_message(
-    msg: &ToolResultMessage,
-    emit: &(dyn Fn(AgentEvent) + Send + Sync),
-) {
+fn emit_tool_result_message(msg: &ToolResultMessage, emit: &(dyn Fn(AgentEvent) + Send + Sync)) {
     let agent_msg = AgentMessage::Llm(Message::ToolResult(msg.clone()));
     emit(AgentEvent::MessageStart {
         message: agent_msg.clone(),
@@ -431,48 +428,42 @@ async fn execute_tool_batch_sequential(
             args: Value::Object(tc.arguments.clone()),
         });
 
-        let result = match prepare_tool_call(
-            tools,
-            middlewares,
-            assistant_message,
-            tc,
-            snapshot,
-            cancel,
-        )
-        .await
-        {
-            PreparedToolCall::Immediate(res) => res,
-            PreparedToolCall::Ready { tool, args } => {
-                let (gate, on_update) = make_scoped_progress_callback(
-                    tc.id.clone(),
-                    tc.name.clone(),
-                    args.clone(),
-                    Arc::clone(&emit),
-                );
-                let raw_result = if cancel.is_cancelled() {
-                    AgentToolResult::error("Operation aborted")
-                } else {
-                    match tool
-                        .execute(tc.id.clone(), args.clone(), cancel.clone(), on_update)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => AgentToolResult::error(e),
-                    }
-                };
-                close_progress_gate(&gate);
-                apply_after_tool_call(
-                    middlewares,
-                    assistant_message,
-                    tc,
-                    &args,
-                    raw_result,
-                    snapshot,
-                    cancel,
-                )
+        let result =
+            match prepare_tool_call(tools, middlewares, assistant_message, tc, snapshot, cancel)
                 .await
-            }
-        };
+            {
+                PreparedToolCall::Immediate(res) => res,
+                PreparedToolCall::Ready { tool, args } => {
+                    let (gate, on_update) = make_scoped_progress_callback(
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        args.clone(),
+                        Arc::clone(&emit),
+                    );
+                    let raw_result = if cancel.is_cancelled() {
+                        AgentToolResult::error("Operation aborted")
+                    } else {
+                        match tool
+                            .execute(tc.id.clone(), args.clone(), cancel.clone(), on_update)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => AgentToolResult::error(e),
+                        }
+                    };
+                    close_progress_gate(&gate);
+                    apply_after_tool_call(
+                        middlewares,
+                        assistant_message,
+                        tc,
+                        &args,
+                        raw_result,
+                        snapshot,
+                        cancel,
+                    )
+                    .await
+                }
+            };
 
         let finalized = FinalizedToolCall {
             tool_call: tc.clone(),

@@ -182,7 +182,11 @@ impl CodemodeSandbox {
                 Err(msg) => {
                     cancelled.store(true, Ordering::Release);
                     let _ = vm_handle.host_tx.send(HostMsg::Stop);
-                    return CodemodeResult::err(CodemodeError::sandbox(msg), Vec::new(), Vec::new());
+                    return CodemodeResult::err(
+                        CodemodeError::sandbox(msg),
+                        Vec::new(),
+                        Vec::new(),
+                    );
                 }
             }
         } else {
@@ -251,9 +255,7 @@ impl CodemodeSandbox {
 
             match step {
                 LoopStep::Timeout => {
-                    break Err(CodemodeError::timeout(
-                        effective_timeout_ms.unwrap_or(0),
-                    ));
+                    break Err(CodemodeError::timeout(effective_timeout_ms.unwrap_or(0)));
                 }
                 LoopStep::Aborted => {
                     break Err(CodemodeError::aborted("Execution aborted"));
@@ -268,8 +270,7 @@ impl CodemodeSandbox {
                 }) => {
                     let arg_bytes = args_json.as_ref().map_or(0, String::len);
                     if pending_meta.len() >= MAX_IN_FLIGHT_CALLS
-                        || in_flight_arg_bytes.saturating_add(arg_bytes)
-                            > MAX_QUEUED_CALL_ARG_BYTES
+                        || in_flight_arg_bytes.saturating_add(arg_bytes) > MAX_QUEUED_CALL_ARG_BYTES
                     {
                         break Err(CodemodeError::script(
                             Some("RangeError".to_string()),
@@ -387,9 +388,7 @@ impl CodemodeSandbox {
                 }
                 LoopStep::Vm(VmEvent::DoneErr(err)) => break Err(err),
                 LoopStep::Vm(VmEvent::Timeout) => {
-                    break Err(CodemodeError::timeout(
-                        effective_timeout_ms.unwrap_or(0),
-                    ));
+                    break Err(CodemodeError::timeout(effective_timeout_ms.unwrap_or(0)));
                 }
                 LoopStep::Vm(VmEvent::Aborted) => {
                     break Err(CodemodeError::aborted("Execution aborted"));
@@ -412,9 +411,7 @@ impl CodemodeSandbox {
                         break Err(CodemodeError::aborted("Execution aborted"));
                     }
                     if deadline.is_some_and(|d| Instant::now() >= d) {
-                        break Err(CodemodeError::timeout(
-                            effective_timeout_ms.unwrap_or(0),
-                        ));
+                        break Err(CodemodeError::timeout(effective_timeout_ms.unwrap_or(0)));
                     }
                     break Err(CodemodeError::sandbox(
                         "QuickJS VM terminated unexpectedly before completing",
@@ -427,7 +424,8 @@ impl CodemodeSandbox {
         let now = Instant::now();
         for (_id, (call_index, started_at, _arg_bytes)) in pending_meta.drain() {
             calls[call_index].status = CodemodeCallStatus::Cancelled;
-            calls[call_index].duration_ms = now.saturating_duration_since(started_at).as_millis() as u64;
+            calls[call_index].duration_ms =
+                now.saturating_duration_since(started_at).as_millis() as u64;
         }
         guard.cancel_now();
         drop(in_flight);
@@ -473,9 +471,7 @@ fn finish_tool_call(
                 HostMsg::ToolResult {
                     id,
                     ok: false,
-                    payload: Some(format!(
-                        "Failed to serialize tool return value: {err}"
-                    )),
+                    payload: Some(format!("Failed to serialize tool return value: {err}")),
                 }
             }
         },
@@ -576,7 +572,9 @@ fn parse_store_writes(raw: &str) -> Result<CodemodeStoreWrites, CodemodeError> {
     let entries: Value = serde_json::from_str(raw)
         .map_err(|err| CodemodeError::sandbox(format!("Invalid store writes JSON: {err}")))?;
     let Some(arr) = entries.as_array() else {
-        return Err(CodemodeError::sandbox("Store writes payload is not an array"));
+        return Err(CodemodeError::sandbox(
+            "Store writes payload is not an array",
+        ));
     };
     let mut writes = CodemodeStoreWrites::default();
     for entry in arr {
@@ -595,9 +593,7 @@ fn parse_store_writes(raw: &str) -> Result<CodemodeStoreWrites, CodemodeError> {
                     return Err(CodemodeError::sandbox("Malformed store write value"));
                 };
                 let val: Value = serde_json::from_str(val_json).map_err(|err| {
-                    CodemodeError::sandbox(format!(
-                        "Invalid JSON for stored key \"{key}\": {err}"
-                    ))
+                    CodemodeError::sandbox(format!("Invalid JSON for stored key \"{key}\": {err}"))
                 })?;
                 writes.set.insert(key.to_string(), val);
             }

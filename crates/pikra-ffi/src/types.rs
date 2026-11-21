@@ -162,7 +162,9 @@ impl From<FfiJsExtensionConfig> for JsExtensionConfig {
             .sources
             .into_iter()
             .map(|s| match s {
-                FfiJsExtensionSource::Inline { name, code } => ExtensionSource::Inline { name, code },
+                FfiJsExtensionSource::Inline { name, code } => {
+                    ExtensionSource::Inline { name, code }
+                }
                 FfiJsExtensionSource::File { path } => ExtensionSource::File(PathBuf::from(path)),
             })
             .collect();

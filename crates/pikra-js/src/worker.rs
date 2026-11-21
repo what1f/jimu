@@ -2,7 +2,7 @@
 
 use crate::prelude::PRELUDE_SOURCE;
 use crate::types::{
-    parse_registry_snapshot, HookKind, JsExtensionError, RegistrySnapshot, ResolvedSource,
+    HookKind, JsExtensionError, RegistrySnapshot, ResolvedSource, parse_registry_snapshot,
 };
 use futures_channel::oneshot;
 use pikra_ai::CancelToken;
@@ -16,7 +16,7 @@ use rquickjs::{
 };
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -96,12 +96,7 @@ impl WorkerHandle {
 
     pub(crate) fn shutdown(&self) {
         let _ = self.tx.send(WorkerCmd::Shutdown);
-        if let Some(handle) = self
-            .join
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(handle) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = handle.join();
         }
     }
@@ -255,20 +250,22 @@ impl VmInstance {
         let _guard = InterruptGuard(&interrupt);
 
         // 1. Evaluate prelude and capture the internal runtime object.
-        let runtime_obj = context.with(|ctx| -> Result<Persistent<Object<'static>>, JsExtensionError> {
-            let mut opts = EvalOptions::default();
-            opts.global = true;
-            opts.strict = true;
-            opts.filename = Some("pikra-js-prelude.js".to_string());
+        let runtime_obj = context.with(
+            |ctx| -> Result<Persistent<Object<'static>>, JsExtensionError> {
+                let mut opts = EvalOptions::default();
+                opts.global = true;
+                opts.strict = true;
+                opts.filename = Some("pikra-js-prelude.js".to_string());
 
-            let init_fn: Function<'_> = ctx
-                .eval_with_options(PRELUDE_SOURCE, opts)
-                .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
-            let obj: Object<'_> = init_fn
-                .call(())
-                .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
-            Ok(Persistent::save(&ctx, obj))
-        })?;
+                let init_fn: Function<'_> = ctx
+                    .eval_with_options(PRELUDE_SOURCE, opts)
+                    .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
+                let obj: Object<'_> = init_fn
+                    .call(())
+                    .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
+                Ok(Persistent::save(&ctx, obj))
+            },
+        )?;
 
         let mut vm = Self {
             runtime_obj,
@@ -314,52 +311,54 @@ impl VmInstance {
             DefaultFn(Persistent<Function<'static>>),
         }
 
-        let outcome = self.context.with(|ctx| -> Result<EvalOutcome, JsExtensionError> {
-            match Module::declare(ctx.clone(), source.name.as_str(), source.code.as_str()) {
-                Ok(declared) => {
-                    let (evaluated, eval_promise) = declared
-                        .eval()
-                        .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-                    let default_fn = extract_default_fn(&ctx, &evaluated, &self.interrupt)?;
+        let outcome = self
+            .context
+            .with(|ctx| -> Result<EvalOutcome, JsExtensionError> {
+                match Module::declare(ctx.clone(), source.name.as_str(), source.code.as_str()) {
+                    Ok(declared) => {
+                        let (evaluated, eval_promise) = declared
+                            .eval()
+                            .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                        let default_fn = extract_default_fn(&ctx, &evaluated, &self.interrupt)?;
 
-                    match eval_promise.state() {
-                        PromiseState::Pending => Ok(EvalOutcome::PendingModule {
-                            eval_promise: Persistent::save(&ctx, eval_promise),
-                            default_fn: default_fn.map(|f| Persistent::save(&ctx, f)),
-                        }),
-                        PromiseState::Resolved => {
-                            let _ = eval_promise.result::<Value<'_>>();
-                            Ok(match default_fn {
-                                Some(f) => EvalOutcome::DefaultFn(Persistent::save(&ctx, f)),
-                                None => EvalOutcome::Done,
-                            })
-                        }
-                        PromiseState::Rejected => {
-                            let err = eval_promise
-                                .result::<Value<'_>>()
-                                .expect("rejected promise has result")
-                                .unwrap_err();
-                            Err(classify_js_error(&ctx, err, &self.interrupt))
+                        match eval_promise.state() {
+                            PromiseState::Pending => Ok(EvalOutcome::PendingModule {
+                                eval_promise: Persistent::save(&ctx, eval_promise),
+                                default_fn: default_fn.map(|f| Persistent::save(&ctx, f)),
+                            }),
+                            PromiseState::Resolved => {
+                                let _ = eval_promise.result::<Value<'_>>();
+                                Ok(match default_fn {
+                                    Some(f) => EvalOutcome::DefaultFn(Persistent::save(&ctx, f)),
+                                    None => EvalOutcome::Done,
+                                })
+                            }
+                            PromiseState::Rejected => {
+                                let err = eval_promise
+                                    .result::<Value<'_>>()
+                                    .expect("rejected promise has result")
+                                    .unwrap_err();
+                                Err(classify_js_error(&ctx, err, &self.interrupt))
+                            }
                         }
                     }
-                }
-                Err(mod_err) => {
-                    // Only fall back to classic script mode if the source does not use ESM syntax.
-                    if looks_like_esm(&source.code) {
-                        return Err(classify_js_error(&ctx, mod_err, &self.interrupt));
+                    Err(mod_err) => {
+                        // Only fall back to classic script mode if the source does not use ESM syntax.
+                        if looks_like_esm(&source.code) {
+                            return Err(classify_js_error(&ctx, mod_err, &self.interrupt));
+                        }
+                        // Consume any pending exception from the failed module parse.
+                        let _ = ctx.catch();
+                        let mut opts = EvalOptions::default();
+                        opts.global = true;
+                        opts.strict = false;
+                        opts.filename = Some(source.name.clone());
+                        ctx.eval_with_options::<Value<'_>, _>(source.code.as_str(), opts)
+                            .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                        Ok(EvalOutcome::Done)
                     }
-                    // Consume any pending exception from the failed module parse.
-                    let _ = ctx.catch();
-                    let mut opts = EvalOptions::default();
-                    opts.global = true;
-                    opts.strict = false;
-                    opts.filename = Some(source.name.clone());
-                    ctx.eval_with_options::<Value<'_>, _>(source.code.as_str(), opts)
-                        .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-                    Ok(EvalOutcome::Done)
                 }
-            }
-        })?;
+            })?;
 
         let default_fn = match outcome {
             EvalOutcome::Done => {
@@ -512,20 +511,22 @@ impl VmInstance {
         self.interrupt.arm(self.timeout_ms, Some(cancel));
         let _guard = InterruptGuard(&self.interrupt);
 
-        let step = self.context.with(|ctx| -> Result<CallOutcome, JsExtensionError> {
-            let rt_obj = self
-                .runtime_obj
-                .clone()
-                .restore(&ctx)
-                .map_err(|err| JsExtensionError::Script(err.to_string()))?;
-            let func: Function<'_> = rt_obj
-                .get("invokeTool")
-                .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-            let ret: Value<'_> = func
-                .call((name, tool_call_id, args_json))
-                .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-            inspect_call_value(&ctx, ret, &self.interrupt)
-        });
+        let step = self
+            .context
+            .with(|ctx| -> Result<CallOutcome, JsExtensionError> {
+                let rt_obj = self
+                    .runtime_obj
+                    .clone()
+                    .restore(&ctx)
+                    .map_err(|err| JsExtensionError::Script(err.to_string()))?;
+                let func: Function<'_> = rt_obj
+                    .get("invokeTool")
+                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                let ret: Value<'_> = func
+                    .call((name, tool_call_id, args_json))
+                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                inspect_call_value(&ctx, ret, &self.interrupt)
+            });
 
         let res = match step {
             Ok(CallOutcome::Ready(opt)) => Ok(opt),
@@ -555,20 +556,22 @@ impl VmInstance {
         self.interrupt.arm(self.timeout_ms, Some(cancel));
         let _guard = InterruptGuard(&self.interrupt);
 
-        let step = self.context.with(|ctx| -> Result<CallOutcome, JsExtensionError> {
-            let rt_obj = self
-                .runtime_obj
-                .clone()
-                .restore(&ctx)
-                .map_err(|err| JsExtensionError::Script(err.to_string()))?;
-            let func: Function<'_> = rt_obj
-                .get("invokeHook")
-                .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-            let ret: Value<'_> = func
-                .call((hook.as_str(), payload_json))
-                .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
-            inspect_call_value(&ctx, ret, &self.interrupt)
-        });
+        let step = self
+            .context
+            .with(|ctx| -> Result<CallOutcome, JsExtensionError> {
+                let rt_obj = self
+                    .runtime_obj
+                    .clone()
+                    .restore(&ctx)
+                    .map_err(|err| JsExtensionError::Script(err.to_string()))?;
+                let func: Function<'_> = rt_obj
+                    .get("invokeHook")
+                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                let ret: Value<'_> = func
+                    .call((hook.as_str(), payload_json))
+                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                inspect_call_value(&ctx, ret, &self.interrupt)
+            });
 
         let res = match step {
             Ok(CallOutcome::Ready(opt)) => Ok(opt),
@@ -697,15 +700,10 @@ fn drain_jobs(runtime: &Runtime, interrupt: &InterruptState) -> Result<(), JsExt
 
 fn is_oom_error(name: Option<&str>, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    (name == Some("InternalError") && lower.contains("out of memory"))
-        || lower == "out of memory"
+    (name == Some("InternalError") && lower.contains("out of memory")) || lower == "out of memory"
 }
 
-fn classify_js_error(
-    ctx: &Ctx<'_>,
-    err: JsError,
-    interrupt: &InterruptState,
-) -> JsExtensionError {
+fn classify_js_error(ctx: &Ctx<'_>, err: JsError, interrupt: &InterruptState) -> JsExtensionError {
     if let Some(reason) = interrupt.check() {
         return reason;
     }
@@ -734,9 +732,7 @@ fn classify_caught_value(
             return JsExtensionError::OutOfMemory(message);
         }
         if name.as_deref() == Some("InternalError") && message.eq_ignore_ascii_case("interrupted") {
-            return interrupt
-                .check()
-                .unwrap_or(JsExtensionError::Cancelled);
+            return interrupt.check().unwrap_or(JsExtensionError::Cancelled);
         }
         let formatted = match name {
             Some(n) if !message.is_empty() => format!("{n}: {message}"),

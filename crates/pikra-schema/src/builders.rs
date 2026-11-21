@@ -61,7 +61,9 @@ pub fn map_schema(value_schema: Schema) -> Schema {
     Value::Object(obj)
 }
 
-pub fn obj_schema(properties: impl IntoIterator<Item = (impl Into<String>, Schema, bool)>) -> Schema {
+pub fn obj_schema(
+    properties: impl IntoIterator<Item = (impl Into<String>, Schema, bool)>,
+) -> Schema {
     let mut props = Map::new();
     let mut required = Vec::new();
     for (name, schema, is_req) in properties {
@@ -86,7 +88,12 @@ pub fn string_enum(values: impl IntoIterator<Item = impl Into<String>>) -> Schem
     obj.insert("type".into(), Value::String("string".into()));
     obj.insert(
         "enum".into(),
-        Value::Array(values.into_iter().map(|v| Value::String(v.into())).collect()),
+        Value::Array(
+            values
+                .into_iter()
+                .map(|v| Value::String(v.into()))
+                .collect(),
+        ),
     );
     Value::Object(obj)
 }

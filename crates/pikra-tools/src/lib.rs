@@ -198,7 +198,10 @@ impl WorkspaceToolsConfig {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             shell: None,
             default_bash_timeout_ms: None,
-            ignore_dirs: DEFAULT_IGNORE_DIRS.iter().map(|s| (*s).to_string()).collect(),
+            ignore_dirs: DEFAULT_IGNORE_DIRS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
 
@@ -227,10 +230,7 @@ impl WorkspaceToolsConfig {
         self
     }
 
-    pub fn with_ignore_dirs(
-        mut self,
-        dirs: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_ignore_dirs(mut self, dirs: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.ignore_dirs = dirs.into_iter().map(Into::into).collect();
         self
     }

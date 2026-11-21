@@ -62,7 +62,8 @@ impl CancelToken {
 
     pub fn cancel(&self) {
         if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
-            let wakers = std::mem::take(&mut *self.inner.wakers.lock().unwrap_or_else(|e| e.into_inner()));
+            let wakers =
+                std::mem::take(&mut *self.inner.wakers.lock().unwrap_or_else(|e| e.into_inner()));
             for waker in wakers {
                 waker.wake();
             }
@@ -74,7 +75,9 @@ impl CancelToken {
     }
 
     pub fn cancelled(&self) -> CancelledFuture {
-        CancelledFuture { token: self.clone() }
+        CancelledFuture {
+            token: self.clone(),
+        }
     }
 }
 
@@ -89,7 +92,12 @@ impl Future for CancelledFuture {
         if self.token.is_cancelled() {
             return Poll::Ready(());
         }
-        let mut wakers = self.token.inner.wakers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wakers = self
+            .token
+            .inner
+            .wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.token.is_cancelled() {
             return Poll::Ready(());
         }
@@ -423,7 +431,11 @@ pub struct TranscriptContext {
 }
 
 impl TranscriptContext {
-    pub fn new(system_prompt: impl Into<String>, tools: Vec<ToolDefinition>, messages: Vec<Message>) -> Self {
+    pub fn new(
+        system_prompt: impl Into<String>,
+        tools: Vec<ToolDefinition>,
+        messages: Vec<Message>,
+    ) -> Self {
         let mut all = Vec::with_capacity(messages.len() + 1);
         all.push(Message::System(SystemMessage {
             content: system_prompt.into(),
@@ -440,18 +452,52 @@ impl TranscriptContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantMessageEvent {
-    Start { partial: AssistantMessage },
-    TextStart { content_index: usize },
-    TextDelta { content_index: usize, delta: String },
-    TextEnd { content_index: usize, text: String },
-    ThinkingStart { content_index: usize },
-    ThinkingDelta { content_index: usize, delta: String },
-    ThinkingEnd { content_index: usize, thinking: String },
-    ToolCallStart { content_index: usize, id: String, name: String },
-    ToolCallDelta { content_index: usize, delta: String },
-    ToolCallEnd { content_index: usize, tool_call: ToolCall },
-    Done { reason: StopReason, message: AssistantMessage },
-    Error { reason: StopReason, error: AssistantMessage },
+    Start {
+        partial: AssistantMessage,
+    },
+    TextStart {
+        content_index: usize,
+    },
+    TextDelta {
+        content_index: usize,
+        delta: String,
+    },
+    TextEnd {
+        content_index: usize,
+        text: String,
+    },
+    ThinkingStart {
+        content_index: usize,
+    },
+    ThinkingDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ThinkingEnd {
+        content_index: usize,
+        thinking: String,
+    },
+    ToolCallStart {
+        content_index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ToolCallEnd {
+        content_index: usize,
+        tool_call: ToolCall,
+    },
+    Done {
+        reason: StopReason,
+        message: AssistantMessage,
+    },
+    Error {
+        reason: StopReason,
+        error: AssistantMessage,
+    },
 }
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
@@ -486,7 +532,11 @@ pub struct HttpStreamResponse {
 }
 
 pub trait HttpTransport: Send + Sync {
-    fn send(&self, request: HttpRequest, cancel: CancelToken) -> BoxFuture<'_, Result<HttpStreamResponse, TransportError>>;
+    fn send(
+        &self,
+        request: HttpRequest,
+        cancel: CancelToken,
+    ) -> BoxFuture<'_, Result<HttpStreamResponse, TransportError>>;
 }
 
 #[derive(Debug, Clone, Default)]

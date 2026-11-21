@@ -14,8 +14,8 @@ mod types;
 mod worker;
 
 pub use types::{
-    ExtensionSource, HookKind, JsExtensionConfig, JsExtensionError, DEFAULT_MAX_STACK_SIZE_BYTES,
-    DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_TIMEOUT_MS,
+    DEFAULT_MAX_STACK_SIZE_BYTES, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_TIMEOUT_MS, ExtensionSource,
+    HookKind, JsExtensionConfig, JsExtensionError,
 };
 
 use futures_channel::oneshot;
@@ -26,12 +26,12 @@ use pikra_agent::{
 };
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use types::{
-    parse_after_tool_call_result, parse_before_tool_call_result, parse_finish_turn_result,
-    parse_request_override, parse_tool_execute_result, resolve_sources, JsAfterToolCallPayload,
-    JsBeforeToolCallPayload, JsFinishTurnPayload, JsPrepareRequestSnapshot, RegistrySnapshot,
+    JsAfterToolCallPayload, JsBeforeToolCallPayload, JsFinishTurnPayload, JsPrepareRequestSnapshot,
+    RegistrySnapshot, parse_after_tool_call_result, parse_before_tool_call_result,
+    parse_finish_turn_result, parse_request_override, parse_tool_execute_result, resolve_sources,
 };
 use worker::{VmLimits, WorkerCmd, WorkerHandle};
 
@@ -333,7 +333,8 @@ impl AgentMiddleware for JsExtensionRuntime {
         let payload_json = match serde_json::to_string(&payload) {
             Ok(s) => s,
             Err(err) => {
-                self.inner.record_error(JsExtensionError::Serialization(err.to_string()));
+                self.inner
+                    .record_error(JsExtensionError::Serialization(err.to_string()));
                 return Box::pin(async { None });
             }
         };
@@ -370,7 +371,8 @@ impl AgentMiddleware for JsExtensionRuntime {
         let payload_json = match serde_json::to_string(&messages) {
             Ok(s) => s,
             Err(err) => {
-                self.inner.record_error(JsExtensionError::Serialization(err.to_string()));
+                self.inner
+                    .record_error(JsExtensionError::Serialization(err.to_string()));
                 return Box::pin(async move { messages });
             }
         };
@@ -481,7 +483,8 @@ impl AgentMiddleware for JsExtensionRuntime {
             Ok(s) => s,
             Err(err) => {
                 let reason = err.to_string();
-                self.inner.record_error(JsExtensionError::Serialization(reason.clone()));
+                self.inner
+                    .record_error(JsExtensionError::Serialization(reason.clone()));
                 return Box::pin(async move { Some(fail_closed(reason)) });
             }
         };
@@ -521,7 +524,8 @@ impl AgentMiddleware for JsExtensionRuntime {
         let payload_json = match serde_json::to_string(&payload) {
             Ok(s) => s,
             Err(err) => {
-                self.inner.record_error(JsExtensionError::Serialization(err.to_string()));
+                self.inner
+                    .record_error(JsExtensionError::Serialization(err.to_string()));
                 return Box::pin(async { None });
             }
         };

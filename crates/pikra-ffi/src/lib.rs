@@ -23,8 +23,8 @@ use bytes::Bytes;
 use pikra_agent::AgentToolResult;
 use pikra_ai::{Model, ThinkingLevel};
 use session::{FfiSession, SendCallbackCtx};
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use types::{FfiPromptRequest, FfiSessionConfig, FfiToolSpec};
 
 unsafe fn write_out_string(out: *mut *mut c_char, value: impl Into<String>) {
@@ -537,15 +537,16 @@ pub unsafe extern "C" fn pikra_session_set_thinking_level(
                 return PikraStatus::ErrInvalidArgument;
             }
         };
-        let level: ThinkingLevel = match serde_json::from_value(serde_json::Value::String(
-            raw.to_ascii_lowercase(),
-        )) {
-            Ok(l) => l,
-            Err(e) => {
-                unsafe { write_out_string(out_error, format!("invalid thinking_level `{raw}`: {e}")) };
-                return PikraStatus::ErrInvalidArgument;
-            }
-        };
+        let level: ThinkingLevel =
+            match serde_json::from_value(serde_json::Value::String(raw.to_ascii_lowercase())) {
+                Ok(l) => l,
+                Err(e) => {
+                    unsafe {
+                        write_out_string(out_error, format!("invalid thinking_level `{raw}`: {e}"))
+                    };
+                    return PikraStatus::ErrInvalidArgument;
+                }
+            };
         match s.inner.set_thinking_level(level) {
             Ok(()) => PikraStatus::Ok,
             Err((code, msg)) => {
@@ -896,7 +897,10 @@ fn format_discovered_skills_prompt(skills: &[FfiDiscoveredSkill]) -> String {
     lines.push("<available_skills>".to_string());
     for skill in visible {
         lines.push("  <skill>".to_string());
-        lines.push(format!("    <name>{}</name>", escape_skill_xml(&skill.name)));
+        lines.push(format!(
+            "    <name>{}</name>",
+            escape_skill_xml(&skill.name)
+        ));
         lines.push(format!(
             "    <description>{}</description>",
             escape_skill_xml(&skill.description)
@@ -936,22 +940,20 @@ pub unsafe extern "C" fn pikra_discover_skills(
             }
         };
 
-        let root_paths: Vec<std::path::PathBuf> =
-            raw_roots.into_iter().map(std::path::PathBuf::from).collect();
+        let root_paths: Vec<std::path::PathBuf> = raw_roots
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
         let catalog = pikra_kit::SkillCatalog::discover(&root_paths);
         let skills: Vec<FfiDiscoveredSkill> = catalog
             .skills()
             .iter()
-            .map(|skill| {
-                let raw_contents = std::fs::read_to_string(&skill.file_path).unwrap_or_default();
-                let revision = pikra_ai::transform::short_hash(&raw_contents);
-                FfiDiscoveredSkill {
-                    name: skill.name.clone(),
-                    description: skill.description.clone(),
-                    location: skill.file_path.to_string_lossy().into_owned(),
-                    disable_model_invocation: skill.disable_model_invocation,
-                    revision,
-                }
+            .map(|skill| FfiDiscoveredSkill {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                location: skill.file_path.to_string_lossy().into_owned(),
+                disable_model_invocation: skill.disable_model_invocation,
+                revision: skill.revision.clone(),
             })
             .collect();
         let prompt = format_discovered_skills_prompt(&skills);

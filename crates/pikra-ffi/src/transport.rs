@@ -3,12 +3,12 @@ use crate::types::{FfiHttpRequestHead, PikraStatus};
 use bytes::Bytes;
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
-use futures_util::future::{select, Either};
+use futures_util::future::{Either, select};
 use pikra_ai::{
     BoxFuture, CancelToken, CancelledFuture, HttpRequest, HttpStreamResponse, HttpTransport,
     TransportError,
 };
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

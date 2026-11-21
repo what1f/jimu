@@ -14,16 +14,16 @@ use pikra_ai::{
 };
 use pikra_js::{JsExtensionConfig, JsExtensionRuntime};
 use pikra_kit::{
-    CallToolGateway, CodemodeExecTool, DeferredToolRegistry, SkillCatalog, ToolSearchTool,
-    CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, TOOL_SEARCH_NAME,
+    CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, CallToolGateway, CodemodeExecTool,
+    DeferredToolRegistry, SkillCatalog, TOOL_SEARCH_NAME, ToolSearchTool,
 };
 use pikra_session::{
-    context_block_to_agent_message, CompactionConfig, CompactionResult, JsonlSessionStore,
-    MemorySessionStore, SessionConfig, SessionEntry, SessionEntryPayload, SessionEvent,
-    SessionManager, SessionStore,
+    CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
+    SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
+    context_block_to_agent_message,
 };
 use serde_json::Map;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -161,10 +161,18 @@ impl FfiSession {
         // Keep deferred gateway resident when enabled so dynamic deferred tool updates
         // NEVER mutate the top-level resident `tools` array (prompt cache stability).
         if config.enable_deferred_gateway {
-            if !resident.iter().any(|t| t.definition().name == TOOL_SEARCH_NAME) {
-                resident.push(Arc::new(ToolSearchTool::new(Arc::clone(&deferred_registry))));
+            if !resident
+                .iter()
+                .any(|t| t.definition().name == TOOL_SEARCH_NAME)
+            {
+                resident.push(Arc::new(ToolSearchTool::new(Arc::clone(
+                    &deferred_registry,
+                ))));
             }
-            if !resident.iter().any(|t| t.definition().name == CALL_TOOL_NAME) {
+            if !resident
+                .iter()
+                .any(|t| t.definition().name == CALL_TOOL_NAME)
+            {
                 resident.push(Arc::new(
                     CallToolGateway::new(Arc::clone(&deferred_registry))
                         .with_middlewares(middlewares.clone()),
@@ -179,10 +187,7 @@ impl FfiSession {
                 .iter()
                 .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
         {
-            let cm_opts = config
-                .codemode_options
-                .map(Into::into)
-                .unwrap_or_default();
+            let cm_opts = config.codemode_options.map(Into::into).unwrap_or_default();
             let exec_tool: Arc<dyn AgentTool> = Arc::new(
                 CodemodeExecTool::new(
                     Arc::clone(&resident_tools_handle),
@@ -203,10 +208,7 @@ impl FfiSession {
             _ => Arc::new(MemorySessionStore::new()),
         };
 
-        let compaction: CompactionConfig = config
-            .compaction
-            .map(Into::into)
-            .unwrap_or_default();
+        let compaction: CompactionConfig = config.compaction.map(Into::into).unwrap_or_default();
 
         let mut session_cfg =
             SessionConfig::new(&config.system_prompt, resident_defs).with_compaction(compaction);
@@ -330,7 +332,10 @@ impl FfiSession {
                 return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
             }
             if state.active.is_some() || self.agent.is_running() {
-                return Err((PikraStatus::ErrBusy, "session is currently busy".to_string()));
+                return Err((
+                    PikraStatus::ErrBusy,
+                    "session is currently busy".to_string(),
+                ));
             }
             state.active = Some(ActivePromptRun {
                 cancel: prompt_cancel.clone(),
@@ -539,15 +544,17 @@ impl FfiSession {
                     .await;
             }
 
+            // Release busy state BEFORE emitting `.turnEnded` and `on_done` so any Swift consumer
+            // reacting to `.turnEnded` or exiting `for try await` can immediately call `prompt`/`updateTools`
+            // with zero spurious `busy` errors.
+            let waiters = this.finish_active_run();
+
             emit(&FfiEvent::TurnEnded {
                 stop_reason: last_stop_reason,
                 user_message_kept,
                 error_message: last_error_message,
             });
 
-            // Release busy state BEFORE notifying Swift stream completion so the consumer
-            // can immediately issue follow-up calls after `for try await` exits with zero `busy`.
-            let waiters = this.finish_active_run();
             on_done(ctx.as_ptr(), PikraStatus::Ok, std::ptr::null());
             for w in waiters {
                 let _ = w.send(());
@@ -634,11 +641,7 @@ impl FfiSession {
         });
     }
 
-    pub(crate) fn close_async(
-        self: &Arc<Self>,
-        ctx: SendCallbackCtx,
-        on_done: PikraVoidDoneFn,
-    ) {
+    pub(crate) fn close_async(self: &Arc<Self>, ctx: SendCallbackCtx, on_done: PikraVoidDoneFn) {
         let waiter = {
             let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
             state.closed = true;
@@ -755,13 +758,20 @@ impl FfiSession {
         Ok(())
     }
 
-    pub(crate) fn upsert_tools(&self, specs: Vec<FfiToolSpec>) -> Result<(), (PikraStatus, String)> {
+    pub(crate) fn upsert_tools(
+        &self,
+        specs: Vec<FfiToolSpec>,
+    ) -> Result<(), (PikraStatus, String)> {
         self.check_open_and_idle()
             .map_err(|s| (s, status_message(s)))?;
         let tools: Vec<Arc<dyn AgentTool>> = specs
             .iter()
             .map(|spec| {
-                FfiAgentTool::from_spec(spec, self.tool_callbacks, Arc::clone(&self.next_tool_call_id))
+                FfiAgentTool::from_spec(
+                    spec,
+                    self.tool_callbacks,
+                    Arc::clone(&self.next_tool_call_id),
+                )
             })
             .collect();
         self.deferred_registry.upsert(tools);
@@ -853,10 +863,16 @@ impl FfiSession {
                         tokens_before: res.tokens_before,
                         usage: res.usage,
                     };
-                    match serde_json::to_string(&payload).ok().and_then(|s| CString::new(s).ok()) {
-                        Some(json_c) => {
-                            on_done(ctx.as_ptr(), PikraStatus::Ok, json_c.as_ptr(), std::ptr::null())
-                        }
+                    match serde_json::to_string(&payload)
+                        .ok()
+                        .and_then(|s| CString::new(s).ok())
+                    {
+                        Some(json_c) => on_done(
+                            ctx.as_ptr(),
+                            PikraStatus::Ok,
+                            json_c.as_ptr(),
+                            std::ptr::null(),
+                        ),
                         None => {
                             let err_c = CString::new("failed to serialize compaction result").ok();
                             on_done(
@@ -869,7 +885,12 @@ impl FfiSession {
                     }
                 }
                 Ok(None) => {
-                    on_done(ctx.as_ptr(), PikraStatus::Ok, std::ptr::null(), std::ptr::null());
+                    on_done(
+                        ctx.as_ptr(),
+                        PikraStatus::Ok,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    );
                 }
                 Err(err) => {
                     let err_c = CString::new(err).ok();
@@ -938,11 +959,7 @@ impl FfiSession {
         let (maybe_result, reconstructed) = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
             let res = session
-                .commit_compaction_if_leaf_matches(
-                    output,
-                    tokens_before,
-                    expected_leaf.as_deref(),
-                )
+                .commit_compaction_if_leaf_matches(output, tokens_before, expected_leaf.as_deref())
                 .map_err(|e| e.to_string())?;
             let recon = session.reconstruct_context();
             (res, recon)

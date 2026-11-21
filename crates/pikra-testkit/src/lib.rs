@@ -44,7 +44,9 @@ pub struct SseScriptSender {
 
 impl SseScriptSender {
     pub fn push_str(&self, chunk: impl Into<String>) -> bool {
-        self.tx.unbounded_send(Ok(Bytes::from(chunk.into()))).is_ok()
+        self.tx
+            .unbounded_send(Ok(Bytes::from(chunk.into())))
+            .is_ok()
     }
 
     pub fn push_bytes(&self, chunk: impl Into<Bytes>) -> bool {
@@ -85,10 +87,7 @@ impl ScriptedHttpResponse {
 
     /// Convenience constructor for HTTP 200 SSE responses split across arbitrary string chunks.
     pub fn sse_strings(chunks: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let bytes = chunks
-            .into_iter()
-            .map(|s| Bytes::from(s.into()))
-            .collect();
+        let bytes = chunks.into_iter().map(|s| Bytes::from(s.into())).collect();
         Self::sse(200, bytes)
     }
 
@@ -389,7 +388,9 @@ pub fn check_prompt_prefix_identical(
     let msg_key = ["input", "messages", "contents"]
         .into_iter()
         .find(|k| b1.get(*k).is_some() || b2.get(*k).is_some())
-        .ok_or_else(|| "could not locate input/messages/contents array in request JSON".to_string())?;
+        .ok_or_else(|| {
+            "could not locate input/messages/contents array in request JSON".to_string()
+        })?;
 
     let arr1 = b1
         .get(msg_key)
@@ -420,7 +421,10 @@ pub fn check_prompt_prefix_identical(
                 to_canonical_bytes(&strip_tail_cache_control(&arr2[idx])),
             )
         } else {
-            (to_canonical_bytes(&arr1[idx]), to_canonical_bytes(&arr2[idx]))
+            (
+                to_canonical_bytes(&arr1[idx]),
+                to_canonical_bytes(&arr2[idx]),
+            )
         };
 
         if m1_bytes != m2_bytes {

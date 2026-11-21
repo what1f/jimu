@@ -77,7 +77,9 @@ impl AgentTool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command in the workspace directory with optional cwd and timeout_ms.".into(),
+            description:
+                "Run a shell command in the workspace directory with optional cwd and timeout_ms."
+                    .into(),
             parameters: obj_schema([
                 (
                     "command",
@@ -195,7 +197,8 @@ impl AgentTool for BashTool {
             let mut err_chunk = [0u8; CHUNK_READ_BYTES];
 
             let mut buffer = BoundedOutputBuffer::new(config.max_output_bytes);
-            let deadline = timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+            let deadline =
+                timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
             let mut stop_kind = StopReasonKind::Completed;
 
             // Phase 1: stream stdout & stderr concurrently, racing cancellation and timeout.

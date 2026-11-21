@@ -10,8 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const TINY_PNG_B64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 #[test]
 fn multi_tool_orchestration_output_isolation_and_exit() {
@@ -178,7 +177,10 @@ store("ignored", true);
                 console: false,
             }]
         );
-        assert_eq!(exit_res.store_writes.set.get("saved"), Some(&json!({ "step": 1 })));
+        assert_eq!(
+            exit_res.store_writes.set.get("saved"),
+            Some(&json!({ "step": 1 }))
+        );
         assert!(!exit_res.store_writes.set.contains_key("ignored"));
     });
 }
@@ -191,7 +193,9 @@ fn options_header_line_numbers_and_transactional_store() {
         assert!(parse_codemode_source("// @options: {\"unknown\": 1}\nreturn 1;").is_err());
         assert!(parse_codemode_source("// @options: not-json\nreturn 1;").is_err());
         assert!(parse_codemode_source("// @options: {\"timeout_ms\": 1000}\n").is_err());
-        assert!(parse_codemode_source("const a = 1;\n// @options: {\"timeout_ms\": 1000}").is_err());
+        assert!(
+            parse_codemode_source("const a = 1;\n// @options: {\"timeout_ms\": 1000}").is_err()
+        );
 
         let raw_source = "// @options: {\"max_output_tokens\": 2000, \"timeout_ms\": 30000}\nconst x = 1;\nconst y = x + 1;\nthrow new Error(\"boom on line 4\");";
         let parsed = parse_codemode_source(raw_source).expect("valid header");
@@ -470,10 +474,8 @@ fn review_regressions_stack_drop_order_budget_microtasks_and_prelude() {
         }
 
         {
-            let exec_fut = drop_sandbox.execute(
-                "await tools.hold();",
-                CodemodeExecuteOptions::default(),
-            );
+            let exec_fut =
+                drop_sandbox.execute("await tools.hold();", CodemodeExecuteOptions::default());
             futures_util::pin_mut!(exec_fut);
             let race = futures_util::future::select(exec_fut, started_rx).await;
             assert!(
@@ -543,7 +545,11 @@ return "unstarved";
                 CodemodeExecuteOptions::default(),
             )
             .await;
-        assert!(mt_res.ok, "microtask loop should not starve tool completion: {:?}", mt_res.error);
+        assert!(
+            mt_res.ok,
+            "microtask loop should not starve tool completion: {:?}",
+            mt_res.error
+        );
         assert_eq!(mt_res.value, Some(json!("unstarved")));
 
         // 5. In-flight tool call count & queued argument payload budget enforcement.
@@ -649,18 +655,43 @@ return rejects;
         let prelude_res = prelude_sandbox
             .execute(&prelude_script, CodemodeExecuteOptions::default())
             .await;
-        assert!(prelude_res.ok, "prelude regression test failed: {:?}", prelude_res.error);
+        assert!(
+            prelude_res.ok,
+            "prelude regression test failed: {:?}",
+            prelude_res.error
+        );
         assert_eq!(prelude_res.value, Some(json!([true, true, true, true])));
         assert_eq!(
             prelude_res.output,
             vec![
-                CodemodeOutputItem::Text { text: "NaN".to_string(), console: false },
-                CodemodeOutputItem::Text { text: "Infinity".to_string(), console: false },
-                CodemodeOutputItem::Text { text: "1".to_string(), console: false },
-                CodemodeOutputItem::Text { text: "true".to_string(), console: false },
-                CodemodeOutputItem::Text { text: "undefined".to_string(), console: false },
-                CodemodeOutputItem::Text { text: "Symbol(tag)".to_string(), console: false },
-                CodemodeOutputItem::Text { text: r#"{"k":1}"#.to_string(), console: false },
+                CodemodeOutputItem::Text {
+                    text: "NaN".to_string(),
+                    console: false
+                },
+                CodemodeOutputItem::Text {
+                    text: "Infinity".to_string(),
+                    console: false
+                },
+                CodemodeOutputItem::Text {
+                    text: "1".to_string(),
+                    console: false
+                },
+                CodemodeOutputItem::Text {
+                    text: "true".to_string(),
+                    console: false
+                },
+                CodemodeOutputItem::Text {
+                    text: "undefined".to_string(),
+                    console: false
+                },
+                CodemodeOutputItem::Text {
+                    text: "Symbol(tag)".to_string(),
+                    console: false
+                },
+                CodemodeOutputItem::Text {
+                    text: r#"{"k":1}"#.to_string(),
+                    console: false
+                },
                 CodemodeOutputItem::Image {
                     data: TINY_PNG_B64.to_string(),
                     mime_type: "image/png".to_string(),

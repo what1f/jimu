@@ -23,7 +23,10 @@ fn convert_tools(tools: &[ToolDefinition]) -> Value {
         .map(|tool| {
             let mut decl = Map::new();
             decl.insert("name".into(), Value::String(tool.name.clone()));
-            decl.insert("description".into(), Value::String(tool.description.clone()));
+            decl.insert(
+                "description".into(),
+                Value::String(tool.description.clone()),
+            );
             decl.insert("parametersJsonSchema".into(), tool.parameters.clone());
             Value::Object(decl)
         })
@@ -119,10 +122,7 @@ fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
                             let mut part = Map::new();
                             part.insert("functionCall".into(), Value::Object(fc));
                             if is_same_model && let Some(sig) = &tc.thought_signature {
-                                part.insert(
-                                    "thoughtSignature".into(),
-                                    Value::String(sig.clone()),
-                                );
+                                part.insert("thoughtSignature".into(), Value::String(sig.clone()));
                             }
                             parts.push(Value::Object(part));
                         }
@@ -219,7 +219,11 @@ fn build_thinking_config(model: &Model, level: ThinkingLevel) -> Option<Value> {
         ThinkingLevel::Off => None,
         ThinkingLevel::None => {
             if uses_thinking_level(&model.id) {
-                Some(json!({ "thinkingLevel": "MINIMAL" }))
+                if model.id.to_ascii_lowercase().contains("pro") {
+                    Some(json!({ "thinkingLevel": "LOW" }))
+                } else {
+                    Some(json!({ "thinkingLevel": "MINIMAL" }))
+                }
             } else if model.id.to_ascii_lowercase().contains("pro") {
                 None
             } else {
@@ -480,11 +484,9 @@ pub fn stream(
                                         content_index: idx,
                                     });
                                 } else {
-                                    output
-                                        .content
-                                        .push(AssistantBlock::Text(TextContent::plain(
-                                            String::new(),
-                                        )));
+                                    output.content.push(AssistantBlock::Text(TextContent::plain(
+                                        String::new(),
+                                    )));
                                     active = Some(ActiveGoogleBlock::Text(idx));
                                     sink.send(AssistantMessageEvent::TextStart {
                                         content_index: idx,
@@ -537,9 +539,9 @@ pub fn stream(
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty());
                             let is_dup = provided_id.is_some_and(|pid| {
-                                output.content.iter().any(|b| {
-                                    matches!(b, AssistantBlock::ToolCall(tc) if tc.id == pid)
-                                })
+                                output.content.iter().any(
+                                    |b| matches!(b, AssistantBlock::ToolCall(tc) if tc.id == pid),
+                                )
                             });
                             let id = match provided_id {
                                 Some(pid) if !is_dup => pid.to_string(),
@@ -608,8 +610,7 @@ pub fn stream(
                         }
                         "MAX_TOKENS" | "CONTINUATION" => StopReason::Length,
                         other => {
-                            output.error_message =
-                                Some(format!("Provider stopped with: {other}"));
+                            output.error_message = Some(format!("Provider stopped with: {other}"));
                             StopReason::Error
                         }
                     };

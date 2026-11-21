@@ -183,7 +183,11 @@ public struct PikraCodexOAuth: Sendable {
         callback: String
     ) async throws -> PikraCodexCredentials {
         let parsed = parseCallbackInput(callback)
-        if let returnedState = parsed.state, !returnedState.isEmpty, returnedState != authorization.state {
+        if parsed.requiresState {
+            guard let returnedState = parsed.state, returnedState == authorization.state else {
+                throw PikraCodexOAuthError.stateMismatch
+            }
+        } else if let returnedState = parsed.state, !returnedState.isEmpty, returnedState != authorization.state {
             throw PikraCodexOAuthError.stateMismatch
         }
         guard let code = parsed.code, !code.isEmpty else {
@@ -296,16 +300,18 @@ public struct PikraCodexOAuth: Sendable {
 
         let bodyText = String(data: rawBody, encoding: .utf8) ?? ""
         guard (200..<300).contains(response.statusCode) else {
+            let safeError = Self.extractSafeOAuthErrorMessage(from: rawBody, statusCode: response.statusCode)
             throw isRefresh
-                ? PikraCodexOAuthError.refreshFailed(statusCode: response.statusCode, message: bodyText)
-                : PikraCodexOAuthError.tokenExchangeFailed(statusCode: response.statusCode, message: bodyText)
+                ? PikraCodexOAuthError.refreshFailed(statusCode: response.statusCode, message: safeError)
+                : PikraCodexOAuthError.tokenExchangeFailed(statusCode: response.statusCode, message: safeError)
         }
 
         guard let payload = try? JSONDecoder().decode(TokenPayload.self, from: rawBody),
               let accessToken = payload.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines),
               !accessToken.isEmpty
         else {
-            let message = bodyText.isEmpty ? "Missing access_token in token response" : bodyText
+            // Never echo 2xx rawBody into LocalizedError to prevent leaking tokens on partial schema mismatch.
+            let message = "Invalid or incomplete token response payload"
             throw isRefresh
                 ? PikraCodexOAuthError.refreshFailed(statusCode: response.statusCode, message: message)
                 : PikraCodexOAuthError.tokenExchangeFailed(statusCode: response.statusCode, message: message)
@@ -318,32 +324,53 @@ public struct PikraCodexOAuth: Sendable {
         )
     }
 
-    private func parseCallbackInput(_ input: String) -> (code: String?, state: String?) {
+    private struct OAuthErrorEnvelope: Decodable {
+        let error: String?
+        let errorDescription: String?
+
+        enum CodingKeys: String, CodingKey {
+            case error
+            case errorDescription = "error_description"
+        }
+    }
+
+    private static func extractSafeOAuthErrorMessage(from rawBody: Data, statusCode: Int) -> String {
+        if let env = try? JSONDecoder().decode(OAuthErrorEnvelope.self, from: rawBody) {
+            let parts = [env.error, env.errorDescription].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            if !parts.isEmpty {
+                return String(parts.joined(separator: ": ").prefix(256))
+            }
+        }
+        return "HTTP \(statusCode)"
+    }
+
+    private func parseCallbackInput(_ input: String) -> (code: String?, state: String?, requiresState: Bool) {
         let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return (nil, nil) }
+        guard !value.isEmpty else { return (nil, nil, false) }
 
         if let components = URLComponents(string: value), components.scheme != nil {
             let code = components.queryItems?.first(where: { $0.name == "code" })?.value
             let state = components.queryItems?.first(where: { $0.name == "state" })?.value
-            return (code, state)
+            return (code, state, true)
         }
 
         if let hashIndex = value.firstIndex(of: "#") {
             let code = String(value[..<hashIndex])
             let state = String(value[value.index(after: hashIndex)...])
-            return (code.isEmpty ? nil : code, state.isEmpty ? nil : state)
+            return (code.isEmpty ? nil : code, state.isEmpty ? nil : state, true)
         }
 
-        if value.contains("code=") {
+        if value.contains("code=") || value.contains("state=") || value.hasPrefix("?") {
             let query = value.hasPrefix("?") ? String(value.dropFirst()) : value
             if let components = URLComponents(string: "http://localhost?\(query)") {
                 let code = components.queryItems?.first(where: { $0.name == "code" })?.value
                 let state = components.queryItems?.first(where: { $0.name == "state" })?.value
-                return (code, state)
+                return (code, state, true)
             }
+            return (nil, nil, true)
         }
 
-        return (value, nil)
+        return (value, nil, false)
     }
 }
 
@@ -354,41 +381,52 @@ public actor PikraCodexSubscription {
     private let loadCredentials: @Sendable () async throws -> PikraCodexCredentials
     private let onRefresh: @Sendable (PikraCodexCredentials) async throws -> Void
     private let oauth: PikraCodexOAuth
+    private let allowedBaseURL: URL
 
-    private var cached: PikraCodexCredentials?
-    private var inFlightRefresh: Task<PikraCodexCredentials, any Error>?
+    /// Retains rotated credentials if `onRefresh` transiently threw after a single-use token rotation.
+    private var pendingSave: (sourceRefreshToken: String?, credentials: PikraCodexCredentials)?
+    private var inFlightRefresh: (key: String, task: Task<PikraCodexCredentials, any Error>)?
 
     public init(
         credentials: @escaping @Sendable () async throws -> PikraCodexCredentials,
         onRefresh: @escaping @Sendable (PikraCodexCredentials) async throws -> Void,
-        httpClient: any PikraHTTPClient = PikraURLSessionHTTPClient()
+        httpClient: any PikraHTTPClient = PikraURLSessionHTTPClient(),
+        allowedBaseURL: URL = URL(string: PikraCodexOAuth.codexBaseURL)!
     ) {
         self.loadCredentials = credentials
         self.onRefresh = onRefresh
         self.oauth = PikraCodexOAuth(httpClient: httpClient)
+        self.allowedBaseURL = allowedBaseURL
     }
 
-    /// Returns valid credentials, automatically refreshing within 300 seconds of expiry or when forced.
-    /// Concurrent callers coalesce onto a single in-flight refresh request.
+    private static func identityKey(for creds: PikraCodexCredentials) -> String {
+        "\(creds.accountID ?? "")|\(creds.refreshToken ?? creds.accessToken)"
+    }
+
+    /// Returns valid credentials, re-reading `loadCredentials` to pick up account switches or external
+    /// CLI token rotations while coalescing concurrent refreshes for the same account/token.
     public func currentCredentials(forceRefresh: Bool = false) async throws -> PikraCodexCredentials {
-        if let active = inFlightRefresh {
-            return try await active.value
+        let diskCreds = try await loadCredentials().normalized()
+
+        // If a previous rotation succeeded in OAuth but `onRefresh` failed to persist, reuse the rotated
+        // credentials as long as the caller hasn't switched accounts on disk, and retry `onRefresh`.
+        let current: PikraCodexCredentials
+        if let pending = pendingSave {
+            if pending.sourceRefreshToken == diskCreds.refreshToken && pending.credentials.accountID == diskCreds.accountID {
+                try await onRefresh(pending.credentials)
+                pendingSave = nil
+                current = pending.credentials
+            } else {
+                pendingSave = nil
+                current = diskCreds
+            }
+        } else {
+            current = diskCreds
         }
 
-        let current: PikraCodexCredentials
-        if let cached {
-            current = cached
-        } else {
-            let loaded = try await loadCredentials().normalized()
-            if let active = inFlightRefresh {
-                return try await active.value
-            }
-            if let updated = self.cached {
-                current = updated
-            } else {
-                self.cached = loaded
-                current = loaded
-            }
+        let key = Self.identityKey(for: current)
+        if let active = inFlightRefresh, active.key == key {
+            return try await active.task.value
         }
 
         let isExpiring = current.expiresAt.map { $0.timeIntervalSinceNow <= Self.refreshLeewaySeconds } ?? false
@@ -397,28 +435,53 @@ public actor PikraCodexSubscription {
             return current
         }
 
-        if let active = inFlightRefresh {
-            return try await active.value
-        }
-
         let oauth = self.oauth
-        let onRefresh = self.onRefresh
         let refreshTask = Task<PikraCodexCredentials, any Error> {
-            let refreshed = try await oauth.refreshCredentials(current)
-            try await onRefresh(refreshed)
-            return refreshed
+            try await oauth.refreshCredentials(current)
         }
-        inFlightRefresh = refreshTask
-        defer { inFlightRefresh = nil }
+        inFlightRefresh = (key: key, task: refreshTask)
+        defer {
+            if inFlightRefresh?.key == key {
+                inFlightRefresh = nil
+            }
+        }
 
         let refreshed = try await refreshTask.value
-        cached = refreshed
+        // Retain rotated token in memory BEFORE calling `onRefresh` so a transient persistence error
+        // never loses a single-use refresh token.
+        pendingSave = (sourceRefreshToken: current.refreshToken, credentials: refreshed)
+        try await onRefresh(refreshed)
+        pendingSave = nil
         return refreshed
     }
 
+    nonisolated private func validateTargetURL(_ targetURL: URL?) throws {
+        guard let targetURL,
+              let scheme = targetURL.scheme?.lowercased(),
+              let host = targetURL.host?.lowercased(),
+              let expectedScheme = allowedBaseURL.scheme?.lowercased(),
+              let expectedHost = allowedBaseURL.host?.lowercased()
+        else {
+            throw PikraCodexOAuthError.invalidCredentials
+        }
+        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        guard scheme == "https" || (isLoopback && scheme == expectedScheme) else {
+            throw PikraCodexOAuthError.invalidCredentials
+        }
+        guard scheme == expectedScheme, host == expectedHost, targetURL.port == allowedBaseURL.port else {
+            throw PikraCodexOAuthError.invalidCredentials
+        }
+        let basePrefix = allowedBaseURL.path.isEmpty ? "/codex" : allowedBaseURL.path
+        guard targetURL.path.hasPrefix(basePrefix) || targetURL.path.contains("/codex/") else {
+            throw PikraCodexOAuthError.invalidCredentials
+        }
+    }
+
     /// Per-request authorizer compatible with `PikraConfiguration.authorizeRequest`.
+    /// Validates target HTTPS origin & Codex path before attaching ChatGPT credentials.
     public nonisolated var requestAuthorizer: PikraRequestAuthorizer {
         { [self] request in
+            try self.validateTargetURL(request.url)
             let creds = try await self.currentCredentials()
             request.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
             if let accountID = creds.accountID, !accountID.isEmpty {

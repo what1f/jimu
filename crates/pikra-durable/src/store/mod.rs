@@ -44,15 +44,14 @@ pub trait DurableStore: Send + Sync {
     ) -> Result<Option<SubmissionRecord>, DurableError>;
 
     /// Fetch the active execution phase checkpoint for a conversation, if any.
-    fn get_checkpoint(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Option<TaskCheckpoint>, DurableError>;
+    fn get_checkpoint(&self, conversation_id: &str)
+    -> Result<Option<TaskCheckpoint>, DurableError>;
 
-    /// Fetch a single committed tool side-effect record by `(conversation_id, tool_call_id)`.
+    /// Fetch a single committed tool side-effect record by `(conversation_id, assistant_entry_id, tool_call_id)`.
     fn get_completed_tool(
         &self,
         conversation_id: &str,
+        assistant_entry_id: &str,
         tool_call_id: &str,
     ) -> Result<Option<CompletedToolRecord>, DurableError>;
 
@@ -81,7 +80,29 @@ pub trait DurableStore: Send + Sync {
         &self,
         conversation_id: &str,
         signal_key: &str,
+    ) -> Result<Option<SignalRecord>, DurableError> {
+        self.peek_next_unconsumed_signal(conversation_id, signal_key, &[], None)
+    }
+
+    /// Peek the oldest unconsumed signal matching `(conversation_id, signal_key)`, excluding
+    /// `exclude_signal_ids` and optionally filtering `received_at_ms <= max_received_at_ms`.
+    fn peek_next_unconsumed_signal(
+        &self,
+        conversation_id: &str,
+        signal_key: &str,
+        exclude_signal_ids: &[String],
+        max_received_at_ms: Option<u64>,
     ) -> Result<Option<SignalRecord>, DurableError>;
+
+    /// Atomically either return an unconsumed matching signal (if one already arrived within
+    /// `max_received_at_ms`) OR commit `tx` (typically setting `Parked(AwaitSignal)`).
+    fn commit_or_peek_signal(
+        &self,
+        tx: CommitBatch,
+        signal_key: &str,
+        exclude_signal_ids: &[String],
+        max_received_at_ms: Option<u64>,
+    ) -> Result<Result<CommitReceipt, SignalRecord>, DurableError>;
 
     /// List all signals (buffered and consumed) for a conversation in arrival order.
     fn list_signals(&self, conversation_id: &str) -> Result<Vec<SignalRecord>, DurableError>;

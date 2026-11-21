@@ -9,8 +9,16 @@ use serde_json::{Value, json};
 #[test]
 fn llm_tool_call_coercion_and_key_order_preservation() {
     let filter_schema = obj_schema([
-        ("pattern", with_description(str_schema(), "Glob pattern"), true),
-        ("max_depth", with_bounds(int_schema(), Some(1.0), Some(10.0)), false),
+        (
+            "pattern",
+            with_description(str_schema(), "Glob pattern"),
+            true,
+        ),
+        (
+            "max_depth",
+            with_bounds(int_schema(), Some(1.0), Some(10.0)),
+            false,
+        ),
         ("include_hidden", bool_schema(), false),
     ]);
 
@@ -18,9 +26,17 @@ fn llm_tool_call_coercion_and_key_order_preservation() {
         obj_schema([
             ("path", with_length(str_schema(), Some(1), None), true),
             ("offset", with_bounds(int_schema(), Some(1.0), None), false),
-            ("temperature", with_bounds(num_schema(), Some(0.0), Some(2.0)), false),
+            (
+                "temperature",
+                with_bounds(num_schema(), Some(0.0), Some(2.0)),
+                false,
+            ),
             ("dry_run", with_default(bool_schema(), json!(false)), false),
-            ("tags", with_unique_items(arr_schema(str_schema()), true), false),
+            (
+                "tags",
+                with_unique_items(arr_schema(str_schema()), true),
+                false,
+            ),
             ("counts", arr_schema(int_schema()), false),
             ("cursor", opt_nullable(str_schema()), false),
             ("filter", filter_schema, false),
@@ -139,8 +155,14 @@ fn llm_tool_call_coercion_and_key_order_preservation() {
 fn unions_combinators_tuples_and_model_friendly_diagnostics() {
     // Union coercion chooses the first matching branch cleanly.
     let int_or_bool = CompiledSchema::compile(any_of([int_schema(), bool_schema()])).unwrap();
-    assert_eq!(int_or_bool.coerce_and_validate(&json!("-7")).unwrap(), json!(-7));
-    assert_eq!(int_or_bool.coerce_and_validate(&json!("true")).unwrap(), json!(true));
+    assert_eq!(
+        int_or_bool.coerce_and_validate(&json!("-7")).unwrap(),
+        json!(-7)
+    );
+    assert_eq!(
+        int_or_bool.coerce_and_validate(&json!("true")).unwrap(),
+        json!(true)
+    );
 
     // Tagged union + nested array item diagnostics.
     let action_schema = CompiledSchema::compile(one_of([
@@ -149,9 +171,11 @@ fn unions_combinators_tuples_and_model_friendly_diagnostics() {
             (
                 "items",
                 with_items_bounds(
-                    arr_schema(obj_schema([
-                        ("limit", with_bounds(int_schema(), Some(1.0), None), true),
-                    ])),
+                    arr_schema(obj_schema([(
+                        "limit",
+                        with_bounds(int_schema(), Some(1.0), None),
+                        true,
+                    )])),
                     Some(1),
                     None,
                 ),
@@ -227,10 +251,24 @@ fn unions_combinators_tuples_and_model_friendly_diagnostics() {
     .unwrap();
     assert!(combo.validate(&json!({ "id": "ok", "score": 10 })).is_ok());
     assert!(combo.validate(&json!({ "id": "forbidden" })).is_err());
-    assert!(combo.validate(&json!({ "id": "ok", "bad": "str" })).is_err());
+    assert!(
+        combo
+            .validate(&json!({ "id": "ok", "bad": "str" }))
+            .is_err()
+    );
 
-    assert!(CompiledSchema::compile(Value::Bool(true)).unwrap().validate(&json!(123)).is_ok());
-    assert!(CompiledSchema::compile(Value::Bool(false)).unwrap().validate(&json!(123)).is_err());
+    assert!(
+        CompiledSchema::compile(Value::Bool(true))
+            .unwrap()
+            .validate(&json!(123))
+            .is_ok()
+    );
+    assert!(
+        CompiledSchema::compile(Value::Bool(false))
+            .unwrap()
+            .validate(&json!(123))
+            .is_err()
+    );
 }
 
 #[test]
@@ -269,11 +307,8 @@ fn recursive_refs_and_cycle_termination() {
     );
 
     // Direct self-reference (`#`) with recursive array-wrapping must terminate on uncoercible input.
-    let nested_strings = CompiledSchema::compile(any_of([
-        str_schema(),
-        arr_schema(ref_schema("#")),
-    ]))
-    .unwrap();
+    let nested_strings =
+        CompiledSchema::compile(any_of([str_schema(), arr_schema(ref_schema("#"))])).unwrap();
     assert!(nested_strings.validate(&json!(["a", ["b", ["c"]]])).is_ok());
     let uncoercible = json!({ "unexpected": 1 });
     assert_eq!(nested_strings.coerce(&uncoercible), uncoercible);
@@ -313,28 +348,53 @@ fn unicode_lengths_formats_and_numeric_precision() {
         "required": ["step", "whole"]
     }))
     .unwrap();
-    assert!(num_checks.validate(&json!({ "step": 0.0075, "whole": 3.0 })).is_ok());
-    assert!(num_checks.validate(&json!({ "step": 0.00755, "whole": 3 })).is_err());
-    assert!(num_checks.validate(&json!({ "step": 0, "whole": 3 })).is_err());
+    assert!(
+        num_checks
+            .validate(&json!({ "step": 0.0075, "whole": 3.0 }))
+            .is_ok()
+    );
+    assert!(
+        num_checks
+            .validate(&json!({ "step": 0.00755, "whole": 3 }))
+            .is_err()
+    );
+    assert!(
+        num_checks
+            .validate(&json!({ "step": 0, "whole": 3 }))
+            .is_err()
+    );
 
     // Lightweight zero-regex format validators.
     let cases = [
         ("uri", "urn:isbn:0451450523", "not a uri"),
-        ("url", "https://example.com:8443/v1?q=1#top", "urn:isbn:0451450523"),
+        (
+            "url",
+            "https://example.com:8443/v1?q=1#top",
+            "urn:isbn:0451450523",
+        ),
         ("email", "dev+tag@sub.example.com", "invalid@@example"),
-        ("date-time", "2026-02-28T23:59:59.123+08:00", "2026-02-29T12:00:00Z"),
+        (
+            "date-time",
+            "2026-02-28T23:59:59.123+08:00",
+            "2026-02-29T12:00:00Z",
+        ),
         ("date", "2024-02-29", "2025-02-29"),
-        ("uuid", "550e8400-e29b-41d4-a716-446655440000", "550e8400-e29b-41d4-a716-44665544000z"),
+        (
+            "uuid",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550e8400-e29b-41d4-a716-44665544000z",
+        ),
         ("ipv4", "127.0.0.1", "256.0.0.1"),
         ("ipv6", "2001:db8::1", "2001:db8:::1"),
         ("json-pointer", "/properties/a~1b/c~0d", "no-leading-slash"),
     ];
     for (fmt, good, bad) in cases {
         let s = CompiledSchema::compile(with_format(str_schema(), fmt)).unwrap();
-        assert!(s.validate(&json!(good)).is_ok(), "format {fmt} should accept {good}");
-        let err = s
-            .validate(&json!(bad))
-            .unwrap_err();
+        assert!(
+            s.validate(&json!(good)).is_ok(),
+            "format {fmt} should accept {good}"
+        );
+        let err = s.validate(&json!(bad)).unwrap_err();
         assert_eq!(err.issues[0].message, format!("must be a valid {fmt}"));
     }
 }
@@ -344,7 +404,8 @@ fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
     // 1. Multi-byte UTF-8 input >= 20 bytes where byte offset 10 splits a UTF-8 char must never panic.
     let dt_schema = CompiledSchema::compile(with_format(str_schema(), "date-time")).unwrap();
     let d_schema = CompiledSchema::compile(with_format(str_schema(), "date")).unwrap();
-    for weird in ["你好世界你好世界", "🚀🚀🚀🚀🚀🚀", "2024-01-0好T00:00:00Z"] {
+    for weird in ["你好世界你好世界", "🚀🚀🚀🚀🚀🚀", "2024-01-0好T00:00:00Z"]
+    {
         assert!(dt_schema.validate(&json!(weird)).is_err());
         assert!(d_schema.validate(&json!(weird)).is_err());
     }
@@ -352,10 +413,22 @@ fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
     // 2. IPv4, IPv6 bracket literal + IPvFuture in URI/URL, port <= 65535, and single-label email.
     let uri_schema = CompiledSchema::compile(with_format(str_schema(), "uri")).unwrap();
     assert!(uri_schema.validate(&json!("http://[::1]:8080/api")).is_ok());
-    assert!(uri_schema.validate(&json!("http://[v1.fe80::a+en1]/x")).is_ok());
-    assert!(uri_schema.validate(&json!("https://example.com:65535/")).is_ok());
+    assert!(
+        uri_schema
+            .validate(&json!("http://[v1.fe80::a+en1]/x"))
+            .is_ok()
+    );
+    assert!(
+        uri_schema
+            .validate(&json!("https://example.com:65535/"))
+            .is_ok()
+    );
     assert!(uri_schema.validate(&json!("http://[not-ipv6]/x")).is_err());
-    assert!(uri_schema.validate(&json!("https://example.com:65536/")).is_err());
+    assert!(
+        uri_schema
+            .validate(&json!("https://example.com:65536/"))
+            .is_err()
+    );
     assert!(uri_schema.validate(&json!("http://[::1]:99999/")).is_err());
 
     let email_schema = CompiledSchema::compile(with_format(str_schema(), "email")).unwrap();
@@ -419,9 +492,18 @@ fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
     assert!(nullable_int.coerce_and_validate(&json!("3.5")).is_err());
 
     let bool_or_num = CompiledSchema::compile(json!({ "type": ["boolean", "number"] })).unwrap();
-    assert_eq!(bool_or_num.coerce_and_validate(&json!("1")).unwrap(), json!(1));
-    assert_eq!(bool_or_num.coerce_and_validate(&json!("true")).unwrap(), json!(true));
-    assert_eq!(bool_or_num.coerce_and_validate(&json!("false")).unwrap(), json!(false));
+    assert_eq!(
+        bool_or_num.coerce_and_validate(&json!("1")).unwrap(),
+        json!(1)
+    );
+    assert_eq!(
+        bool_or_num.coerce_and_validate(&json!("true")).unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        bool_or_num.coerce_and_validate(&json!("false")).unwrap(),
+        json!(false)
+    );
 
     // 6. Pass 1 optional `$ref` property null handling + inherited `required` across `$ref`.
     let ref_nulls = CompiledSchema::compile(json!({
@@ -454,7 +536,8 @@ fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
     );
 
     // 7. Huge bounds (u64::MAX / 1e30) must reject short strings/arrays/objects instead of being skipped.
-    let huge_str = CompiledSchema::compile(json!({ "type": "string", "minLength": u64::MAX })).unwrap();
+    let huge_str =
+        CompiledSchema::compile(json!({ "type": "string", "minLength": u64::MAX })).unwrap();
     assert!(huge_str.validate(&json!("abc")).is_err());
     let huge_arr = CompiledSchema::compile(json!({ "type": "array", "minItems": 1e30 })).unwrap();
     assert!(huge_arr.validate(&json!([1, 2])).is_err());
@@ -485,7 +568,11 @@ fn review_regressions_formats_cycles_key_order_precision_and_pointers() {
         }
     }))
     .unwrap();
-    assert!(pct_pointer.validate(&json!({ "slash": 7, "tilde": true })).is_ok());
+    assert!(
+        pct_pointer
+            .validate(&json!({ "slash": 7, "tilde": true }))
+            .is_ok()
+    );
     assert!(pct_pointer.validate(&json!({ "slash": "bad" })).is_err());
 
     let leading_zero_idx = CompiledSchema::compile(json!({

@@ -12,12 +12,12 @@ use pikra_ai::{
     ToolDefinition,
 };
 use pikra_kit::{
-    KitEvent, KitSession, KitSessionConfig, McpClient, McpToolRegistrationMode, StdioMcpConfig,
-    StdioMcpTransport, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, TOOL_SEARCH_NAME,
+    CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, KitEvent, KitSession, KitSessionConfig, McpClient,
+    McpToolRegistrationMode, StdioMcpConfig, StdioMcpTransport, TOOL_SEARCH_NAME,
 };
 use pikra_schema::{int_schema, obj_schema, str_schema};
-use pikra_testkit::{assert_prompt_prefix_identical, FauxTransport, ScriptedHttpResponse};
-use serde_json::{json, Value};
+use pikra_testkit::{FauxTransport, ScriptedHttpResponse, assert_prompt_prefix_identical};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -109,7 +109,11 @@ fn make_echo_tool(name: &str, description: &str) -> Arc<dyn AgentTool> {
     }))
 }
 
-fn json_http_response(status: u16, headers: Vec<(String, String)>, body: Value) -> ScriptedHttpResponse {
+fn json_http_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Value,
+) -> ScriptedHttpResponse {
     let mut all_headers = headers;
     all_headers.push(("content-type".into(), "application/json".into()));
     let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
@@ -304,10 +308,12 @@ fn codemode_exec_bridges_resident_and_deferred_tools_without_recursion() {
             .with_codemode(true);
 
         let session = KitSession::new(provider, config).unwrap();
-        assert!(session
-            .resident_tool_definitions()
-            .iter()
-            .any(|t| t.name == CODEMODE_EXEC_TOOL_NAME));
+        assert!(
+            session
+                .resident_tool_definitions()
+                .iter()
+                .any(|t| t.name == CODEMODE_EXEC_TOOL_NAME)
+        );
 
         let script = r#"
             const sum = await tools.deferred_add({ a: 10, b: 32 });
@@ -349,7 +355,10 @@ fn codemode_exec_bridges_resident_and_deferred_tools_without_recursion() {
         let parsed: Value = serde_json::from_str(&exec_result_text.expect("exec output")).unwrap();
         assert_eq!(parsed["echoed"], "echo:val=42");
         assert_eq!(parsed["sum"], 42);
-        assert_eq!(parsed["hasExec"], false, "exec must be excluded to prevent recursion");
+        assert_eq!(
+            parsed["hasExec"], false,
+            "exec must be excluded to prevent recursion"
+        );
     });
 }
 
@@ -423,7 +432,10 @@ fn streamable_http_mcp_client_json_and_sse_integrated_into_kit_session() {
         ));
         llm_http.enqueue_sse(openai_sse_text("m2", "It is 22C and sunny in Tokyo."));
 
-        let msgs = session.prompt("What is the weather in Tokyo?").await.unwrap();
+        let msgs = session
+            .prompt("What is the weather in Tokyo?")
+            .await
+            .unwrap();
         let tr = msgs
             .iter()
             .find_map(|m| match m {
@@ -443,11 +455,17 @@ fn streamable_http_mcp_client_json_and_sse_integrated_into_kit_session() {
         assert_eq!(mcp_reqs[0].body_json["method"], "initialize");
         assert_eq!(mcp_reqs[1].body_json["method"], "notifications/initialized");
         assert_eq!(mcp_reqs[1].header("mcp-session-id"), Some("sess_abc123"));
-        assert_eq!(mcp_reqs[1].header("mcp-protocol-version"), Some("2025-03-26"));
+        assert_eq!(
+            mcp_reqs[1].header("mcp-protocol-version"),
+            Some("2025-03-26")
+        );
         assert_eq!(mcp_reqs[2].body_json["method"], "tools/list");
         assert_eq!(mcp_reqs[3].body_json["method"], "tools/call");
         assert_eq!(mcp_reqs[3].body_json["params"]["name"], "lookup_weather");
-        assert_eq!(mcp_reqs[3].body_json["params"]["arguments"]["city"], "Tokyo");
+        assert_eq!(
+            mcp_reqs[3].body_json["params"]["arguments"]["city"],
+            "Tokyo"
+        );
     });
 }
 

@@ -3,9 +3,9 @@ mod framing;
 mod protocol;
 mod runtime;
 
-use args::{help_text, parse_args, version_text, CliAction, CliMode};
+use args::{CliAction, CliMode, help_text, parse_args, version_text};
 use framing::{JsonlReader, JsonlWriterGuard};
-use protocol::{parse_command_line, RpcResponse};
+use protocol::{RpcResponse, parse_command_line};
 use runtime::RpcRuntime;
 use std::process::ExitCode;
 
@@ -151,7 +151,7 @@ impl ShutdownSignals {
     fn new() -> Self {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             Self {
                 sigterm: signal(SignalKind::terminate()).ok(),
                 sigint: signal(SignalKind::interrupt()).ok(),

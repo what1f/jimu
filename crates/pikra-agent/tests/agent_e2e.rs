@@ -1,5 +1,5 @@
 use futures_channel::oneshot;
-use futures_executor::{block_on, ThreadPool};
+use futures_executor::{ThreadPool, block_on};
 use futures_util::stream::{self, StreamExt};
 use pikra_agent::{
     AfterToolCallCtx, AfterToolCallResult, Agent, AgentConfig, AgentContextSnapshot, AgentEvent,
@@ -13,7 +13,7 @@ use pikra_ai::{
     TranscriptContext, Usage,
 };
 use pikra_schema::{obj_schema, str_schema};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,8 +43,9 @@ struct RecordedRequest {
     fast: Option<bool>,
 }
 
-type ScriptedResponseFn =
-    Box<dyn FnOnce(&Model, &TranscriptContext, &SimpleStreamOptions) -> AssistantEventStream + Send>;
+type ScriptedResponseFn = Box<
+    dyn FnOnce(&Model, &TranscriptContext, &SimpleStreamOptions) -> AssistantEventStream + Send,
+>;
 
 struct ScriptedProvider {
     responses: Mutex<VecDeque<ScriptedResponseFn>>,
@@ -223,7 +224,10 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
                 Box::pin(async move {
                     let rx = rx_slot.lock().unwrap().take().unwrap();
                     let _ = rx.await;
-                    Ok(AgentToolResult::text(format!("A:{}", args["tag"].as_str().unwrap())))
+                    Ok(AgentToolResult::text(format!(
+                        "A:{}",
+                        args["tag"].as_str().unwrap()
+                    )))
                 })
             },
         ));
@@ -241,7 +245,10 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
                     if let Some(tx) = tx_slot.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
-                    Ok(AgentToolResult::text(format!("B:{}", args["tag"].as_str().unwrap())))
+                    Ok(AgentToolResult::text(format!(
+                        "B:{}",
+                        args["tag"].as_str().unwrap()
+                    )))
                 })
             },
         ));
@@ -264,10 +271,30 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
                 assistant_stream_from_blocks(
                     model,
                     vec![
-                        AssistantBlock::ToolCall(make_tool_call("call_a", "slow_a", json!({"tag": "first"}), None)),
-                        AssistantBlock::ToolCall(make_tool_call("call_b", "fast_b", json!({"tag": "second"}), None)),
-                        AssistantBlock::ToolCall(make_tool_call("call_bad", "slow_a", json!({}), Some("malformed JSON args"))),
-                        AssistantBlock::ToolCall(make_tool_call("call_missing", "nope_tool", json!({}), None)),
+                        AssistantBlock::ToolCall(make_tool_call(
+                            "call_a",
+                            "slow_a",
+                            json!({"tag": "first"}),
+                            None,
+                        )),
+                        AssistantBlock::ToolCall(make_tool_call(
+                            "call_b",
+                            "fast_b",
+                            json!({"tag": "second"}),
+                            None,
+                        )),
+                        AssistantBlock::ToolCall(make_tool_call(
+                            "call_bad",
+                            "slow_a",
+                            json!({}),
+                            Some("malformed JSON args"),
+                        )),
+                        AssistantBlock::ToolCall(make_tool_call(
+                            "call_missing",
+                            "nope_tool",
+                            json!({}),
+                            None,
+                        )),
                     ],
                     StopReason::ToolUse,
                     usage1,
@@ -277,7 +304,9 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
             Box::new(move |model, _ctx, _opts| {
                 assistant_stream_from_blocks(
                     model,
-                    vec![AssistantBlock::Text(TextContent::plain("All tools settled."))],
+                    vec![AssistantBlock::Text(TextContent::plain(
+                        "All tools settled.",
+                    ))],
                     StopReason::Stop,
                     usage2,
                     None,
@@ -308,7 +337,10 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
                 _ => None,
             })
             .collect();
-        assert_eq!(start_ids, vec!["call_a", "call_b", "call_bad", "call_missing"]);
+        assert_eq!(
+            start_ids,
+            vec!["call_a", "call_b", "call_bad", "call_missing"]
+        );
 
         // Verify ToolExecutionEnd fires out-of-order: immediate errors during preflight,
         // then fast_b completes strictly before slow_a!
@@ -321,7 +353,10 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
             .collect();
         let pos_b = end_ids.iter().position(|&id| id == "call_b").unwrap();
         let pos_a = end_ids.iter().position(|&id| id == "call_a").unwrap();
-        assert!(pos_b < pos_a, "expected call_b to finish before call_a, got {end_ids:?}");
+        assert!(
+            pos_b < pos_a,
+            "expected call_b to finish before call_a, got {end_ids:?}"
+        );
 
         // Verify ToolExecutionUpdate for call_b arrived before ToolExecutionEnd for call_b
         let update_pos = events
@@ -344,18 +379,29 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
                 _ => None,
             })
             .collect();
-        assert_eq!(emitted_tr_ids, vec!["call_a", "call_b", "call_bad", "call_missing"]);
+        assert_eq!(
+            emitted_tr_ids,
+            vec!["call_a", "call_b", "call_bad", "call_missing"]
+        );
 
         // Verify TurnEnd.tool_results preserves source order & error details
         let turn1_results = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::TurnEnd { tool_results, .. } if !tool_results.is_empty() => Some(tool_results),
+                AgentEvent::TurnEnd { tool_results, .. } if !tool_results.is_empty() => {
+                    Some(tool_results)
+                }
                 _ => None,
             })
             .unwrap();
-        let turn1_ids: Vec<&str> = turn1_results.iter().map(|tr| tr.tool_call_id.as_str()).collect();
-        assert_eq!(turn1_ids, vec!["call_a", "call_b", "call_bad", "call_missing"]);
+        let turn1_ids: Vec<&str> = turn1_results
+            .iter()
+            .map(|tr| tr.tool_call_id.as_str())
+            .collect();
+        assert_eq!(
+            turn1_ids,
+            vec!["call_a", "call_b", "call_bad", "call_missing"]
+        );
         assert_eq!(first_text(&turn1_results[0].content), "A:first");
         assert_eq!(first_text(&turn1_results[1].content), "B:second");
         assert!(turn1_results[2].is_error);
@@ -375,15 +421,20 @@ fn parallel_tools_out_of_order_completion_and_source_order_persistence() {
                 _ => None,
             })
             .collect();
-        assert_eq!(transcript_tr_ids, vec!["call_a", "call_b", "call_bad", "call_missing"]);
+        assert_eq!(
+            transcript_tr_ids,
+            vec!["call_a", "call_b", "call_bad", "call_missing"]
+        );
 
         // Verify RequestUsage emitted once per LLM request (2 requests)
         let usages: Vec<(String, String, u64)> = events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::RequestUsage { model, provider, usage } => {
-                    Some((model.clone(), provider.clone(), usage.total_tokens))
-                }
+                AgentEvent::RequestUsage {
+                    model,
+                    provider,
+                    usage,
+                } => Some((model.clone(), provider.clone(), usage.total_tokens)),
                 _ => None,
             })
             .collect();
@@ -590,8 +641,18 @@ fn middleware_chain_overrides_blocking_redaction_terminate_and_finish_turn() {
                 assistant_stream_from_blocks(
                     model,
                     vec![
-                        AssistantBlock::ToolCall(make_tool_call("c1", "blocked_tool", json!({}), None)),
-                        AssistantBlock::ToolCall(make_tool_call("c2", "echo_tool", json!({"text": "raw"}), None)),
+                        AssistantBlock::ToolCall(make_tool_call(
+                            "c1",
+                            "blocked_tool",
+                            json!({}),
+                            None,
+                        )),
+                        AssistantBlock::ToolCall(make_tool_call(
+                            "c2",
+                            "echo_tool",
+                            json!({"text": "raw"}),
+                            None,
+                        )),
                     ],
                     StopReason::ToolUse,
                     Usage::default(),
@@ -602,7 +663,9 @@ fn middleware_chain_overrides_blocking_redaction_terminate_and_finish_turn() {
             Box::new(|model, _ctx, _opts| {
                 assistant_stream_from_blocks(
                     model,
-                    vec![AssistantBlock::Text(TextContent::plain("first normal reply"))],
+                    vec![AssistantBlock::Text(TextContent::plain(
+                        "first normal reply",
+                    ))],
                     StopReason::Stop,
                     Usage::default(),
                     None,
@@ -644,8 +707,14 @@ fn middleware_chain_overrides_blocking_redaction_terminate_and_finish_turn() {
         );
 
         let run1_msgs = agent.prompt("test middleware").await.unwrap();
-        assert!(barrier_ok.load(Ordering::SeqCst), "before_tool_call must see AssistantMessage");
-        assert!(!blocked_executed.load(Ordering::SeqCst), "blocked tool must not execute");
+        assert!(
+            barrier_ok.load(Ordering::SeqCst),
+            "before_tool_call must see AssistantMessage"
+        );
+        assert!(
+            !blocked_executed.load(Ordering::SeqCst),
+            "blocked tool must not execute"
+        );
         assert_eq!(*echo_received.lock().unwrap(), "overridden-arg");
 
         // Verify 3 LLM requests were made (Turn 1 tools -> Turn 2 reply -> Turn 3 forced Continue)
@@ -764,7 +833,12 @@ fn mid_turn_steer_and_abort_waits_for_tool_teardown_without_spurious_busy() {
             Box::new(|model, _ctx, _opts| {
                 assistant_stream_from_blocks(
                     model,
-                    vec![AssistantBlock::ToolCall(make_tool_call("t1", "step_one", json!({}), None))],
+                    vec![AssistantBlock::ToolCall(make_tool_call(
+                        "t1",
+                        "step_one",
+                        json!({}),
+                        None,
+                    ))],
                     StopReason::ToolUse,
                     Usage::default(),
                     None,
@@ -774,7 +848,12 @@ fn mid_turn_steer_and_abort_waits_for_tool_teardown_without_spurious_busy() {
             Box::new(|model, _ctx, _opts| {
                 assistant_stream_from_blocks(
                     model,
-                    vec![AssistantBlock::ToolCall(make_tool_call("t2", "barrier_tool", json!({}), None))],
+                    vec![AssistantBlock::ToolCall(make_tool_call(
+                        "t2",
+                        "barrier_tool",
+                        json!({}),
+                        None,
+                    ))],
                     StopReason::ToolUse,
                     Usage::default(),
                     None,
@@ -834,7 +913,10 @@ fn mid_turn_steer_and_abort_waits_for_tool_teardown_without_spurious_busy() {
 
         // Wait until barrier_tool observes cancellation while still tearing down
         cancel_observed_rx.await.unwrap();
-        assert!(agent.is_running(), "agent must remain running until tool teardown completes");
+        assert!(
+            agent.is_running(),
+            "agent must remain running until tool teardown completes"
+        );
         assert!(!teardown_completed.load(Ordering::SeqCst));
 
         // Allow barrier_tool teardown to complete
@@ -850,11 +932,15 @@ fn mid_turn_steer_and_abort_waits_for_tool_teardown_without_spurious_busy() {
             "abort().await must wait for in-flight tool teardown"
         );
         // 2) Active-run lock MUST be cleared -> immediate state mutations & next prompt NEVER return Busy!
-        agent.set_model(test_model("model-v2")).expect("set_model must not fail with Busy");
+        agent
+            .set_model(test_model("model-v2"))
+            .expect("set_model must not fail with Busy");
         agent
             .set_thinking_level(ThinkingLevel::Medium)
             .expect("set_thinking_level must not fail with Busy");
-        agent.set_fast(true).expect("set_fast must not fail with Busy");
+        agent
+            .set_fast(true)
+            .expect("set_fast must not fail with Busy");
 
         let _ = run_done_rx.await.unwrap().unwrap();
 
@@ -884,11 +970,13 @@ fn mid_turn_steer_and_abort_waits_for_tool_teardown_without_spurious_busy() {
             .unwrap();
         let s1_msg_start_pos = events
             .iter()
-            .position(|e| matches!(
-                e,
-                AgentEvent::MessageStart { message: AgentMessage::Llm(Message::User(u)) }
-                if u.id.as_deref() == Some("s1")
-            ))
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::MessageStart { message: AgentMessage::Llm(Message::User(u)) }
+                    if u.id.as_deref() == Some("s1")
+                )
+            })
             .unwrap();
         assert!(s1_steered_pos < s1_msg_start_pos);
 

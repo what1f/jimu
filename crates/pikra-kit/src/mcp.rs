@@ -7,7 +7,7 @@ use pikra_ai::{
 };
 use pikra_schema::Schema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -207,7 +207,10 @@ impl StreamableHttpMcpTransport {
             out.push(("content-type".into(), "application/json".into()));
         }
         if !has_header(&out, "accept") {
-            out.push(("accept".into(), "application/json, text/event-stream".into()));
+            out.push((
+                "accept".into(),
+                "application/json, text/event-stream".into(),
+            ));
         }
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sid) = &guard.session_id
@@ -257,12 +260,18 @@ async fn read_all_bytes(
     Ok(buf)
 }
 
-fn extract_matching_response(value: Value, expected_id: u64) -> Result<Option<JsonRpcResponse>, McpError> {
+fn extract_matching_response(
+    value: Value,
+    expected_id: u64,
+) -> Result<Option<JsonRpcResponse>, McpError> {
     match value {
         Value::Array(items) => {
             for item in items {
                 if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(item)
-                    && resp.id.as_ref().is_some_and(|id| id.matches_u64(expected_id))
+                    && resp
+                        .id
+                        .as_ref()
+                        .is_some_and(|id| id.matches_u64(expected_id))
                     && (resp.result.is_some() || resp.error.is_some())
                 {
                     return Ok(Some(resp));
@@ -272,7 +281,10 @@ fn extract_matching_response(value: Value, expected_id: u64) -> Result<Option<Js
         }
         Value::Object(_) => {
             let resp: JsonRpcResponse = serde_json::from_value(value)?;
-            if resp.id.as_ref().is_some_and(|id| id.matches_u64(expected_id))
+            if resp
+                .id
+                .as_ref()
+                .is_some_and(|id| id.matches_u64(expected_id))
                 && (resp.result.is_some() || resp.error.is_some())
             {
                 Ok(Some(resp))
@@ -470,6 +482,8 @@ mod stdio {
         }
     }
 
+    const MAX_STDIO_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
     #[cfg(unix)]
     fn kill_process_group(pid: u32) {
         if pid == 0 || pid > i32::MAX as u32 {
@@ -480,7 +494,7 @@ mod stdio {
         }
         const SIGKILL: i32 = 9;
         // SAFETY: `pid` is the process group leader created via `Command::process_group(0)`
-        // and we only signal it while the child has not yet been reaped.
+        // and we signal `-pid` BEFORE reaping `child`, so the OS cannot have recycled `pid`.
         unsafe {
             let _ = kill(-(pid as i32), SIGKILL);
         }
@@ -489,12 +503,30 @@ mod stdio {
     #[cfg(not(unix))]
     fn kill_process_group(_pid: u32) {}
 
-    type PendingMap = HashMap<u64, oneshot::Sender<Result<JsonRpcResponse, McpError>>>;
+    struct PendingState {
+        closed: bool,
+        closed_reason: String,
+        waiters: HashMap<u64, oneshot::Sender<Result<JsonRpcResponse, McpError>>>,
+    }
 
-    fn fail_all_pending(pending: &Mutex<PendingMap>, message: &str) {
+    impl PendingState {
+        fn new() -> Self {
+            Self {
+                closed: false,
+                closed_reason: String::new(),
+                waiters: HashMap::new(),
+            }
+        }
+    }
+
+    fn close_and_fail_all_pending(pending: &Mutex<PendingState>, message: &str) {
         let waiters: Vec<_> = {
-            let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
-            map.drain().map(|(_, tx)| tx).collect()
+            let mut state = pending.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            if state.closed_reason.is_empty() {
+                state.closed_reason = message.to_string();
+            }
+            state.waiters.drain().map(|(_, tx)| tx).collect()
         };
         for tx in waiters {
             let _ = tx.send(Err(McpError::Protocol(message.to_string())));
@@ -508,14 +540,65 @@ mod stdio {
         }
     }
 
-    fn dispatch_parsed_frame(value: Value, pending: &Mutex<PendingMap>) {
+    async fn write_raw_frame(
+        stdin: &AsyncMutex<Option<ChildStdin>>,
+        frame: &[u8],
+    ) -> Result<(), McpError> {
+        let mut guard = stdin.lock().await;
+        let pipe = guard
+            .as_mut()
+            .ok_or_else(|| McpError::Protocol("stdio MCP transport is closed".into()))?;
+        pipe.write_all(frame)
+            .await
+            .map_err(|err| McpError::Protocol(format!("stdio MCP write error: {err}")))?;
+        pipe.flush()
+            .await
+            .map_err(|err| McpError::Protocol(format!("stdio MCP flush error: {err}")))?;
+        Ok(())
+    }
+
+    async fn dispatch_parsed_frame(
+        value: Value,
+        pending: &Mutex<PendingState>,
+        stdin: &Arc<AsyncMutex<Option<ChildStdin>>>,
+    ) {
         match value {
             Value::Array(items) => {
                 for item in items {
-                    dispatch_parsed_frame(item, pending);
+                    Box::pin(dispatch_parsed_frame(item, pending, stdin)).await;
                 }
             }
-            Value::Object(_) => {
+            Value::Object(ref map) => {
+                // Handle inbound server-to-client requests (such as `ping`) that carry both `method` and `id`.
+                if let Some(method) = map.get("method").and_then(Value::as_str) {
+                    if let Some(req_id) = map.get("id").filter(|v| !v.is_null()) {
+                        let reply = if method == "ping" {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": {},
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {
+                                    "code": -32601,
+                                    "message": format!("Method not found: {method}"),
+                                },
+                            })
+                        };
+                        if let Ok(mut frame) = serde_json::to_vec(&reply) {
+                            frame.push(b'\n');
+                            let stdin_clone = Arc::clone(stdin);
+                            tokio::spawn(async move {
+                                let _ = write_raw_frame(&stdin_clone, &frame).await;
+                            });
+                        }
+                    }
+                    return;
+                }
+
                 if let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(value)
                     && (resp.result.is_some() || resp.error.is_some())
                     && let Some(id) = resp.id.as_ref().and_then(id_as_u64)
@@ -523,6 +606,7 @@ mod stdio {
                     let waiter = pending
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
+                        .waiters
                         .remove(&id);
                     if let Some(tx) = waiter {
                         let _ = tx.send(Ok(resp));
@@ -533,12 +617,66 @@ mod stdio {
         }
     }
 
+    enum ReadFrameOutcome {
+        Line(Vec<u8>),
+        Eof,
+        TooLarge,
+        IoError(std::io::Error),
+    }
+
+    async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> ReadFrameOutcome {
+        buf.clear();
+        let mut over_limit = false;
+        loop {
+            let available = match reader.fill_buf().await {
+                Ok([]) => {
+                    if buf.is_empty() && !over_limit {
+                        return ReadFrameOutcome::Eof;
+                    }
+                    return if over_limit {
+                        ReadFrameOutcome::TooLarge
+                    } else {
+                        ReadFrameOutcome::Line(std::mem::take(buf))
+                    };
+                }
+                Ok(slice) => slice,
+                Err(err) => return ReadFrameOutcome::IoError(err),
+            };
+
+            if let Some(nl_pos) = available.iter().position(|&b| b == b'\n') {
+                let take_len = nl_pos + 1;
+                if !over_limit && buf.len().saturating_add(take_len) <= max_bytes {
+                    buf.extend_from_slice(&available[..take_len]);
+                    reader.consume(take_len);
+                    return ReadFrameOutcome::Line(std::mem::take(buf));
+                }
+                reader.consume(take_len);
+                return ReadFrameOutcome::TooLarge;
+            }
+
+            let chunk_len = available.len();
+            if !over_limit {
+                if buf.len().saturating_add(chunk_len) <= max_bytes {
+                    buf.extend_from_slice(available);
+                } else {
+                    buf.clear();
+                    over_limit = true;
+                }
+            }
+            reader.consume(chunk_len);
+        }
+    }
+
     /// Newline-delimited JSON-RPC 2.0 MCP transport over a child process's `stdin`/`stdout`.
     pub struct StdioMcpTransport {
-        stdin: AsyncMutex<Option<ChildStdin>>,
+        stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
         child: Mutex<Option<Child>>,
         child_pid: AtomicU32,
-        pending: Arc<Mutex<PendingMap>>,
+        pending: Arc<Mutex<PendingState>>,
         reader_task: Mutex<Option<JoinHandle<()>>>,
         closed: AtomicBool,
     }
@@ -547,7 +685,9 @@ mod stdio {
         /// Spawn the configured MCP subprocess and start its stdout JSON-RPC frame reader.
         pub fn spawn(config: StdioMcpConfig) -> Result<Self, McpError> {
             let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                McpError::Protocol("StdioMcpTransport::spawn requires an active Tokio runtime".into())
+                McpError::Protocol(
+                    "StdioMcpTransport::spawn requires an active Tokio runtime".into(),
+                )
             })?;
 
             let mut cmd = Command::new(&config.command);
@@ -580,32 +720,44 @@ mod stdio {
                 McpError::Protocol("failed to capture stdio MCP child stdout".into())
             })?;
 
-            let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+            let stdin_arc = Arc::new(AsyncMutex::new(Some(stdin)));
+            let pending = Arc::new(Mutex::new(PendingState::new()));
             let reader_pending = Arc::clone(&pending);
+            let reader_stdin = Arc::clone(&stdin_arc);
             let reader_task = handle.spawn(async move {
                 let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
+                let mut raw_buf = Vec::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => {
-                            fail_all_pending(
+                    match read_bounded_line(&mut reader, &mut raw_buf, MAX_STDIO_FRAME_BYTES).await
+                    {
+                        ReadFrameOutcome::Eof => {
+                            close_and_fail_all_pending(
                                 &reader_pending,
                                 "stdio MCP server closed stdout before responding",
                             );
                             break;
                         }
-                        Ok(_) => {
-                            let trimmed = line.trim();
+                        ReadFrameOutcome::TooLarge => {
+                            close_and_fail_all_pending(
+                                &reader_pending,
+                                "stdio MCP stdout frame exceeded 16 MiB limit",
+                            );
+                            break;
+                        }
+                        ReadFrameOutcome::Line(bytes) => {
+                            let Ok(text) = std::str::from_utf8(&bytes) else {
+                                continue;
+                            };
+                            let trimmed = text.trim();
                             if trimmed.is_empty() {
                                 continue;
                             }
                             if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                                dispatch_parsed_frame(val, &reader_pending);
+                                dispatch_parsed_frame(val, &reader_pending, &reader_stdin).await;
                             }
                         }
-                        Err(err) => {
-                            fail_all_pending(
+                        ReadFrameOutcome::IoError(err) => {
+                            close_and_fail_all_pending(
                                 &reader_pending,
                                 &format!("stdio MCP stdout read error: {err}"),
                             );
@@ -616,7 +768,7 @@ mod stdio {
             });
 
             Ok(Self {
-                stdin: AsyncMutex::new(Some(stdin)),
+                stdin: stdin_arc,
                 child: Mutex::new(Some(child)),
                 child_pid: AtomicU32::new(pid),
                 pending,
@@ -625,13 +777,8 @@ mod stdio {
             })
         }
 
-        /// Close stdin, terminate the child process group cleanly, and fail any pending waiters.
-        pub async fn close(&self) {
+        fn terminate_process_group_sync(&self) -> Option<Child> {
             self.closed.store(true, Ordering::SeqCst);
-            {
-                let mut stdin_guard = self.stdin.lock().await;
-                let _ = stdin_guard.take();
-            }
             if let Some(handle) = self
                 .reader_task
                 .lock()
@@ -640,54 +787,43 @@ mod stdio {
             {
                 handle.abort();
             }
-            fail_all_pending(&self.pending, "stdio MCP transport closed");
+            close_and_fail_all_pending(&self.pending, "stdio MCP transport closed");
 
             let pid = self.child_pid.swap(0, Ordering::SeqCst);
-            let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if pid > 0 {
+                // Signal the entire process group BEFORE reaping `child` so worker descendants
+                // are terminated even if the group leader already exited on its own.
+                kill_process_group(pid);
+            }
+            if let Some(ref mut c) = child {
+                let _ = c.start_kill();
+            }
+            child
+        }
+
+        /// Close stdin, terminate the child process group cleanly, and fail any pending waiters.
+        pub async fn close(&self) {
+            // Terminate child process group BEFORE acquiring `self.stdin` so any in-flight
+            // `write_frame` blocked on a full pipe unblocks with EPIPE immediately.
+            let child = self.terminate_process_group_sync();
+            {
+                let mut stdin_guard = self.stdin.lock().await;
+                let _ = stdin_guard.take();
+            }
             if let Some(mut child) = child {
-                let still_running = matches!(child.try_wait(), Ok(None));
-                if still_running {
-                    kill_process_group(pid);
-                    let _ = child.kill().await;
-                }
+                let _ = child.wait().await;
             }
         }
 
         async fn write_frame(&self, frame: &[u8]) -> Result<(), McpError> {
-            let mut guard = self.stdin.lock().await;
-            let stdin = guard.as_mut().ok_or_else(|| {
-                McpError::Protocol("stdio MCP transport is closed".into())
-            })?;
-            stdin
-                .write_all(frame)
-                .await
-                .map_err(|err| McpError::Protocol(format!("stdio MCP write error: {err}")))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|err| McpError::Protocol(format!("stdio MCP flush error: {err}")))?;
-            Ok(())
+            write_raw_frame(&self.stdin, frame).await
         }
     }
 
     impl Drop for StdioMcpTransport {
         fn drop(&mut self) {
-            self.closed.store(true, Ordering::SeqCst);
-            if let Some(handle) = self
-                .reader_task
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                handle.abort();
-            }
-            let pid = self.child_pid.swap(0, Ordering::SeqCst);
-            if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take()
-                && matches!(child.try_wait(), Ok(None))
-            {
-                kill_process_group(pid);
-                let _ = child.start_kill();
-            }
+            let _ = self.terminate_process_group_sync();
         }
     }
 
@@ -718,15 +854,43 @@ mod stdio {
                 frame.push(b'\n');
 
                 let (tx, rx) = oneshot::channel();
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(id, tx);
+                {
+                    let mut state = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.closed || self.closed.load(Ordering::SeqCst) {
+                        let msg = if state.closed_reason.is_empty() {
+                            "stdio MCP transport is closed".to_string()
+                        } else {
+                            state.closed_reason.clone()
+                        };
+                        return Err(McpError::Protocol(msg));
+                    }
+                    state.waiters.insert(id, tx);
+                }
 
-                if let Err(err) = self.write_frame(&frame).await {
+                let write_res = {
+                    let write_fut = self.write_frame(&frame);
+                    let cancel_write = cancel.cancelled();
+                    futures_util::pin_mut!(write_fut, cancel_write);
+                    match future::select(write_fut, cancel_write).await {
+                        Either::Left((res, _)) => res,
+                        Either::Right(((), _)) => {
+                            self.pending
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .waiters
+                                .remove(&id);
+                            // Cancelling mid-write can leave a partial JSON frame on the pipe; tear down cleanly.
+                            self.close().await;
+                            return Err(McpError::Cancelled);
+                        }
+                    }
+                };
+
+                if let Err(err) = write_res {
                     self.pending
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
+                        .waiters
                         .remove(&id);
                     return Err(err);
                 }
@@ -739,10 +903,28 @@ mod stdio {
                         "stdio MCP response channel closed".into(),
                     )),
                     Either::Right(((), _)) => {
-                        self.pending
+                        let removed = self
+                            .pending
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .remove(&id);
+                            .waiters
+                            .remove(&id)
+                            .is_some();
+                        if removed
+                            && method != "initialize"
+                            && !self.closed.load(Ordering::SeqCst)
+                            && let Ok(mut cancel_frame) = serde_json::to_vec(&json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/cancelled",
+                                "params": {
+                                    "requestId": id,
+                                    "reason": "Request cancelled",
+                                },
+                            }))
+                        {
+                            cancel_frame.push(b'\n');
+                            let _ = self.write_frame(&cancel_frame).await;
+                        }
                         Err(McpError::Cancelled)
                     }
                 }
@@ -809,7 +991,9 @@ impl McpClient {
         url: impl Into<String>,
         headers: Vec<(String, String)>,
     ) -> Self {
-        Self::new(Arc::new(StreamableHttpMcpTransport::new(http, url, headers)))
+        Self::new(Arc::new(StreamableHttpMcpTransport::new(
+            http, url, headers,
+        )))
     }
 
     pub fn initialize_result(&self) -> Option<McpInitializeResult> {
@@ -857,7 +1041,9 @@ impl McpClient {
             }
         });
 
-        let raw = self.rpc_call("initialize", Some(params), cancel.clone()).await?;
+        let raw = self
+            .rpc_call("initialize", Some(params), cancel.clone())
+            .await?;
         let init: McpInitializeResult = serde_json::from_value(raw)?;
         self.transport
             .set_protocol_version(init.protocol_version.clone());
@@ -910,10 +1096,7 @@ impl McpClient {
             "arguments": arguments,
         });
         let raw = self.rpc_call("tools/call", Some(params), cancel).await?;
-        let is_error = raw
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let is_error = raw.get("isError").and_then(Value::as_bool).unwrap_or(false);
         let structured_content = raw.get("structuredContent").cloned();
 
         let mut content = Vec::new();

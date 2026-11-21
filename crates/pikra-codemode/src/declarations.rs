@@ -123,7 +123,13 @@ fn to_object_schema_type(map: &Map<String, Value>, ctx: &mut SchemaRenderCtx<'_>
             .iter()
             .map(|v| to_type(v, ctx))
             .filter(|s| s != "unknown")
-            .map(|s| if s.contains(" | ") { format!("({s})") } else { s })
+            .map(|s| {
+                if s.contains(" | ") {
+                    format!("({s})")
+                } else {
+                    s
+                }
+            })
             .collect();
         return if parts.is_empty() {
             "unknown".to_string()

@@ -18,6 +18,8 @@ public struct PikraWorkspaceTools: Sendable {
     public let environment: (@Sendable () async -> [String: String])?
     public let shellOutputLimit: Int
 
+    private let writeCoordinator = FileWriteCoordinator()
+
     private static let maxReadFileBytes = 16 * 1024 * 1024
     private static let maxShellCommandBytes = 65_536
     private static let defaultShellTimeoutSeconds: Double = 120
@@ -85,16 +87,64 @@ public struct PikraWorkspaceTools: Sendable {
         return workspace.appendingPathComponent(rawPath).standardizedFileURL
     }
 
-    private static func regularFileSize(at url: URL) throws -> Int {
-        var st = Darwin.stat()
-        guard stat(url.path, &st) == 0 else {
+    private static func resolveMutationTarget(_ url: URL) -> URL {
+        var lst = Darwin.stat()
+        if Darwin.lstat(url.path, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFLNK {
+            return url.resolvingSymlinksInPath().standardizedFileURL
+        }
+        return url.standardizedFileURL
+    }
+
+    /// Opens `url` once with `O_RDONLY | O_NONBLOCK`, validates `fstat` (`S_IFREG` and `<= maxReadFileBytes`),
+    /// and reads from the same file descriptor so symlinks/FIFOs/race-condition growth never hang or OOM.
+    private static func readRegularFileData(at url: URL) throws -> Data {
+        let fd = Darwin.open(url.path, O_RDONLY | O_NONBLOCK)
+        guard fd >= 0 else {
             let code = errno
             throw PikraError.io("Cannot access \(url.path): \(String(cString: strerror(code)))")
+        }
+        defer { Darwin.close(fd) }
+
+        var st = Darwin.stat()
+        guard Darwin.fstat(fd, &st) == 0 else {
+            let code = errno
+            throw PikraError.io("Cannot stat \(url.path): \(String(cString: strerror(code)))")
         }
         guard (st.st_mode & S_IFMT) == S_IFREG else {
             throw PikraError.invalidArgument("Path is not a regular file: \(url.path)")
         }
-        return Int(st.st_size)
+        let declaredSize = Int(st.st_size)
+        if declaredSize > maxReadFileBytes {
+            throw PikraError.invalidArgument("File exceeds 16 MiB limit (\(declaredSize) bytes): \(url.path)")
+        }
+
+        let flags = Darwin.fcntl(fd, F_GETFL)
+        if flags >= 0, (flags & O_NONBLOCK) != 0 {
+            _ = Darwin.fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
+        }
+
+        var data = Data()
+        if declaredSize > 0 {
+            data.reserveCapacity(min(declaredSize, maxReadFileBytes))
+        }
+        var buf = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let n = Darwin.read(fd, &buf, buf.count)
+            if n > 0 {
+                if data.count + n > maxReadFileBytes {
+                    throw PikraError.invalidArgument("File exceeds 16 MiB limit: \(url.path)")
+                }
+                data.append(contentsOf: buf[0..<n])
+            } else if n == 0 {
+                break
+            } else if errno == EINTR {
+                continue
+            } else {
+                let code = errno
+                throw PikraError.io("Failed to read \(url.path): \(String(cString: strerror(code)))")
+            }
+        }
+        return data
     }
 
     private static func atomicWrite(_ data: Data, to url: URL) throws {
@@ -210,21 +260,12 @@ public struct PikraWorkspaceTools: Sendable {
             }
 
             let url: URL
-            do {
-                url = try self.resolvePath(rawPath)
-                let size = try Self.regularFileSize(at: url)
-                if size > Self.maxReadFileBytes {
-                    return .error("File exceeds 16 MiB limit (\(size) bytes): \(url.path)")
-                }
-            } catch {
-                return .error(error.localizedDescription)
-            }
-
             let data: Data
             do {
-                data = try Data(contentsOf: url)
+                url = try self.resolvePath(rawPath)
+                data = try Self.readRegularFileData(at: url)
             } catch {
-                return .error("Failed to read \(url.path): \(error.localizedDescription)")
+                return .error(error.localizedDescription)
             }
 
             if let mimeType = Self.detectImageMimeType(data) {
@@ -258,7 +299,7 @@ public struct PikraWorkspaceTools: Sendable {
             }
             let endIndex: Int
             if let limit {
-                endIndex = min(lines.count, startIndex + limit)
+                endIndex = startIndex + min(limit, lines.count - startIndex)
             } else {
                 endIndex = lines.count
             }
@@ -295,10 +336,13 @@ public struct PikraWorkspaceTools: Sendable {
             }
 
             do {
-                let url = try self.resolvePath(rawPath)
+                let requestedURL = try self.resolvePath(rawPath)
+                let targetURL = Self.resolveMutationTarget(requestedURL)
                 let data = Data(content.utf8)
-                try Self.atomicWrite(data, to: url)
-                return .text("Wrote \(data.count) bytes to \(url.path)")
+                try await self.writeCoordinator.withExclusiveAccess(path: targetURL.path) {
+                    try Self.atomicWrite(data, to: targetURL)
+                }
+                return .text("Wrote \(data.count) bytes to \(requestedURL.path)")
             } catch {
                 return .error(error.localizedDescription)
             }
@@ -343,27 +387,26 @@ public struct PikraWorkspaceTools: Sendable {
             }
 
             do {
-                let url = try self.resolvePath(rawPath)
-                let size = try Self.regularFileSize(at: url)
-                if size > Self.maxReadFileBytes {
-                    return .error("File exceeds 16 MiB limit (\(size) bytes): \(url.path)")
-                }
-                let data = try Data(contentsOf: url)
-                guard let content = String(data: data, encoding: .utf8) else {
-                    return .error("File is not valid UTF-8 text: \(url.path)")
-                }
+                let requestedURL = try self.resolvePath(rawPath)
+                let targetURL = Self.resolveMutationTarget(requestedURL)
+                return try await self.writeCoordinator.withExclusiveAccess(path: targetURL.path) {
+                    let data = try Self.readRegularFileData(at: targetURL)
+                    guard let content = String(data: data, encoding: .utf8) else {
+                        return .error("File is not valid UTF-8 text: \(requestedURL.path)")
+                    }
 
-                guard let firstRange = content.range(of: oldText) else {
-                    return .error("old_text not found in \(url.path)")
-                }
-                if content.range(of: oldText, range: firstRange.upperBound..<content.endIndex) != nil {
-                    return .error("old_text matched multiple times in \(url.path); provide more context for a unique match")
-                }
+                    guard let firstRange = content.range(of: oldText) else {
+                        return .error("old_text not found in \(requestedURL.path)")
+                    }
+                    if content.range(of: oldText, range: firstRange.upperBound..<content.endIndex) != nil {
+                        return .error("old_text matched multiple times in \(requestedURL.path); provide more context for a unique match")
+                    }
 
-                var updated = content
-                updated.replaceSubrange(firstRange, with: newText)
-                try Self.atomicWrite(Data(updated.utf8), to: url)
-                return .text("Edited \(url.path)")
+                    var updated = content
+                    updated.replaceSubrange(firstRange, with: newText)
+                    try Self.atomicWrite(Data(updated.utf8), to: targetURL)
+                    return .text("Edited \(requestedURL.path)")
+                }
             } catch {
                 return .error(error.localizedDescription)
             }
@@ -530,7 +573,7 @@ public struct PikraWorkspaceTools: Sendable {
     private final class ShellProcessGuard: @unchecked Sendable {
         private let lock = NSLock()
         private var pid: pid_t = 0
-        private var exited = false
+        private var settled = false
         private var cancelled = false
         private var timedOut = false
         private var killTimer: DispatchSourceTimer?
@@ -542,14 +585,21 @@ public struct PikraWorkspaceTools: Sendable {
             }
         }
 
-        func markExited() {
-            let timer = lock.withLock { () -> DispatchSourceTimer? in
-                exited = true
+        /// Called after `waitpid(childPid)` reaps the shell leader.
+        /// If cancellation or timeout already triggered, escalates `SIGKILL` to the entire process group
+        /// immediately so backgrounded descendants ignoring `SIGTERM` cannot survive!
+        func finishAndEnsureGroupCleanup() {
+            let (timer, groupToKill) = lock.withLock { () -> (DispatchSourceTimer?, pid_t) in
+                settled = true
                 let t = killTimer
                 killTimer = nil
-                return t
+                let killGroup = (cancelled || timedOut) ? pid : 0
+                return (t, killGroup)
             }
             timer?.cancel()
+            if groupToKill > 0 {
+                _ = Darwin.killpg(groupToKill, SIGKILL)
+            }
         }
 
         var wasCancelled: Bool {
@@ -561,40 +611,32 @@ public struct PikraWorkspaceTools: Sendable {
         }
 
         func cancel(becauseTimedOut: Bool) {
-            let targetPid: pid_t = lock.withLock {
+            lock.withLock {
                 if becauseTimedOut {
                     timedOut = true
                 } else {
                     cancelled = true
                 }
-                guard !exited, pid > 0 else { return 0 }
-                return pid
-            }
-            guard targetPid > 0 else { return }
-            _ = Darwin.killpg(targetPid, SIGTERM)
+                guard !settled, pid > 0 else { return }
+                let targetPid = pid
+                _ = Darwin.killpg(targetPid, SIGTERM)
 
-            let graceTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-            graceTimer.schedule(deadline: .now() + .milliseconds(200))
-            graceTimer.setEventHandler { [weak self] in
-                guard let self else { return }
-                let stillAlive: pid_t = self.lock.withLock {
-                    self.killTimer = nil
-                    return self.exited ? 0 : self.pid
-                }
-                if stillAlive > 0 {
-                    _ = Darwin.killpg(stillAlive, SIGKILL)
-                }
-            }
-            let shouldResume = lock.withLock { () -> Bool in
-                guard !exited else { return false }
                 killTimer?.cancel()
-                killTimer = graceTimer
-                return true
-            }
-            if shouldResume {
+                let graceTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+                graceTimer.schedule(deadline: .now() + .milliseconds(200))
+                graceTimer.setEventHandler { [weak self] in
+                    guard let self else { return }
+                    let stillActiveGroup: pid_t = self.lock.withLock {
+                        self.killTimer = nil
+                        return self.settled ? 0 : self.pid
+                    }
+                    if stillActiveGroup > 0 {
+                        _ = Darwin.killpg(stillActiveGroup, SIGKILL)
+                    }
+                }
+                // Always resume before storing so `cancel()` is NEVER invoked on a suspended timer.
                 graceTimer.resume()
-            } else {
-                graceTimer.cancel()
+                killTimer = graceTimer
             }
         }
     }
@@ -729,7 +771,7 @@ public struct PikraWorkspaceTools: Sendable {
                         if waited < 0 && errno == EINTR { continue }
                         break
                     }
-                    guardBox.markExited()
+                    guardBox.finishAndEnsureGroupCleanup()
 
                     if guardBox.wasCancelled {
                         continuation.resume(throwing: CancellationError())
@@ -789,4 +831,43 @@ public struct PikraWorkspaceTools: Sendable {
         return String(decoding: data.prefix(cut), as: UTF8.self)
     }
     #endif
+}
+
+/// Per-path async FIFO mutex serializing concurrent `write` and `edit` mutations to the same target file.
+private actor FileWriteCoordinator {
+    private var active: Set<String> = []
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func withExclusiveAccess<T: Sendable>(
+        path: String,
+        operation: @Sendable () throws -> T
+    ) async rethrows -> T {
+        await acquire(path: path)
+        defer { release(path: path) }
+        return try operation()
+    }
+
+    private func acquire(path: String) async {
+        if !active.contains(path) {
+            active.insert(path)
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            waiters[path, default: []].append(cont)
+        }
+    }
+
+    private func release(path: String) {
+        if var queue = waiters[path], !queue.isEmpty {
+            let next = queue.removeFirst()
+            if queue.isEmpty {
+                waiters.removeValue(forKey: path)
+            } else {
+                waiters[path] = queue
+            }
+            next.resume()
+        } else {
+            active.remove(path)
+        }
+    }
 }

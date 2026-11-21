@@ -1,8 +1,8 @@
-use crate::context::{now_ms, ConvertToLlmFn};
+use crate::context::{ConvertToLlmFn, now_ms};
 use crate::error::AgentError;
 use crate::loop_runner::{
-    agent_loop_with_queues, validate_continuable, AgentLoopConfig, ApiKeyResolver, QueueSource,
-    QueuedInput,
+    AgentLoopConfig, ApiKeyResolver, QueueSource, QueuedInput, agent_loop_with_queues,
+    validate_continuable,
 };
 use crate::{AgentEvent, AgentMessage, AgentMiddleware, AgentTool, QueueMode, ToolExecutionMode};
 use futures_channel::{mpsc, oneshot};
@@ -501,10 +501,7 @@ impl Agent {
 
     // ---- State Mutations (Guarded against Busy) ----
 
-    fn with_idle_inner<R>(
-        &self,
-        f: impl FnOnce(&mut AgentInner) -> R,
-    ) -> Result<R, AgentError> {
+    fn with_idle_inner<R>(&self, f: impl FnOnce(&mut AgentInner) -> R) -> Result<R, AgentError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.active_run.is_some() {
             return Err(AgentError::Busy);
@@ -634,6 +631,18 @@ impl Agent {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Drain all remaining unconsumed steering items in FIFO order as `(id, content)`.
+    pub fn drain_steering(&self) -> Vec<(String, Vec<ContentPart>)> {
+        self.queues
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items
+            .drain(..)
+            .map(|item| (item.id, item.content))
+            .collect()
     }
 
     pub fn clear_follow_up_queue(&self) {

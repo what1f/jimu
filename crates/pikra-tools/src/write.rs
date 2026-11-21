@@ -22,7 +22,9 @@ impl AgentTool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write".into(),
-            description: "Write full UTF-8 content to a file, creating parent directories automatically.".into(),
+            description:
+                "Write full UTF-8 content to a file, creating parent directories automatically."
+                    .into(),
             parameters: obj_schema([
                 (
                     "path",
@@ -72,10 +74,8 @@ impl AgentTool for WriteTool {
 
             atomic_write_file(&resolved, content.as_bytes()).await?;
 
-            let mut res = AgentToolResult::text(format!(
-                "Wrote {} bytes to {shown}",
-                content.len()
-            ));
+            let mut res =
+                AgentToolResult::text(format!("Wrote {} bytes to {shown}", content.len()));
             res.details = json!({
                 "path": shown,
                 "bytes": content.len(),

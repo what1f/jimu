@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -166,7 +166,9 @@ export default function(pikra) {
     let session_path = ws.join("session.jsonl");
 
     // Local loopback mock OpenAI Chat Completions SSE server.
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let release_req1 = Arc::new(Notify::new());
@@ -188,7 +190,10 @@ export default function(pikra) {
                 1 => {
                     // Emit initial delta, wait for test to inspect streaming state & enqueue steer,
                     // then emit write + read tool calls.
-                    let chunk1 = sse_chunk(json!({ "role": "assistant", "content": "working..." }), None);
+                    let chunk1 = sse_chunk(
+                        json!({ "role": "assistant", "content": "working..." }),
+                        None,
+                    );
                     socket.write_all(chunk1.as_bytes()).await.unwrap();
                     socket.flush().await.unwrap();
 
@@ -248,7 +253,10 @@ export default function(pikra) {
                     let _ = socket.read(&mut drain).await;
                 }
                 _ => {
-                    let c1 = sse_chunk(json!({ "role": "assistant", "content": "extra" }), Some("stop"));
+                    let c1 = sse_chunk(
+                        json!({ "role": "assistant", "content": "extra" }),
+                        Some("stop"),
+                    );
                     let _ = socket.write_all(c1.as_bytes()).await;
                     let _ = socket.write_all(b"data: [DONE]\n\n").await;
                     let _ = socket.flush().await;
@@ -302,7 +310,10 @@ export default function(pikra) {
         .filter_map(Value::as_str)
         .collect();
     assert!(tools.contains(&"read") && tools.contains(&"write"));
-    assert_eq!(state_resp["data"]["extensions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        state_resp["data"]["extensions"].as_array().unwrap().len(),
+        1
+    );
 
     // 3. set_context queues named context block for the next turn.
     proc.send_json(&json!({
@@ -531,7 +542,10 @@ export default function(pikra) {
 
     proc.send_json(&json!({ "id": "ac1", "type": "set_auto_compaction", "enabled": false }))
         .await;
-    assert_eq!(proc.read_response_for("ac1").await.0["data"]["enabled"], false);
+    assert_eq!(
+        proc.read_response_for("ac1").await.0["data"]["enabled"],
+        false
+    );
 
     // Verify session JSONL persisted on disk, then test new_session + switch_session.
     assert!(Path::new(&session_path).exists());
@@ -598,9 +612,7 @@ async fn rpc_live_deepseek_smoke_if_key_present() {
     let mut saw_delta = false;
     loop {
         let ev = proc.next_record().await;
-        if ev["type"] == "message_update"
-            && ev["assistant_message_event"]["type"] == "text_delta"
-        {
+        if ev["type"] == "message_update" && ev["assistant_message_event"]["type"] == "text_delta" {
             saw_delta = true;
         }
         if ev["type"] == "agent_settled" {
@@ -608,7 +620,10 @@ async fn rpc_live_deepseek_smoke_if_key_present() {
             break;
         }
     }
-    assert!(saw_delta, "expected streaming text_delta from live DeepSeek");
+    assert!(
+        saw_delta,
+        "expected streaming text_delta from live DeepSeek"
+    );
 
     proc.send_json(&json!({ "id": "live-last", "type": "get_last_assistant_text" }))
         .await;

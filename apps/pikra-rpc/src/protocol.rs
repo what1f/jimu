@@ -224,11 +224,7 @@ impl RpcResponse {
         }
     }
 
-    pub fn error(
-        id: Option<String>,
-        command: impl Into<String>,
-        error: impl Into<String>,
-    ) -> Self {
+    pub fn error(id: Option<String>, command: impl Into<String>, error: impl Into<String>) -> Self {
         Self {
             id,
             record_type: "response",

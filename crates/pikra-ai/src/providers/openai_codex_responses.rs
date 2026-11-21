@@ -18,7 +18,6 @@ use bytes::Bytes;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
-const MIN_OUTPUT_TOKENS: u32 = 16;
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
 /// Resolve `{base_url}/codex/responses` without duplicating `/codex` or `/responses`.
@@ -75,16 +74,6 @@ pub fn build_request_body(
 
     if options.fast == Some(true) {
         body.insert("service_tier".into(), Value::String("priority".into()));
-    }
-
-    // Codex backend rejects `max_output_tokens` on many subscription models unless explicitly opted in.
-    if model.compat.is_some()
-        && let Some(max_tokens) = options.max_tokens
-    {
-        body.insert(
-            "max_output_tokens".into(),
-            json!(max_tokens.max(MIN_OUTPUT_TOKENS)),
-        );
     }
 
     // Reasoning models on Codex reject `temperature`; only include when non-reasoning (or via sampling_params).

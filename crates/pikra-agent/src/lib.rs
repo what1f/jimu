@@ -7,13 +7,13 @@ mod loop_runner;
 mod tool;
 
 pub use agent::{Agent, AgentConfig, AgentEventStream, SubscriptionId};
-pub use context::{default_convert_to_llm, ConvertToLlmFn};
+pub use context::{ConvertToLlmFn, default_convert_to_llm};
 pub use error::AgentError;
 pub use loop_runner::{
-    agent_loop, agent_loop_continue, AgentLoopConfig, AgentLoopOutcome, ApiKeyResolver,
-    QueueSource, QueuedInput,
+    AgentLoopConfig, AgentLoopOutcome, ApiKeyResolver, QueueSource, QueuedInput, agent_loop,
+    agent_loop_continue,
 };
-pub use tool::{run_tool_call, ClosureTool};
+pub use tool::{ClosureTool, run_tool_call};
 
 use pikra_ai::{
     AssistantMessage, AssistantMessageEvent, BoxFuture, CancelToken, ContentPart, Message, Model,

@@ -1,9 +1,9 @@
 use crate::error::SessionError;
-use crate::types::{now_ms, SessionEntry, SessionEntryPayload};
+use crate::types::{SessionEntry, SessionEntryPayload, now_ms};
 use pikra_agent::AgentMessage;
 use pikra_ai::{
-    complete, AssistantBlock, BoxFuture, ContentPart, Message, Model, SimpleStreamOptions,
-    StopReason, StreamProvider, TranscriptContext, Usage, UserMessage,
+    AssistantBlock, BoxFuture, ContentPart, Message, Model, SimpleStreamOptions, StopReason,
+    StreamProvider, TranscriptContext, Usage, UserMessage, complete,
 };
 
 /// Fixed token estimate per image content part (excludes raw base64 bytes).
@@ -132,7 +132,9 @@ pub fn estimate_content_parts_tokens(parts: &[ContentPart]) -> u64 {
     for part in parts {
         match part {
             ContentPart::Text(t) => text_chars = text_chars.saturating_add(t.text.len()),
-            ContentPart::Image(_) => image_tokens = image_tokens.saturating_add(IMAGE_TOKEN_ESTIMATE),
+            ContentPart::Image(_) => {
+                image_tokens = image_tokens.saturating_add(IMAGE_TOKEN_ESTIMATE)
+            }
         }
     }
     chars_to_tokens(text_chars).saturating_add(image_tokens)
@@ -355,10 +357,7 @@ pub(crate) fn select_first_kept_entry_id(
         accumulated = accumulated.saturating_add(entry_tokens);
         if accumulated >= keep_recent_tokens {
             // Pick the earliest valid cut candidate at or after `rel_idx`.
-            chosen_rel = cut_candidates
-                .iter()
-                .copied()
-                .find(|&cand| cand >= rel_idx);
+            chosen_rel = cut_candidates.iter().copied().find(|&cand| cand >= rel_idx);
             break;
         }
     }

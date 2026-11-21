@@ -800,6 +800,7 @@ dependencies = [
  "futures-core",
  "futures-executor",
  "futures-util",
+ "getrandom 0.4.3",
  "pikra-schema",
  "pikra-testkit",
  "serde",

@@ -1,13 +1,15 @@
 use crate::deferred::DeferredToolRegistry;
-use futures_util::future::{select, Either};
+use futures_util::future::{Either, select};
 use pikra_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use pikra_ai::{BoxFuture, CancelToken, ContentPart, ImageContent, TextContent, ToolDefinition};
 use pikra_codemode::{
     CodemodeExecuteOptions, CodemodeOutputItem, CodemodeSandbox, CodemodeSandboxOptions,
     CodemodeTool, CodemodeToolContext,
 };
-use pikra_schema::{int_schema, obj_schema, str_schema, with_bounds, with_description, CompiledSchema, Schema};
-use serde_json::{json, Value};
+use pikra_schema::{
+    CompiledSchema, Schema, int_schema, obj_schema, str_schema, with_bounds, with_description,
+};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,11 +73,13 @@ impl CodemodeTool for AgentToolCodemodeBridge {
             let call_id = format!("cm_{}", Uuid::now_v7());
             let result = if self.middlewares.is_empty() {
                 let validated = match CompiledSchema::compile(self.definition.parameters.clone()) {
-                    Ok(compiled) => compiled
-                        .coerce_and_validate(&effective_args)
-                        .map_err(|err| {
-                            format!("Invalid arguments for `{}`:\n{err}", self.definition.name)
-                        })?,
+                    Ok(compiled) => {
+                        compiled
+                            .coerce_and_validate(&effective_args)
+                            .map_err(|err| {
+                                format!("Invalid arguments for `{}`:\n{err}", self.definition.name)
+                            })?
+                    }
                     Err(_) => effective_args,
                 };
                 self.tool
@@ -210,10 +214,7 @@ impl CodemodeExecTool {
     }
 
     pub fn store_snapshot(&self) -> BTreeMap<String, Value> {
-        self.store
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -292,11 +293,7 @@ impl AgentTool for CodemodeExecTool {
                 .map_err(|err| format!("failed to initialize codemode sandbox: {err}"))?;
 
             let abort_flag = Arc::new(AtomicBool::new(cancel.is_cancelled()));
-            let store_snapshot = self
-                .store
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let store_snapshot = self.store.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let exec_opts = CodemodeExecuteOptions {
                 timeout_ms,
                 abort: Some(abort_flag.clone()),

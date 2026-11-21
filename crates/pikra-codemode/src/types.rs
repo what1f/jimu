@@ -101,11 +101,7 @@ where
     F: Fn(Value, CodemodeToolContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Value, String>> + Send + 'static,
 {
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        handler: F,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, handler: F) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -219,11 +215,7 @@ pub struct CodemodeError {
 }
 
 impl CodemodeError {
-    pub fn script(
-        name: Option<String>,
-        message: impl Into<String>,
-        stack: Option<String>,
-    ) -> Self {
+    pub fn script(name: Option<String>, message: impl Into<String>, stack: Option<String>) -> Self {
         Self {
             kind: CodemodeErrorKind::Script,
             name,

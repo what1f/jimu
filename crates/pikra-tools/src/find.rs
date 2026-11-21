@@ -106,7 +106,14 @@ impl AgentTool for FindTool {
             let cancel_clone = cancel.clone();
 
             let outcome = tokio::task::spawn_blocking(move || {
-                run_find(&cwd, &search_root, &pattern, limit, &ignore_dirs, &cancel_clone)
+                run_find(
+                    &cwd,
+                    &search_root,
+                    &pattern,
+                    limit,
+                    &ignore_dirs,
+                    &cancel_clone,
+                )
             })
             .await
             .map_err(|e| format!("find task failed: {e}"))??;
@@ -409,7 +416,10 @@ fn glob_match_segment(pattern: &str, text: &str) -> bool {
         Star,
         Any,
         Literal(char),
-        Class { negated: bool, ranges: Vec<(char, char)> },
+        Class {
+            negated: bool,
+            ranges: Vec<(char, char)>,
+        },
     }
 
     let mut tokens = Vec::with_capacity(m);

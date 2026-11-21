@@ -1,6 +1,4 @@
-use pikra_ai::{
-    AssistantMessageEvent, Model, StopReason, ToolCall, ToolResultMessage, Usage,
-};
+use pikra_ai::{AssistantMessageEvent, Model, StopReason, ToolCall, ToolResultMessage, Usage};
 use pikra_session::SessionEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -130,6 +128,8 @@ pub enum TaskCheckpoint {
     },
     Compacting {
         submission_id: String,
+        #[serde(default)]
+        turn_index: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_leaf_id: Option<String>,
     },
@@ -236,6 +236,8 @@ pub enum CheckpointMutation {
 pub struct CommitBatch {
     pub conversation_id: String,
     pub now_ms: u64,
+    pub expected_head_entry_id: Option<Option<String>>,
+    pub require_no_checkpoint: bool,
     pub upsert_conversation: Option<ConversationRecord>,
     pub update_status: Option<ConversationStatus>,
     pub update_model: Option<Model>,
@@ -252,6 +254,8 @@ impl CommitBatch {
         Self {
             conversation_id: conversation_id.into(),
             now_ms,
+            expected_head_entry_id: None,
+            require_no_checkpoint: false,
             upsert_conversation: None,
             update_status: None,
             update_model: None,

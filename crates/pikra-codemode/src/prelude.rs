@@ -6,8 +6,14 @@ use crate::types::{
 
 pub(crate) fn build_prelude_source() -> String {
     PRELUDE_TEMPLATE
-        .replace("__MAX_STORE_VALUE_CHARS__", &MAX_STORE_VALUE_CHARS.to_string())
-        .replace("__MAX_STORE_TOTAL_CHARS__", &MAX_STORE_TOTAL_CHARS.to_string())
+        .replace(
+            "__MAX_STORE_VALUE_CHARS__",
+            &MAX_STORE_VALUE_CHARS.to_string(),
+        )
+        .replace(
+            "__MAX_STORE_TOTAL_CHARS__",
+            &MAX_STORE_TOTAL_CHARS.to_string(),
+        )
         .replace("__MAX_OUTPUT_CHARS__", &MAX_OUTPUT_CHARS.to_string())
         .replace("__MAX_OUTPUT_ITEMS__", &MAX_OUTPUT_ITEMS.to_string())
 }

@@ -195,36 +195,50 @@ public actor PikraSkillCatalog {
             let fm = FileManager.default
             var targets: Set<String> = []
 
-            for root in roots {
-                let rootPath = root.standardizedFileURL.path
-                var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: rootPath, isDirectory: &isDir) else { continue }
-                targets.insert(rootPath)
+            func scanDirectory(_ dirURL: URL, includeRootMarkdown: Bool) {
+                let dirPath = dirURL.standardizedFileURL.path
+                targets.insert(dirPath)
 
-                guard isDir.boolValue,
-                      let children = try? fm.contentsOfDirectory(atPath: rootPath)
-                else {
-                    continue
+                guard let children = try? fm.contentsOfDirectory(atPath: dirPath) else {
+                    return
+                }
+
+                let skillMDURL = dirURL.appendingPathComponent("SKILL.md")
+                let skillMDPath = skillMDURL.standardizedFileURL.path
+                var skillIsDir: ObjCBool = false
+                if !includeRootMarkdown,
+                   fm.fileExists(atPath: skillMDPath, isDirectory: &skillIsDir),
+                   !skillIsDir.boolValue
+                {
+                    targets.insert(skillMDPath)
+                    return
                 }
 
                 for child in children {
                     if child.hasPrefix(".") || child == "node_modules" {
                         continue
                     }
-                    let childURL = root.appendingPathComponent(child)
+                    let childURL = dirURL.appendingPathComponent(child)
                     let childPath = childURL.standardizedFileURL.path
                     var childIsDir: ObjCBool = false
                     guard fm.fileExists(atPath: childPath, isDirectory: &childIsDir) else { continue }
 
                     if childIsDir.boolValue {
-                        targets.insert(childPath)
-                        let skillMD = childURL.appendingPathComponent("SKILL.md").standardizedFileURL.path
-                        if fm.fileExists(atPath: skillMD) {
-                            targets.insert(skillMD)
-                        }
-                    } else if child == "SKILL.md" || child.hasSuffix(".md") {
+                        scanDirectory(childURL, includeRootMarkdown: false)
+                    } else if child == "SKILL.md" || (includeRootMarkdown && child.hasSuffix(".md")) {
                         targets.insert(childPath)
                     }
+                }
+            }
+
+            for root in roots {
+                let rootPath = root.standardizedFileURL.path
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: rootPath, isDirectory: &isDir) else { continue }
+                if isDir.boolValue {
+                    scanDirectory(root, includeRootMarkdown: true)
+                } else if rootPath.hasSuffix(".md") {
+                    targets.insert(rootPath)
                 }
             }
             return targets

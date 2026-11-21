@@ -1,4 +1,4 @@
-use crate::context::{convert_to_llm_with_overrides, now_ms, ConvertToLlmFn};
+use crate::context::{ConvertToLlmFn, convert_to_llm_with_overrides, now_ms};
 use crate::error::AgentError;
 use crate::tool::{execute_tool_batch, fail_truncated_tool_calls};
 use crate::{
@@ -198,7 +198,10 @@ pub(crate) fn validate_continuable(messages: &[AgentMessage]) -> Result<(), Agen
             "no non-system messages in transcript".into(),
         ));
     }
-    if matches!(messages.last(), Some(AgentMessage::Llm(Message::Assistant(_)))) {
+    if matches!(
+        messages.last(),
+        Some(AgentMessage::Llm(Message::Assistant(_)))
+    ) {
         return Err(AgentError::CannotContinue(
             "cannot continue from message role: assistant".into(),
         ));
@@ -465,11 +468,8 @@ pub(crate) async fn agent_loop_with_queues(
             turns_with_ok_assistant += 1;
 
             // Execute tool calls (if any)
-            let tool_calls: Vec<ToolCall> = assistant_msg
-                .tool_calls()
-                .into_iter()
-                .cloned()
-                .collect();
+            let tool_calls: Vec<ToolCall> =
+                assistant_msg.tool_calls().into_iter().cloned().collect();
 
             let mut tool_results = Vec::new();
             has_more_tool_calls = false;
@@ -638,7 +638,11 @@ async fn run_finish_turn(
     final_decision
 }
 
-fn empty_assistant(model: &Model, thinking_level: ThinkingLevel, stop_reason: StopReason) -> AssistantMessage {
+fn empty_assistant(
+    model: &Model,
+    thinking_level: ThinkingLevel,
+    stop_reason: StopReason,
+) -> AssistantMessage {
     AssistantMessage {
         content: Vec::new(),
         api: model.api.clone(),
@@ -665,7 +669,11 @@ fn make_aborted_assistant(
     msg
 }
 
-fn ensure_block_slot(blocks: &mut Vec<AssistantBlock>, index: usize, default_block: AssistantBlock) {
+fn ensure_block_slot(
+    blocks: &mut Vec<AssistantBlock>,
+    index: usize,
+    default_block: AssistantBlock,
+) {
     while blocks.len() < index {
         blocks.push(AssistantBlock::Text(TextContent::plain("")));
     }
@@ -862,7 +870,10 @@ async fn stream_assistant_response(
                     assistant_message_event: AssistantMessageEvent::Start { partial: p },
                 });
             }
-            AssistantMessageEvent::Done { reason, mut message } => {
+            AssistantMessageEvent::Done {
+                reason,
+                mut message,
+            } => {
                 if message.stop_reason == StopReason::Pending {
                     message.stop_reason = reason;
                 }

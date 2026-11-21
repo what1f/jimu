@@ -330,7 +330,9 @@ where
     };
 
     if effective_mode != CliMode::Rpc && prompt.is_none() {
-        return Err("one-shot mode requires a prompt argument (e.g. `pikra ask \"Hello\"`)".to_string());
+        return Err(
+            "one-shot mode requires a prompt argument (e.g. `pikra ask \"Hello\"`)".to_string(),
+        );
     }
 
     let resolved_cwd = match cwd {

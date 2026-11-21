@@ -113,7 +113,9 @@ pub(crate) fn validate_schema_tree(
 
             if let Some(reference) = map.get("$ref") {
                 let Some(ref_str) = reference.as_str() else {
-                    return Err(SchemaCompileError(format!("{loc}: '$ref' must be a string")));
+                    return Err(SchemaCompileError(format!(
+                        "{loc}: '$ref' must be a string"
+                    )));
                 };
                 resolve_pointer(root, ref_str)?;
             }
@@ -121,12 +123,16 @@ pub(crate) fn validate_schema_tree(
             if let Some(enum_val) = map.get("enum")
                 && !enum_val.is_array()
             {
-                return Err(SchemaCompileError(format!("{loc}: 'enum' must be an array")));
+                return Err(SchemaCompileError(format!(
+                    "{loc}: 'enum' must be an array"
+                )));
             }
 
             if let Some(req) = map.get("required") {
                 let Some(arr) = req.as_array() else {
-                    return Err(SchemaCompileError(format!("{loc}: 'required' must be an array")));
+                    return Err(SchemaCompileError(format!(
+                        "{loc}: 'required' must be an array"
+                    )));
                 };
                 if !arr.iter().all(Value::is_string) {
                     return Err(SchemaCompileError(format!(
@@ -139,7 +145,9 @@ pub(crate) fn validate_schema_tree(
                 if let Some(v) = map.get(kw)
                     && !v.is_number()
                 {
-                    return Err(SchemaCompileError(format!("{loc}: '{kw}' must be a number")));
+                    return Err(SchemaCompileError(format!(
+                        "{loc}: '{kw}' must be a number"
+                    )));
                 }
             }
 
@@ -192,7 +200,9 @@ pub(crate) fn validate_schema_tree(
             for kw in ["properties", "$defs", "definitions"] {
                 if let Some(v) = map.get(kw) {
                     let Some(submap) = v.as_object() else {
-                        return Err(SchemaCompileError(format!("{loc}: '{kw}' must be an object")));
+                        return Err(SchemaCompileError(format!(
+                            "{loc}: '{kw}' must be an object"
+                        )));
                     };
                     for (k, sub) in submap {
                         validate_schema_tree(root, sub, &format!("{loc}/{kw}/{k}"))?;
@@ -222,7 +232,9 @@ pub(crate) fn validate_schema_tree(
             for kw in ["prefixItems", "anyOf", "oneOf", "allOf"] {
                 if let Some(v) = map.get(kw) {
                     let Some(arr) = v.as_array() else {
-                        return Err(SchemaCompileError(format!("{loc}: '{kw}' must be an array")));
+                        return Err(SchemaCompileError(format!(
+                            "{loc}: '{kw}' must be an array"
+                        )));
                     };
                     for (i, sub) in arr.iter().enumerate() {
                         validate_schema_tree(root, sub, &format!("{loc}/{kw}/{i}"))?;

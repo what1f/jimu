@@ -13,7 +13,7 @@ use crate::usage::{
 use crate::{
     AssistantBlock, AssistantEventStream, AssistantMessageEvent, ContentPart, HttpRequest,
     HttpTransport, MaxTokensField, Message, Model, SimpleStreamOptions, StopReason, TextContent,
-    ThinkingContent, ToolCall, ToolDefinition, TranscriptContext, Usage,
+    ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, TranscriptContext, Usage,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -27,7 +27,10 @@ fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .map(|tool| {
             let mut func = Map::new();
             func.insert("name".into(), Value::String(tool.name.clone()));
-            func.insert("description".into(), Value::String(tool.description.clone()));
+            func.insert(
+                "description".into(),
+                Value::String(tool.description.clone()),
+            );
             func.insert("parameters".into(), tool.parameters.clone());
             let mut obj = Map::new();
             obj.insert("type".into(), Value::String("function".into()));
@@ -114,8 +117,9 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                             thinking_parts.push(th.thinking.as_str());
                         }
                         AssistantBlock::ToolCall(tc) => {
-                            let args_str = serde_json::to_string(&Value::Object(tc.arguments.clone()))
-                                .unwrap_or_else(|_| "{}".into());
+                            let args_str =
+                                serde_json::to_string(&Value::Object(tc.arguments.clone()))
+                                    .unwrap_or_else(|_| "{}".into());
                             tool_calls.push(json!({
                                 "id": tc.id,
                                 "type": "function",
@@ -214,7 +218,13 @@ pub fn build_request_body(
         && let Some(level) = options.reasoning
         && let Some(effort) = thinking_level_effort_str(level)
     {
-        body.insert("reasoning_effort".into(), Value::String(effort.into()));
+        let is_deepseek = model.provider.eq_ignore_ascii_case("deepseek")
+            || model.base_url.to_ascii_lowercase().contains("deepseek");
+        if is_deepseek && level == ThinkingLevel::None {
+            body.insert("thinking".into(), json!({ "type": "disabled" }));
+        } else {
+            body.insert("reasoning_effort".into(), Value::String(effort.into()));
+        }
     }
 
     for (k, v) in &options.sampling_params {
@@ -376,14 +386,7 @@ pub fn stream(
                     .and_then(Value::as_str)
                     .map(ToString::to_string)
                     .unwrap_or_else(|| err_val.to_string());
-                emit_protocol_error(
-                    &sink,
-                    output,
-                    "stream_error",
-                    err_msg,
-                    &cancel,
-                    started_at,
-                );
+                emit_protocol_error(&sink, output, "stream_error", err_msg, &cancel, started_at);
                 return;
             }
 
@@ -427,11 +430,13 @@ pub fn stream(
                         Some(idx) => idx,
                         None => {
                             let idx = output.content.len();
-                            output.content.push(AssistantBlock::Thinking(ThinkingContent {
-                                thinking: String::new(),
-                                thinking_signature: None,
-                                redacted: false,
-                            }));
+                            output
+                                .content
+                                .push(AssistantBlock::Thinking(ThinkingContent {
+                                    thinking: String::new(),
+                                    thinking_signature: None,
+                                    redacted: false,
+                                }));
                             thinking_index = Some(idx);
                             sink.send(AssistantMessageEvent::ThinkingStart { content_index: idx });
                             idx
@@ -476,10 +481,8 @@ pub fn stream(
                 // Tool call deltas accumulated by stream index.
                 if let Some(tc_deltas) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tc_delta in tc_deltas {
-                        let stream_idx = tc_delta
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as usize;
+                        let stream_idx =
+                            tc_delta.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                         let id_opt = tc_delta.get("id").and_then(Value::as_str);
                         let name_opt = tc_delta
                             .get("function")

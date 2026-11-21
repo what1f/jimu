@@ -7,7 +7,8 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-pub const NON_VISION_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
+pub const NON_VISION_USER_IMAGE_PLACEHOLDER: &str =
+    "(image omitted: model does not support images)";
 pub const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str =
     "(tool image omitted: model does not support images)";
 pub const ERROR_TOOL_IMAGE_PLACEHOLDER: &str = "(image attached after the tool results)";
@@ -207,15 +208,17 @@ where
                                 || thinking.thinking_signature.is_some()
                                 || !thinking.thinking.trim().is_empty()
                             {
-                                transformed_content.push(AssistantBlock::Thinking(thinking.clone()));
+                                transformed_content
+                                    .push(AssistantBlock::Thinking(thinking.clone()));
                             }
                         }
                         AssistantBlock::Text(text) => {
                             if is_same_model {
                                 transformed_content.push(AssistantBlock::Text(text.clone()));
                             } else {
-                                transformed_content
-                                    .push(AssistantBlock::Text(TextContent::plain(text.text.clone())));
+                                transformed_content.push(AssistantBlock::Text(TextContent::plain(
+                                    text.text.clone(),
+                                )));
                             }
                         }
                         AssistantBlock::ToolCall(tc) => {
@@ -227,8 +230,9 @@ where
                                     model.api,
                                     ApiKind::OpenaiResponses | ApiKind::OpenaiCodexResponses
                                 );
-                                let is_foreign_provider_or_api =
-                                    assistant.provider != model.provider || assistant.api != model.api;
+                                let is_foreign_provider_or_api = assistant.provider
+                                    != model.provider
+                                    || assistant.api != model.api;
                                 if target_is_responses && is_foreign_provider_or_api {
                                     cloned.item_id = tc
                                         .item_id
@@ -292,7 +296,10 @@ where
                     &mut held_system,
                     &mut result,
                 );
-                if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
+                if matches!(
+                    assistant.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                ) {
                     continue;
                 }
                 let calls: Vec<ToolCall> = assistant

@@ -10,7 +10,9 @@ pub enum DurableError {
     #[error("conversation already exists: {0}")]
     ConversationAlreadyExists(String),
 
-    #[error("conversation `{conversation_id}` already has an active submission `{active_submission_id}`")]
+    #[error(
+        "conversation `{conversation_id}` already has an active submission `{active_submission_id}`"
+    )]
     ConversationBusy {
         conversation_id: String,
         active_submission_id: String,

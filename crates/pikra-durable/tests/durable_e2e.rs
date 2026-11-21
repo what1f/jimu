@@ -44,7 +44,12 @@ fn provider_for(transport: Arc<FauxTransport>) -> Arc<Models> {
     Arc::new(models)
 }
 
-fn sse_text_response(resp_id: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Vec<String> {
+fn sse_text_response(
+    resp_id: &str,
+    text: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Vec<String> {
     let done_item = json!({
         "type": "response.output_item.done",
         "output_index": 0,
@@ -67,7 +72,9 @@ fn sse_text_response(resp_id: &str, text: &str, input_tokens: u64, output_tokens
         }
     });
     vec![
-        format!("data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{resp_id}\"}}}}\n\n"),
+        format!(
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{resp_id}\"}}}}\n\n"
+        ),
         format!("data: {done_item}\n\n"),
         format!("data: {completed}\n\n"),
     ]
@@ -182,7 +189,10 @@ impl DurableTool for ApprovalGateTool {
                     AgentToolResult::error("approval timed out"),
                 )),
                 SignalResolution::Received(payload) => {
-                    let approver = payload["approver"].as_str().unwrap_or("unknown").to_string();
+                    let approver = payload["approver"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
                     let cooldown_ms = args["cooldown_ms"].as_u64().unwrap_or(0);
                     if cooldown_ms > 0 {
                         Ok(DurableToolOutcome::SleepUntil {
@@ -286,7 +296,10 @@ fn crash_recovery_replays_completed_side_effect_tools_and_deduplicates_submissio
         let crash_res = catch_unwind(AssertUnwindSafe(|| {
             block_on(engine.submit("conv-pay", "sub-1", "Charge $42 and email alice"))
         }));
-        assert!(crash_res.is_err(), "expected simulated crash during send_receipt");
+        assert!(
+            crash_res.is_err(),
+            "expected simulated crash during send_receipt"
+        );
         assert_eq!(transport.request_count(), 2, "503 retry + tool-use turn");
         assert_eq!(charge_count.load(Ordering::SeqCst), 1);
         assert_eq!(receipt_count.load(Ordering::SeqCst), 0);
@@ -294,19 +307,21 @@ fn crash_recovery_replays_completed_side_effect_tools_and_deduplicates_submissio
 
     // Process 2: reopen DB file from disk, recover, replay charge_card without re-running it.
     let store2 = Arc::new(SqliteDurableStore::open(&db_path).expect("reopen sqlite"));
-    assert!(matches!(
-        store2.get_checkpoint("conv-pay").unwrap(),
-        Some(TaskCheckpoint::ExecutingTools { .. })
-    ));
+    let assistant_entry_id = match store2.get_checkpoint("conv-pay").unwrap() {
+        Some(TaskCheckpoint::ExecutingTools {
+            assistant_entry_id, ..
+        }) => assistant_entry_id,
+        other => panic!("expected ExecutingTools checkpoint, got {other:?}"),
+    };
     assert!(
         store2
-            .get_completed_tool("conv-pay", "call_charge")
+            .get_completed_tool("conv-pay", &assistant_entry_id, "call_charge")
             .unwrap()
             .is_some()
     );
     assert!(
         store2
-            .get_completed_tool("conv-pay", "call_receipt")
+            .get_completed_tool("conv-pay", &assistant_entry_id, "call_receipt")
             .unwrap()
             .is_none()
     );
@@ -403,7 +418,10 @@ fn crash_recovery_replays_completed_side_effect_tools_and_deduplicates_submissio
             )
         })
         .count();
-    assert_eq!(user_count, 1, "retry and recovery must never duplicate user prompt");
+    assert_eq!(
+        user_count, 1,
+        "retry and recovery must never duplicate user prompt"
+    );
 
     // Duplicate submission_id returns cached completion with 0 extra LLM calls.
     let dup = block_on(engine2.submit("conv-pay", "sub-1", "Charge $42 and email alice"))
@@ -422,7 +440,11 @@ fn crash_recovery_replays_completed_side_effect_tools_and_deduplicates_submissio
         }
         other => panic!("expected deduplicated Completed, got {other:?}"),
     }
-    assert_eq!(transport2.request_count(), 1, "0 extra LLM calls on duplicate");
+    assert_eq!(
+        transport2.request_count(),
+        1,
+        "0 extra LLM calls on duplicate"
+    );
 }
 
 #[test]
@@ -509,7 +531,10 @@ fn durable_signal_and_timer_park_across_restarts() {
         assert!(matches!(
             after_sig,
             RunOutcome::Parked {
-                park: ParkState::SleepUntil { wake_at_ms: 1_060_000, .. },
+                park: ParkState::SleepUntil {
+                    wake_at_ms: 1_060_000,
+                    ..
+                },
                 ..
             }
         ));
@@ -519,7 +544,10 @@ fn durable_signal_and_timer_park_across_restarts() {
         assert!(matches!(
             engine2.recover("conv-wf").await.unwrap(),
             RunOutcome::Parked {
-                park: ParkState::SleepUntil { wake_at_ms: 1_060_000, .. },
+                park: ParkState::SleepUntil {
+                    wake_at_ms: 1_060_000,
+                    ..
+                },
                 ..
             }
         ));
@@ -575,7 +603,9 @@ fn durable_signal_and_timer_park_across_restarts() {
             RunOutcome::Completed { final_text, .. } => {
                 assert_eq!(final_text, "Fast-tracked v2.1 with pre-buffered approval.");
             }
-            other => panic!("expected immediate completion from pre-buffered signal, got {other:?}"),
+            other => {
+                panic!("expected immediate completion from pre-buffered signal, got {other:?}")
+            }
         }
         let sig8 = store2
             .list_signals("conv-wf")
@@ -583,7 +613,10 @@ fn durable_signal_and_timer_park_across_restarts() {
             .into_iter()
             .find(|s| s.signal_id == "sig-req-8")
             .expect("sig-req-8 stored");
-        assert!(sig8.consumed_at_ms.is_some(), "pre-buffered signal must be marked consumed");
+        assert!(
+            sig8.consumed_at_ms.is_some(),
+            "pre-buffered signal must be marked consumed"
+        );
     });
 }
 
@@ -646,11 +679,13 @@ fn durable_compaction_and_cas_documents() {
         // Stale CAS inside a multi-op CommitBatch rolls back the entire transaction.
         let mut failing_batch = CommitBatch::new("conv-doc", clock.now_ms());
         failing_batch.update_status = Some(ConversationStatus::Failed);
-        failing_batch.document_writes.push(pikra_durable::DocumentWrite {
-            key: "plan".into(),
-            expected_revision: Some(1),
-            value: json!({"step": 3}),
-        });
+        failing_batch
+            .document_writes
+            .push(pikra_durable::DocumentWrite {
+                key: "plan".into(),
+                expected_revision: Some(1),
+                value: json!({"step": 3}),
+            });
         assert!(matches!(
             store.commit(failing_batch),
             Err(DurableError::Conflict {

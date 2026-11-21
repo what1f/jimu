@@ -315,8 +315,9 @@ pub(crate) fn parse_registry_snapshot(
     inspect_json: &str,
     loaded_extensions: Vec<String>,
 ) -> Result<RegistrySnapshot, JsExtensionError> {
-    let raw: RawInspectPayload = serde_json::from_str(inspect_json)
-        .map_err(|err| JsExtensionError::Serialization(format!("invalid inspect payload: {err}")))?;
+    let raw: RawInspectPayload = serde_json::from_str(inspect_json).map_err(|err| {
+        JsExtensionError::Serialization(format!("invalid inspect payload: {err}"))
+    })?;
 
     let mut tools = Vec::with_capacity(raw.tools.len());
     for item in raw.tools {

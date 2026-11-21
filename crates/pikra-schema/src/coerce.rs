@@ -284,9 +284,7 @@ impl<'a> Coercer<'a> {
         required: &HashSet<&'a str>,
     ) -> Cow<'v, Value> {
         let properties = schema.get("properties").and_then(Value::as_object);
-        let additional = schema
-            .get("additionalProperties")
-            .filter(|v| v.is_object());
+        let additional = schema.get("additionalProperties").filter(|v| v.is_object());
         if properties.is_none() && additional.is_none() {
             return Cow::Borrowed(orig);
         }
@@ -441,7 +439,9 @@ impl<'a> Coercer<'a> {
             }
             return match after_ref {
                 Cow::Borrowed(v) => self.convert_node(node, map, v, depth + 1),
-                Cow::Owned(v) => Cow::Owned(self.convert_node(node, map, &v, depth + 1).into_owned()),
+                Cow::Owned(v) => {
+                    Cow::Owned(self.convert_node(node, map, &v, depth + 1).into_owned())
+                }
             };
         }
         self.convert_node(node, map, value, depth + 1)
@@ -627,8 +627,7 @@ impl<'a> Coercer<'a> {
         match map.get("items") {
             Some(item_schema) => {
                 let wrapped_item = if item_schema.is_object() {
-                    let p1 =
-                        self.drop_optional_nulls(value, item_schema, 0, depth + 1, &empty_req);
+                    let p1 = self.drop_optional_nulls(value, item_schema, 0, depth + 1, &empty_req);
                     let p2 = self.reenter(item_schema, p1.as_ref(), false, depth + 1);
                     self.coerce_types(p2.as_ref(), item_schema, 0, depth + 1)
                         .into_owned()
@@ -661,9 +660,7 @@ impl<'a> Coercer<'a> {
             return Cow::Borrowed(value);
         };
         let properties = map.get("properties").and_then(Value::as_object);
-        let additional = map
-            .get("additionalProperties")
-            .filter(|v| v.is_object());
+        let additional = map.get("additionalProperties").filter(|v| v.is_object());
         if properties.is_none() && additional.is_none() {
             return Cow::Borrowed(value);
         }
@@ -717,9 +714,10 @@ impl<'a> Coercer<'a> {
                 self.pass3_ref_guard.push(guard);
                 current = match current {
                     Cow::Borrowed(v) => self.coerce_types(v, target, value_depth, depth + 1),
-                    Cow::Owned(v) => {
-                        Cow::Owned(self.coerce_types(&v, target, value_depth, depth + 1).into_owned())
-                    }
+                    Cow::Owned(v) => Cow::Owned(
+                        self.coerce_types(&v, target, value_depth, depth + 1)
+                            .into_owned(),
+                    ),
                 };
                 self.pass3_ref_guard.pop();
             }
@@ -729,9 +727,10 @@ impl<'a> Coercer<'a> {
             for member in all_of {
                 current = match current {
                     Cow::Borrowed(v) => self.coerce_types(v, member, value_depth, depth + 1),
-                    Cow::Owned(v) => {
-                        Cow::Owned(self.coerce_types(&v, member, value_depth, depth + 1).into_owned())
-                    }
+                    Cow::Owned(v) => Cow::Owned(
+                        self.coerce_types(&v, member, value_depth, depth + 1)
+                            .into_owned(),
+                    ),
                 };
             }
         }
@@ -739,18 +738,20 @@ impl<'a> Coercer<'a> {
         if let Some(any_of) = map.get("anyOf").and_then(Value::as_array) {
             current = match current {
                 Cow::Borrowed(v) => self.coerce_union(v, any_of, value_depth, depth + 1),
-                Cow::Owned(v) => {
-                    Cow::Owned(self.coerce_union(&v, any_of, value_depth, depth + 1).into_owned())
-                }
+                Cow::Owned(v) => Cow::Owned(
+                    self.coerce_union(&v, any_of, value_depth, depth + 1)
+                        .into_owned(),
+                ),
             };
         }
 
         if let Some(one_of) = map.get("oneOf").and_then(Value::as_array) {
             current = match current {
                 Cow::Borrowed(v) => self.coerce_union(v, one_of, value_depth, depth + 1),
-                Cow::Owned(v) => {
-                    Cow::Owned(self.coerce_union(&v, one_of, value_depth, depth + 1).into_owned())
-                }
+                Cow::Owned(v) => Cow::Owned(
+                    self.coerce_union(&v, one_of, value_depth, depth + 1)
+                        .into_owned(),
+                ),
             };
         }
 
@@ -769,9 +770,10 @@ impl<'a> Coercer<'a> {
         if (types.contains(&"object") || types.is_empty()) && current.is_object() {
             current = match current {
                 Cow::Borrowed(v) => self.coerce_properties(v, map, value_depth, depth),
-                Cow::Owned(v) => {
-                    Cow::Owned(self.coerce_properties(&v, map, value_depth, depth).into_owned())
-                }
+                Cow::Owned(v) => Cow::Owned(
+                    self.coerce_properties(&v, map, value_depth, depth)
+                        .into_owned(),
+                ),
             };
         }
 
@@ -817,9 +819,7 @@ impl<'a> Coercer<'a> {
             return Cow::Borrowed(value);
         };
         let properties = schema.get("properties").and_then(Value::as_object);
-        let additional = schema
-            .get("additionalProperties")
-            .filter(|v| v.is_object());
+        let additional = schema.get("additionalProperties").filter(|v| v.is_object());
         if properties.is_none() && additional.is_none() {
             return Cow::Borrowed(value);
         }

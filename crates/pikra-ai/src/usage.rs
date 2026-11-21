@@ -20,7 +20,9 @@ pub fn calculate_cost(cost: &ModelCost, usage: &mut Usage) {
 
 /// Clamp OpenAI `prompt_cache_key` to at most 64 Unicode scalar values.
 pub fn clamp_prompt_cache_key(key: &str) -> String {
-    key.chars().take(OPENAI_PROMPT_CACHE_KEY_MAX_CHARS).collect()
+    key.chars()
+        .take(OPENAI_PROMPT_CACHE_KEY_MAX_CHARS)
+        .collect()
 }
 
 /// Build `{base_url}/responses` without duplicating `/v1` or `/responses`.
@@ -159,7 +161,10 @@ pub fn merge_headers(
     let mut headers = base;
     let upsert = |list: &mut Vec<(String, String)>, key: &str, val: Option<&str>| {
         let lower = key.to_ascii_lowercase();
-        if let Some(pos) = list.iter().position(|(k, _)| k.to_ascii_lowercase() == lower) {
+        if let Some(pos) = list
+            .iter()
+            .position(|(k, _)| k.to_ascii_lowercase() == lower)
+        {
             match val {
                 Some(v) => list[pos] = (key.to_string(), v.to_string()),
                 None => {

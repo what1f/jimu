@@ -1,23 +1,22 @@
 use crate::compaction::{
-    cap_summary_length, estimate_context_tokens, select_first_kept_entry_id, should_compact,
     CompactionConfig, CompactionInput, CompactionOutput, CompactionResult, CompactionStrategy,
-    ContextTokenEstimate, DefaultCompactionStrategy,
+    ContextTokenEstimate, DefaultCompactionStrategy, cap_summary_length, estimate_context_tokens,
+    select_first_kept_entry_id, should_compact,
 };
 use crate::error::SessionError;
 use crate::store::{MemorySessionStore, SessionStore};
 use crate::types::{
-    baseline_to_system_message, compaction_summary_to_agent_message,
-    context_block_to_agent_message, now_ms, CompactionCheckpoint, ReconstructedContext,
-    SessionEntry, SessionEntryPayload, SessionEvent, SessionHeader, SessionTreeNode,
-    CURRENT_SESSION_VERSION,
+    CURRENT_SESSION_VERSION, CompactionCheckpoint, ReconstructedContext, SessionEntry,
+    SessionEntryPayload, SessionEvent, SessionHeader, SessionTreeNode, baseline_to_system_message,
+    compaction_summary_to_agent_message, context_block_to_agent_message, now_ms,
 };
 use pikra_agent::AgentMessage;
 use pikra_ai::{Model, SimpleStreamOptions, StreamProvider, ThinkingLevel, ToolDefinition};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// Identifier returned by [`SessionManager::subscribe`].
@@ -232,7 +231,10 @@ impl SessionManager {
 
     // ---- Append Operations ----
 
-    fn append_payload(&mut self, payload: SessionEntryPayload) -> Result<SessionEntry, SessionError> {
+    fn append_payload(
+        &mut self,
+        payload: SessionEntryPayload,
+    ) -> Result<SessionEntry, SessionError> {
         let entry = SessionEntry {
             id: Uuid::now_v7().to_string(),
             parent_id: self.leaf_id.clone(),
@@ -509,24 +511,25 @@ impl SessionManager {
         let mut visible_context_blocks: BTreeMap<String, String> = BTreeMap::new();
         let mut latest_compaction: Option<CompactionCheckpoint> = None;
 
-        let push_entry_message = |entry: &SessionEntry,
-                                  messages: &mut Vec<AgentMessage>,
-                                  visible_ctx: &mut BTreeMap<String, String>| {
-            match &entry.payload {
-                SessionEntryPayload::Message { message } => {
-                    messages.push(message.clone());
+        let push_entry_message =
+            |entry: &SessionEntry,
+             messages: &mut Vec<AgentMessage>,
+             visible_ctx: &mut BTreeMap<String, String>| {
+                match &entry.payload {
+                    SessionEntryPayload::Message { message } => {
+                        messages.push(message.clone());
+                    }
+                    SessionEntryPayload::ContextBlock { name, text } => {
+                        visible_ctx.insert(name.clone(), text.clone());
+                        messages.push(context_block_to_agent_message(name, text, entry.timestamp));
+                    }
+                    SessionEntryPayload::SystemBaseline { .. }
+                    | SessionEntryPayload::ModelChange { .. }
+                    | SessionEntryPayload::ThinkingChange { .. }
+                    | SessionEntryPayload::Compaction { .. }
+                    | SessionEntryPayload::Custom { .. } => {}
                 }
-                SessionEntryPayload::ContextBlock { name, text } => {
-                    visible_ctx.insert(name.clone(), text.clone());
-                    messages.push(context_block_to_agent_message(name, text, entry.timestamp));
-                }
-                SessionEntryPayload::SystemBaseline { .. }
-                | SessionEntryPayload::ModelChange { .. }
-                | SessionEntryPayload::ThinkingChange { .. }
-                | SessionEntryPayload::Compaction { .. }
-                | SessionEntryPayload::Custom { .. } => {}
-            }
-        };
+            };
 
         if let Some(comp_idx) = latest_compaction_idx {
             let comp_entry = &branch[comp_idx];

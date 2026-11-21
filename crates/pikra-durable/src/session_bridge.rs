@@ -2,8 +2,8 @@ use crate::error::DurableError;
 use crate::types::ConversationRecord;
 use pikra_ai::ToolDefinition;
 use pikra_session::{
-    CompactionConfig, CompactionStrategy, SessionConfig, SessionEntry, SessionError,
-    SessionHeader, SessionManager, SessionStore, CURRENT_SESSION_VERSION,
+    CURRENT_SESSION_VERSION, CompactionConfig, CompactionStrategy, SessionConfig, SessionEntry,
+    SessionError, SessionHeader, SessionManager, SessionStore,
 };
 use std::sync::Arc;
 
@@ -47,8 +47,8 @@ pub(crate) fn open_session_view(
     };
 
     let store = Arc::new(SnapshotSessionStore { header, entries });
-    let mut cfg = SessionConfig::new(conversation.system_prompt.clone(), tools)
-        .with_compaction(compaction);
+    let mut cfg =
+        SessionConfig::new(conversation.system_prompt.clone(), tools).with_compaction(compaction);
     if let Some(s) = strategy {
         cfg = cfg.with_compaction_strategy(s);
     }

@@ -1,6 +1,6 @@
-use crate::codemode::{CodemodeExecTool, CODEMODE_EXEC_TOOL_NAME};
+use crate::codemode::{CODEMODE_EXEC_TOOL_NAME, CodemodeExecTool};
 use crate::deferred::{
-    CallToolGateway, DeferredToolRegistry, ToolSearchTool, CALL_TOOL_NAME, TOOL_SEARCH_NAME,
+    CALL_TOOL_NAME, CallToolGateway, DeferredToolRegistry, TOOL_SEARCH_NAME, ToolSearchTool,
 };
 use crate::error::KitError;
 use crate::mcp::{McpClient, McpToolRegistrationMode};
@@ -18,9 +18,9 @@ use pikra_ai::{
 };
 use pikra_codemode::CodemodeSandboxOptions;
 use pikra_session::{
-    context_block_to_agent_message, CompactionConfig, CompactionResult, CompactionStrategy,
-    MemorySessionStore, SessionConfig, SessionEntry, SessionEntryPayload, SessionEvent,
-    SessionManager, SessionStore, SessionTreeNode,
+    CompactionConfig, CompactionResult, CompactionStrategy, MemorySessionStore, SessionConfig,
+    SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore, SessionTreeNode,
+    context_block_to_agent_message,
 };
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -184,12 +184,14 @@ impl KitSessionConfig {
 pub enum KitEvent {
     Agent(AgentEvent),
     Session(SessionEvent),
+    Error(String),
 }
 
 /// Runtime-agnostic stream returned by [`KitSession::prompt_stream`].
 pub struct KitEventStream<'a> {
     rx: mpsc::UnboundedReceiver<KitEvent>,
     driver: Option<BoxFuture<'a, Result<(), KitError>>>,
+    terminal_error: Option<String>,
 }
 
 impl Stream for KitEventStream<'_> {
@@ -202,11 +204,16 @@ impl Stream for KitEventStream<'_> {
 
         if let Some(driver) = self.driver.as_mut() {
             match driver.as_mut().poll(cx) {
-                Poll::Ready(_) => {
+                Poll::Ready(res) => {
                     self.driver = None;
+                    if let Err(err) = res {
+                        self.terminal_error = Some(err.to_string());
+                    }
                     return match Pin::new(&mut self.rx).poll_next(cx) {
-                        Poll::Ready(item) => Poll::Ready(item),
-                        Poll::Pending => Poll::Ready(None),
+                        Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+                        Poll::Ready(None) | Poll::Pending => {
+                            Poll::Ready(self.terminal_error.take().map(KitEvent::Error))
+                        }
                     };
                 }
                 Poll::Pending => {
@@ -218,7 +225,17 @@ impl Stream for KitEventStream<'_> {
             }
         }
 
-        Pin::new(&mut self.rx).poll_next(cx)
+        match Pin::new(&mut self.rx).poll_next(cx) {
+            Poll::Ready(Some(ev)) => Poll::Ready(Some(ev)),
+            Poll::Ready(None) => Poll::Ready(self.terminal_error.take().map(KitEvent::Error)),
+            Poll::Pending => {
+                if let Some(err) = self.terminal_error.take() {
+                    Poll::Ready(Some(KitEvent::Error(err)))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
     }
 }
 
@@ -241,7 +258,10 @@ pub struct KitSession {
 
 impl KitSession {
     /// Construct a new or reopened [`KitSession`].
-    pub fn new(provider: Arc<dyn StreamProvider>, config: KitSessionConfig) -> Result<Self, KitError> {
+    pub fn new(
+        provider: Arc<dyn StreamProvider>,
+        config: KitSessionConfig,
+    ) -> Result<Self, KitError> {
         let deferred_registry = Arc::new(DeferredToolRegistry::new());
         let mut resident: Vec<Arc<dyn AgentTool>> = Vec::new();
         let mut deferred: Vec<Arc<dyn AgentTool>> = Vec::new();
@@ -259,10 +279,18 @@ impl KitSession {
         // Always keep built-in deferred gateway resident (when enabled) so adding/removing
         // deferred tools later NEVER mutates the leading resident `tools` array!
         if config.enable_deferred_gateway {
-            if !resident.iter().any(|t| t.definition().name == TOOL_SEARCH_NAME) {
-                resident.push(Arc::new(ToolSearchTool::new(Arc::clone(&deferred_registry))));
+            if !resident
+                .iter()
+                .any(|t| t.definition().name == TOOL_SEARCH_NAME)
+            {
+                resident.push(Arc::new(ToolSearchTool::new(Arc::clone(
+                    &deferred_registry,
+                ))));
             }
-            if !resident.iter().any(|t| t.definition().name == CALL_TOOL_NAME) {
+            if !resident
+                .iter()
+                .any(|t| t.definition().name == CALL_TOOL_NAME)
+            {
                 resident.push(Arc::new(
                     CallToolGateway::new(Arc::clone(&deferred_registry))
                         .with_middlewares(config.middlewares.clone()),
@@ -415,6 +443,10 @@ impl KitSession {
         self.agent.fast()
     }
 
+    pub fn system_prompt(&self) -> String {
+        self.agent.system_prompt()
+    }
+
     pub fn is_running(&self) -> bool {
         self.agent.is_running()
     }
@@ -481,6 +513,11 @@ impl KitSession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .append_thinking_change(level, fast)?;
+        Ok(())
+    }
+
+    pub fn set_system_prompt(&self, prompt: impl Into<String>) -> Result<(), KitError> {
+        self.agent.set_system_prompt(prompt)?;
         Ok(())
     }
 
@@ -626,6 +663,10 @@ impl KitSession {
         self.agent.steer(id, text);
     }
 
+    pub fn drain_steering(&self) -> Vec<(String, Vec<ContentPart>)> {
+        self.agent.drain_steering()
+    }
+
     pub fn follow_up(&self, id: impl Into<String>, text: impl Into<String>) {
         self.agent.follow_up(id, text);
     }
@@ -724,6 +765,7 @@ impl KitSession {
         Ok(KitEventStream {
             rx,
             driver: Some(driver),
+            terminal_error: None,
         })
     }
 
@@ -810,8 +852,7 @@ impl KitSession {
             }));
         }
 
-        let output =
-            SessionManager::execute_prepared_compaction(&*self.provider, prepared).await?;
+        let output = SessionManager::execute_prepared_compaction(&*self.provider, prepared).await?;
 
         let (maybe_result, reconstructed) = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());

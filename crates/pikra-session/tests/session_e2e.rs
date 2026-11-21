@@ -11,12 +11,12 @@ use pikra_ai::{
 };
 use pikra_schema::{obj_schema, str_schema};
 use pikra_session::{
-    compaction_threshold, effective_reserve_tokens, estimate_context_tokens, should_compact,
-    CompactionConfig, CompactionInput, CompactionOutput, CompactionStrategy, JsonlSessionStore,
-    SessionConfig, SessionEntryPayload, SessionError, SessionEvent, SessionManager,
-    IMAGE_TOKEN_ESTIMATE,
+    CompactionConfig, CompactionInput, CompactionOutput, CompactionStrategy, IMAGE_TOKEN_ESTIMATE,
+    JsonlSessionStore, SessionConfig, SessionEntryPayload, SessionError, SessionEvent,
+    SessionManager, compaction_threshold, effective_reserve_tokens, estimate_context_tokens,
+    should_compact,
 };
-use pikra_testkit::{assert_prompt_prefix_identical, FauxTransport};
+use pikra_testkit::{FauxTransport, assert_prompt_prefix_identical};
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
@@ -140,7 +140,10 @@ fn jsonl_persistence_reopen_fork_and_context_deduplication() {
 
     // Strict LF-delimited JSONL (no CRLF).
     let raw = std::fs::read_to_string(&path).unwrap();
-    assert!(!raw.contains('\r'), "JSONL file must be strict LF-delimited");
+    assert!(
+        !raw.contains('\r'),
+        "JSONL file must be strict LF-delimited"
+    );
     assert!(raw.ends_with('\n'));
 
     // Reopen from disk and verify tree + reconstructed context.
@@ -170,7 +173,10 @@ fn jsonl_persistence_reopen_fork_and_context_deduplication() {
     let recon = reopened.reconstruct_context();
     assert_eq!(recon.system_prompt, "Base system instructions.");
     assert_eq!(recon.tools, resident_tools());
-    assert!(matches!(recon.messages[0], AgentMessage::Llm(Message::System(_))));
+    assert!(matches!(
+        recon.messages[0],
+        AgentMessage::Llm(Message::System(_))
+    ));
 
     let rendered_texts: Vec<String> = recon
         .messages
@@ -183,7 +189,11 @@ fn jsonl_persistence_reopen_fork_and_context_deduplication() {
             _ => None,
         })
         .collect();
-    assert!(rendered_texts.iter().any(|t| t == "<system-reminder name=\"env\">\nos=linux\n</system-reminder>"));
+    assert!(
+        rendered_texts
+            .iter()
+            .any(|t| t == "<system-reminder name=\"env\">\nos=linux\n</system-reminder>")
+    );
     assert!(rendered_texts.iter().any(|t| t == "Branch B user"));
     assert!(!rendered_texts.iter().any(|t| t == "Branch A user"));
 
@@ -201,7 +211,10 @@ fn base64_image_exclusion_and_compaction_threshold_math() {
     // 200k window with huge 128k max_output_tokens must clamp reserve to 20k -> threshold 180k.
     let huge_out_model = test_model(200_000, 128_000);
     let default_cfg = CompactionConfig::default();
-    assert_eq!(effective_reserve_tokens(&huge_out_model, &default_cfg), 20_000);
+    assert_eq!(
+        effective_reserve_tokens(&huge_out_model, &default_cfg),
+        20_000
+    );
     assert_eq!(compaction_threshold(200_000, 20_000), 180_000);
     assert!(!should_compact(179_999, &huge_out_model, &default_cfg));
     assert!(should_compact(180_000, &huge_out_model, &default_cfg));
@@ -228,7 +241,11 @@ fn base64_image_exclusion_and_compaction_threshold_math() {
 
     let est = estimate_context_tokens(&messages);
     assert_eq!(est.total_tokens, IMAGE_TOKEN_ESTIMATE + 6);
-    assert!(!should_compact(est.total_tokens, &huge_out_model, &default_cfg));
+    assert!(!should_compact(
+        est.total_tokens,
+        &huge_out_model,
+        &default_cfg
+    ));
 }
 
 #[test]
@@ -305,7 +322,10 @@ fn auto_compaction_preserves_prompt_prefix_folds_repeated_and_restores_context()
                 _ => None,
             })
             .collect();
-        assert_eq!(restored_names, vec!["skills".to_string(), "env".to_string()]);
+        assert_eq!(
+            restored_names,
+            vec!["skills".to_string(), "env".to_string()]
+        );
 
         // Turn 2 after compaction #1 -> triggers Compaction #2 to verify folding (no stacking).
         mgr.append_message(AgentMessage::Llm(Message::User(UserMessage::text(
@@ -331,7 +351,10 @@ fn auto_compaction_preserves_prompt_prefix_folds_repeated_and_restores_context()
 
         // Reconstructed context MUST keep SystemBaseline at index 0 and ONLY the latest summary.
         let final_recon = mgr.reconstruct_context();
-        assert_eq!(final_recon.system_prompt, "You are a disciplined assistant.");
+        assert_eq!(
+            final_recon.system_prompt,
+            "You are a disciplined assistant."
+        );
         assert_eq!(final_recon.tools, resident_tools());
         assert!(matches!(
             final_recon.messages[0],
@@ -350,7 +373,11 @@ fn auto_compaction_preserves_prompt_prefix_folds_repeated_and_restores_context()
                 _ => None,
             })
             .collect();
-        assert_eq!(summary_msgs.len(), 1, "repeated compactions must fold, never stack");
+        assert_eq!(
+            summary_msgs.len(),
+            1,
+            "repeated compactions must fold, never stack"
+        );
         assert!(summary_msgs[0].contains("Folded Summary V2"));
         assert!(!summary_msgs[0].contains("Summary V1"));
 
@@ -381,7 +408,10 @@ fn auto_compaction_preserves_prompt_prefix_folds_repeated_and_restores_context()
             ) -> BoxFuture<'a, Result<CompactionOutput, SessionError>> {
                 Box::pin(async move {
                     Ok(CompactionOutput {
-                        summary: format!("custom-injected(prev={})", input.previous_summary.is_some()),
+                        summary: format!(
+                            "custom-injected(prev={})",
+                            input.previous_summary.is_some()
+                        ),
                         first_kept_entry_id: String::new(),
                         usage: None,
                     })
