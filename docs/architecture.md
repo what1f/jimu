@@ -1,237 +1,112 @@
-# Pikra 架构设计文档
+# Pikra 架构与设计边界
 
-> **定位**：面向全端嵌入（Swift / Kotlin / Wasm / Rust / Node / RPC）的超轻量、模块化、零隐式副作用的无头（Headless）Agent 引擎。
-> **仓库路径**：`/path/to/pikra`
-
----
-
-## 1. 设计目标与硬指标
-
-1. **极致体积与零宿主冗余**：核心库不绑死 `tokio`、不内置 TLS/HTTP 协议栈、不带任何 TUI 代码。宿主嵌入（Swift/Kotlin）直接复用系统网络栈，单架构二进制增量控制在 **1.2MB ~ 1.8MB**（对比 `fx` + `LibFx` 的 ~9.8MB 缩减 80% 以上）；纯 `agent + ai` Wasm 产物 gzip 后 **< 400KB**。
-2. **包级彻底解耦**：对标 [pi](https://github.com/badlogic/pi-mono)，从 `schema`、`ai`、`agent`、`session`、`durable`、`codemode` 到 `kit` 严格单向依赖，每一层均可作为独立库单独引入，未引入的包物理零编译。
-3. **全链路免改源码扩展**：关键生命周期全部暴露为可组合拦截点。同进程宿主可直接用宿主语言（Swift/Kotlin/Rust/TS）注入原生 Hook 与 Tool；跨端动态能力通过可选的 `pikra-js`（`rquickjs`）实现脚本级扩展与 `codemode` 工具编排沙盒。
-4. **Prompt Cache 一等公民**：对齐 **Pi**（`TranscriptContext`）、**Claude Code**（锁定 `cache_control` + `<system-reminder>` 尾部追加）与 **Codex (`codex-rs`)**（`contextual_user_message` 增量上下文片段）的生产级机制，杜绝热更新工具、Skill 或环境信息时打断服务端缓存前缀。
+> **一句话定位**：用 Rust 编写的超轻量、模块化、Prompt Cache 友好的无头（Headless）Agent 运行时内核，配齐产品级单源内置工具箱、可扩展 Skills 与动态工具体系，原生提供 Rust Crate、Swift 6 SDK（`PikraKit`）与跨语言 JSONL RPC（`pikra --mode rpc`）。
 
 ---
 
-## 2. Cargo Workspace 包拆分与依赖拓扑
+## 1. 核心设计哲学
 
-整个仓库维护单一根 `Cargo.toml`（Rust Edition 2024），按职责拆分为以下独立 Crate：
+### 1.1 为什么既有「极简微内核」又有「产品级内置工具箱」？
+像 `pi` 这类编程向框架内核极轻，但内置工具过于简陋（只有同步 `bash` 和基础读写，缺 `rg` 全文检索、后台长驻终端、`Monitor` 事件唤醒、网页正文提纯与可扩展 Skill 目录），直接拿去做产品时每个宿主都得重造一遍轮子。
+
+Pikra 采用**「微内核分层 + 单源可裁剪工具包」**架构同时解决这两个矛盾：
+- **核心层极度纯粹**：`pikra-schema`、`pikra-ai`、`pikra-agent`、`pikra-session` 零磁盘子进程依赖、零网络库绑定，任何沙盒环境（含 iOS、边缘运行时）均可嵌入。
+- **产品级工具单源实现、按需裁剪**：`pikra-tools` 在 Rust 内统一实现一套工业级工作区工具（内嵌 `ripgrep` 的 `find`/`grep`、Codex 同款 4 级容错 `apply_patch`/`edit`、带 PTY 的前后台 `exec_command`/`write_stdin`、按行防抖与防刷屏的 `monitor`、可提前打断的 `sleep`、移植自 Defuddle 的 `web_fetch`）。Rust 端靠 Cargo Features 裁剪，预编译 SDK（如 Swift `.xcframework`）靠独立 C 构造入口配合链接器 `-dead_strip` 自动剔除未选工具的重型依赖，彻底终结「每种语言 SDK 各抄一遍工具」的维护灾难。
+
+### 1.2 单会话引擎 vs 多 Agent 产品宿主的分工边界
+Pikra 严格守住**单会话运行时**边界，不与上层产品宿主（如 Dora、Meerkat）抢调度权：
+
+```mermaid
+flowchart TB
+    subgraph Host["产品宿主层（如 Dora / Meerkat / 业务 App）"]
+        GlobalSched["跨会话调度：持久化 Cron 定时、多 Agent 派小弟（Workers）、远程 Webhook"]
+        UI["交互与系统集成：审批弹窗卡片、选择题 UI（ask_user）、系统通知、窗口/日历原生工具"]
+    end
+
+    subgraph Pikra["Pikra 单会话运行时内核"]
+        Kit["pikra-kit：会话编排 · 可扩展 Skills（增量 Diff） · BM25 延迟工具网关 · MCP · 后台唤醒收件箱"]
+        Tools["pikra-tools：read / write / edit / apply_patch / find / grep / exec_command / write_stdin / monitor / sleep / web_fetch"]
+        Loop["pikra-agent + pikra-session：回合状态机 · 5 阶拦截钩子 · 追加式会话树 · 保前缀自动压缩"]
+        Wire["pikra-ai：OpenAI Responses / Codex / Completions / Anthropic / Gemini 流式协议与跨模型切换"]
+    end
+
+    Host -->|"挂自定义工具 & 前后置钩子（审批/环境变量/密钥脱敏）"| Kit
+    Kit --> Tools
+    Kit --> Loop
+    Loop --> Wire
+```
+
+---
+
+## 2. Workspace 包拓扑与职责
 
 ```mermaid
 flowchart TD
-    subgraph Bindings["跨语言 SDK 与入口层 (bindings/* & apps/*)"]
-        FFI["pikra-ffi (UniFFI -> Swift / Kotlin)"]
-        Wasm["pikra-wasm (wasm-bindgen -> Browser / Workers)"]
-        CLI["pikra-rpc (轻量 stdio JSONL RPC 二进制)"]
+    subgraph Entry["接入入口层"]
+        Swift["swift/PikraKit (Swift 6 Actor SDK)"]
+        FFI["pikra-ffi (C-ABI 静态库桥接，零 reqwest/rustls)"]
+        RPC["apps/pikra-rpc (pikra CLI & stdio JSONL RPC)"]
     end
 
-    subgraph Upper["组装与运行时扩展层"]
-        Kit["pikra-kit (Skills + Context Blocks + 延迟工具网关 + MCP)"]
-        Durable["pikra-durable (持久化 Task 状态机 + Checkpoint + Signal/Sleep)"]
-        JS["pikra-js (rquickjs 动态扩展运行时)"]
+    subgraph Runtime["会话组装与扩展层"]
+        Kit["pikra-kit (KitSession · Skills · Deferred Tools · MCP · Wakeup Inbox)"]
+        Tools["pikra-tools (模块化内置工具箱 + Schema 覆盖)"]
+        Durable["pikra-durable (可选单机 SQLite WAL 事务恢复引擎)"]
+        JS["pikra-js (QuickJS 动态扩展与钩子)"]
         CodeMode["pikra-codemode (QuickJS 受限工具编排沙盒)"]
-        HTTP["pikra-http (仅独立二进制/Rust 宿主选用的原生 HTTP/SSE 实现)"]
-        Tools["pikra-tools (可选内置 read/write/edit/bash 工具包)"]
+        HTTP["pikra-http (reqwest + rustls + 系统根证书)"]
     end
 
-    subgraph Core["纯核心层 (无 tokio / 无网络栈 / 无磁盘绑定, 100% 兼容 wasm32)"]
-        Session["pikra-session (Entry Tree + 分支 Fork + 可插拔 Compaction)"]
-        Agent["pikra-agent (Stateful Turn Loop + 并行/串行工具调度 + Steer/Hooks)"]
-        AI["pikra-ai (统一多模型流式协议 + Handoff + 用量计费 + Transport Trait)"]
-        Schema["pikra-schema (JSON Schema 构建 + 三遍宽松类型纠偏 + 极简校验)"]
+    subgraph Core["纯核心层（零 tokio / 零网络库）"]
+        Session["pikra-session (会话树 · Fork · Context 快照 · 保前缀压缩)"]
+        Agent["pikra-agent (Turn Loop · 并发工具调度 · Steer · Middleware)"]
+        AI["pikra-ai (多服务商流式线协议 · OAuth · HttpTransport Trait)"]
+        Schema["pikra-schema (Schema 构建 · 三遍参数纠偏 · 内置 NFA 校验)"]
     end
 
+    Swift --> FFI
     FFI --> Kit
-    Wasm --> Kit
-    CLI --> Kit
-    CLI --> HTTP
-    CLI --> Tools
+    FFI --> Tools
+    FFI --> JS
+    RPC --> Kit
+    RPC --> Tools
+    RPC --> HTTP
 
     Kit --> Session
-    Kit --> Agent
     Kit --> CodeMode
-    JS --> Agent
-    CodeMode --> Schema
-    Durable --> Agent
     Durable --> Session
+    JS --> Agent
     Tools --> Agent
+    CodeMode --> Schema
+    HTTP --> AI
 
     Session --> Agent
     Agent --> AI
     AI --> Schema
 ```
 
-### 各包职责与独立可用性边界
-
-| Crate | 对标 `pi` 模块 | 核心职责 | 外部依赖约束 |
-| :--- | :--- | :--- | :--- |
-| **`pikra-schema`** | `pi-schema` | 工具参数 JSON Schema 定义、LLM 松散输出三遍纠偏（去可选 `null`、`String` 转数值/布尔、单值包数组、`anyOf` 分支匹配）与模型友好的单行错误诊断 | 仅 `serde`、`serde_json` |
-| **`pikra-ai`** | `pi-ai` | 统一流式协议（`openai-responses`、`openai-completions`、`anthropic-messages`、`google-generative-ai`）、SSE 帧解析、Thinking 签名保留、跨模型消息 Handoff、Token/Cost 核算 | 仅 `pikra-schema`、`futures-core`；HTTP 由 `HttpTransport` trait 注入 |
-| **`pikra-agent`** | `pi-agent-core` | 纯内存 Agent Turn 状态机：`prepareRequest` → 流式生成 → 参数校验与 `beforeToolCall` → 并行/串行工具执行 → `afterToolCall` → `finishTurn`，含 `steer` 插话与 `followUp` 队列 | 仅 `pikra-ai`；零磁盘/系统调用 |
-| **`pikra-session`** | `SessionManager` | 追加式不可变会话树（`SessionEntry` 带 `id`/`parentId`）、分支 `fork`、上下文重建、Prompt Cache 安全上下文块去重、可插拔 `CompactionStrategy` | 仅 `pikra-agent`；内置 `MemoryStore` 与 `JsonlStore` trait |
-| **`pikra-durable`** | `pi-durable` | 事务型持久化执行引擎：原子 Commit、崩溃自动续跑（Task Phase Checkpoint）、幂等 `requestId`、`sleepUntil` 与外部 `Signal` 唤醒（二阶段演进） | `pikra-agent` + `pikra-session` + SQLite/KV 后端 |
-| **`pikra-codemode`** | `pi-codemode` | 模型编写的受限 async JS 工具编排沙盒：仅暴露注入的 `tools.*`、`ALL_TOOLS`、`text()`、`image()`、`store/load`，嵌套调用不进 LLM 上下文。可脱离 Agent 单独使用 | Native 用 `rquickjs`（无 JIT）；Wasm 走宿主 `ScriptBridge` |
-| **`pikra-js`** | `extensions` (JS) | 使用 `rquickjs` 加载跨平台 `.js` 扩展脚本，注册自定义工具与回合/工具级拦截钩子 | `pikra-agent` + `rquickjs` |
-| **`pikra-kit`** | `pi-coding-agent` (无 TUI) + `pi-mcp` | 开箱即用门面：组装 `Session` + `Skill` 按需发现 + 动态 `<system-reminder>` 上下文块 + 延迟工具加载（`tool_search` / `call_tool`）+ MCP Client（Streamable HTTP / stdio） | 按 Cargo Feature 开关子模块 |
-| **`pikra-tools`** | coding-agent builtin tools | 可选本地系统工具（`read`、`write`、`edit`、`bash`、`find`），工具命名与参数对齐统一词汇表 | 仅桌面/CLI 按需引入，移动端/Wasm 不引入 |
-| **`pikra-rpc`** | `pi --mode rpc` | 独立无头子进程二进制：严格 LF 分隔的 `stdin/stdout` JSONL 命令、响应与流式事件协议 | 组装 `pikra-kit` + `pikra-http` + `pikra-tools` |
-
 ---
 
-## 3. 核心机制设计
+## 3. 四大关键架构机制
 
-### 3.1 I/O 与异步运行时解耦（为什么能既小又跨全端）
+### 3.1 双轨网络抽象（`HttpTransport`）
+- **Linux / Windows / CLI / 服务端**：直接注入 `pikra-http::ReqwestTransport`（纯 Rust `reqwest` + `rustls` + 操作系统原生根证书库），单文件静态分发，完美避开 Linux OpenSSL 版本冲突与 Windows WinHTTP 流式缺陷，同时兼容企业内网根证书与系统代理。
+- **macOS / iOS 原生 App（`PikraKit`）**：`pikra-ffi` 不打包任何网络或 TLS 库，由 Swift 侧无痕 `URLSession` 实现同一套 `HttpTransport`。不仅省掉双份 TLS 体积，还能天然支持 iOS 联网权限弹窗、VPN 分流工具按应用规则代理以及 `web_fetch` 零额外依赖联网。
 
-核心层（`schema` / `ai` / `agent` / `session` / `kit`）使用标准 Rust `async fn` + `futures_core::Stream`，**不直接调用 `tokio::spawn` 或特定网络库**，仅通过两个极简宿主接口与外部世界交互：
+### 3.2 Prompt Cache 绝对前缀保护
+所有动态能力均围绕「已发送前缀字节恒定」设计：
+1. **常驻与延迟严格分池**：顶层 `tools` 数组在会话建立时锁定顺序；外部 MCP 工具或超预算工具自动进入 `DeferredToolRegistry`，通过常驻的 `tool_search`（BM25 分词相关性排序）按需拉取参数定义，通过 `call_tool` 执行（事件流自动透出内部真实工具名供 UI 展示）或在 `exec`（QuickJS 沙盒）中批量编排。
+2. **Skills 多级发现与 Dora 式增量 Diff**：
+   - 支持从 `cwd` 向上回溯至仓库根扫描项目级目录（默认兼容跨生态 `.agents/skills` 及宿主自定义目录如 `.pikra/skills`、`.dora/skills`、`.pi/skills`）+ 用户全局目录 + 显式追加路径 + 单条启停过滤 + 8KB 体积封顶。
+   - **首轮与压缩后发全量，中途只发增删 Diff**：会话运行中若新增或删除 Skill，只在末尾追加 `# Skills changed` 增量块；修改已有 `SKILL.md` 正文不发任何冗余提醒。
+3. **压缩复用父前缀**：自动压缩摘要请求直接复用上一轮完整消息与工具前缀，仅在尾部追加摘要指令，最大化命中缓存读取。
 
-```rust
-/// 1. 字节流 HTTP 传输抽象：Swift 接 URLSession，Kotlin 接 OkHttp，Wasm 接 fetch，CLI 接 pikra-http
-pub trait HttpTransport: Send + Sync {
-    fn send(&self, req: HttpRequest, abort: AbortRegistration) -> BoxFuture<'_, Result<HttpStreamResponse, TransportError>>;
-}
+### 3.3 前后台统一终端、`Monitor` 事件唤醒与 `Sleep`
+告别低效耗费 Token 的轮询等待：
+- **`exec_command` + `write_stdin`**：短命令在 `yield_time_ms` 内跑完直接返回输出；长耗时服务或构建自动转入会话后台池返回 `session_id`，支持真 PTY 交互输入、增量读输出与进程组级强制回收。
+- **`monitor` + 会话唤醒收件箱**：在后台监听命令标准输出（200ms 防抖合并成批，stderr 仅落盘日志，1 分钟超 200 行自动触发防刷屏熔断）。当 Agent 处于空闲态时，收件箱将到达的后台事件合并为单条 `<monitor_event>` 消息自动唤醒新一轮推理（或转交重宿主自己的调度器）；当 Agent 正在执行 `sleep` 时，新消息或 `monitor` 事件会立即提前打断休眠。
 
-/// 2. 并发派发器（仅并行工具执行需要）：单线程 Wasm 用 spawn_local，Swift/Kotlin/Tokio 桥接各自任务池
-pub trait Spawner: Send + Sync {
-    fn spawn(&self, fut: BoxFuture<'static, ()>);
-}
-```
-
-> [!IMPORTANT]
-> 这套设计直接消除了两大痛点：一是宿主 App 无需打包双份 TLS/HTTP 栈（省掉 `rustls`/`ring` 数百 KB 体积）；二是自动继承宿主系统的网络环境（macOS/iOS 系统代理、企业根证书、HTTP/3 连接复用）。
-
----
-
-### 3.2 `pikra-ai`：转录上下文与 Prompt Cache 前缀保护
-
-融合 **Pi**（`TranscriptContext` / `SystemMessage`）、**Claude Code**（`ToolSearchTool` / `SkillTool` 通过 `<system-reminder>` 注入与相邻块合并）以及 **Codex (`codex-rs`)**（`contextual_user_message` 追加环境状态）的成熟做法，模型请求采用**严格的追加式转录模型**：
-
-```mermaid
-sequenceDiagram
-    participant Host as "宿主 / Kit"
-    participant Session as "pikra-session"
-    participant AI as "pikra-ai (Wire Adapter)"
-    participant LLM as "Provider API"
-
-    Host->>Session: open(base_instructions, resident_tools)
-    Note over Session: 写入首条不可变 SystemEntry (锁定基线 Prompt 与常驻工具顺序)
-    Host->>Session: set_context("plugins", "...") / set_context("env", "...")
-    Note over Session: 比较上次已发送 Hash，仅将变化的块打包为 <system-reminder> 追加至本轮 User 消息前
-    Session->>AI: stream(model, TranscriptContext)
-    Note over AI: 前缀 [System 基线 + Resident Tools + 历史消息] 字节级恒定不变
-    AI->>LLM: SSE Streaming Request (带稳定 session_id 亲和头)
-```
-
-1. **基线不可变**：会话建立时写入首条 `SystemMessage`（包含基础指令与按固定顺序排列的常驻工具定义），会话存活期内绝不重排工具顺序或重写头部。
-2. **动态上下文增量追加**：环境信息、插件列表、MCP/延迟工具目录变化统一通过 `Session::set_context(name, text)` 管理。内核记录每个 `name` 最后发出的内容摘要，未变化不重发；变化时在两轮之间合并成 `<system-reminder>` 消息追加在末尾。
-3. **压缩复用前缀**：触发上下文压缩（Compaction）时，生成摘要的请求**原样携带当前完整历史前缀**并在末尾追加一条摘要指令请求，从而直接命中最后一轮的 Prompt Cache Read（省去全价重算整段上下文的成本）；压缩完成后生成新 `CompactionEntry`，并在下一轮自动补发当前生效的上下文块。
-4. **跨模型无损 Handoff**：`AssistantMessage` 完整保留各家专有元数据（Anthropic `thinkingSignature` / `redacted`、OpenAI Responses `item_id` / `phase`、Gemini `thoughtSignature`）。会话中途切换模型/服务商时，适配器自动将异构签名降级为标准文本/思考块，同服务商内保留原生重放签名，避免 400 校验错误。
-
----
-
-### 3.3 `pikra-agent` + 双层扩展体系（不改源码定制一切）
-
-Agent 回合状态机在单次运行内严格按以下管线流转，每个控制点均可通过 **Middleware Stack（洋葱模型 / 责任链）** 挂载多个扩展：
-
-```mermaid
-flowchart LR
-    Input["输入 / Steer 注入"] --> Prep["1. prepare_request"]
-    Prep --> Ctx["2. transform_context -> convert_to_llm"]
-    Ctx --> Stream["3. Provider 流式响应"]
-    Stream --> Coerce["4. Schema 三遍纠偏校验"]
-    Coerce --> Before["5. before_tool_call (审批/改参/拦截)"]
-    Before --> Exec["6. 工具并发执行 (完成即发事件, 按原序落库)"]
-    Exec --> After["7. after_tool_call (脱敏/裁剪/terminate)"]
-    After --> Finish["8. finish_turn (continue / end)"]
-```
-
-**统一的 `Extension` 契约支持两种注入方式无缝混用**：
-
-1. **宿主原生扩展（零 JS 开销，全端可用）**
-   - Rust 宿主直接实现 `Extension` / `AgentTool` trait；
-   - Swift / Kotlin / Wasm 宿主通过 FFI Callback Interface 直接用 Swift Closure/Protocol、Kotlin Interface 或 JS 函数注册自定义工具和拦截器。
-2. **QuickJS 动态扩展（`pikra-js`，可选挂载）**
-   - 仅在控制面节点（`prepare_request`、`transform_context`、`before_tool_call`、`after_tool_call`、`finish_turn`、`compact`）调用 QuickJS，**流式高频 `text_delta` / `thinking_delta` 绝不跨 JS 边界**。
-   - 支持从目录或内存加载 `.js` 模块调用 `pikra.registerTool(...)` 与 `pikra.on(...)`，支持运行时 `reload()`，一套脚本跨 macOS / iOS / Android / CLI 通用。
-
----
-
-### 3.4 延迟工具网关与 `pikra-codemode`
-
-针对嵌入宿主往往有数十上百个业务 Action / MCP 工具的场景，在 `pikra-kit` 层内置两套省 Token 利器：
-
-1. **延迟工具检索（`tool_search` + `call_tool`）**：常驻工具表只放高频基础工具与 `tool_search` / `call_tool`（工具列表保持固定不破前缀缓存）；其余工具仅以极简名称索引通过 `deferred_tools` 上下文块告知模型，模型按需 `tool_search` 拉取完整 JSON Schema。
-2. **Code Mode 工具编排（`pikra-codemode`）**：将所有可用工具注入受限 QuickJS 沙盒（禁绝网络、文件系统、定时器，配额限制内存如 `32MB` 及执行超时中断）。模型一次性写出多步逻辑：
-   ```js
-   const items = await tools.list_todos({ status: "open" });
-   for (const item of items.slice(0, 5)) {
-     await tools.mark_reviewed({ id: item.id });
-   }
-   text(`Processed ${Math.min(items.length, 5)} items`);
-   ```
-   中间 6 次工具调用全部在沙盒与宿主间闭环，**不产生 6 轮模型推理，也不膨胀会话上下文**。
-
----
-
-## 4. 多语言 SDK 封装方案
-
-拒绝手搓脆弱的 C 字符串消息总线，针对不同平台提供最地道的原生绑定：
-
-| 目标生态 | 绑定技术 | 产物形态 | 宿主接入体验 |
-| :--- | :--- | :--- | :--- |
-| **Swift (macOS / iOS)** | `UniFFI` + 极薄 Swift 扩展层 | `PikraCore.xcframework` + Swift Package (`PikraKit` / `PikraAI`) | 原生 `async throws`、`AsyncStream<AgentEvent>`、Swift `protocol` 注入 `URLSession` Transport 与自定义工具；零 `Yams` / `JSONSchema.swift` 外部依赖 |
-| **Kotlin (Android / JVM)** | `UniFFI` + 极薄 Coroutines 封装 | AAR / JAR (`dev.what1f.pikra`) | 原生 `suspend fun`、`Flow<AgentEvent>`、`sealed interface` 事件匹配、桥接 `OkHttp` |
-| **Wasm (Browser / Edge)** | `wasm-bindgen` | npm `@what1f/pikra-wasm` | 零拷贝桥接 `globalThis.fetch` 与 `ReadableStream`，支持 Cloudflare Workers / 浏览器沙盒 |
-| **Rust (`meerkat` 等)** | 原生 Cargo Crates | 直接引用 `pikra-ai` / `pikra-agent` / `pikra-kit` | 零 FFI 损耗，直接进程内嵌入，替代 `meerkat-agent` 子进程黑盒 |
-| **跨进程通用 (`RPC`)** | `pikra-rpc` 二进制 | 单文件静态可执行程序（`pikra --mode rpc`） | 严格 LF 分隔的 `stdin` 命令 / `stdout` 事件流（兼容 `pi` RPC 语义：带 `id` 请求关联、`prompt` / `steer` / `abort` / `agent_settled`） |
-
----
-
-## 5. 编译配置与体积控制规范
-
-在根 `Cargo.toml` 固化体积优先配置，并在 CI/本地脚本设立体积红线检查：
-
-- **Release 构建配置**：`opt-level = "z"`（或分 profile 对比 `"s"`）、`lto = true`、`codegen-units = 1`、`panic = "abort"`、`strip = "symbols"`。
-- **依赖禁令**：
-  - 核心包禁止引入 `regex`（普通通配与简单格式校验手写字节扫描，省 ~600KB Unicode 表）、禁止引入 `chrono`（时间戳统一用 `u64` Unix ms）、禁止在核心包开启 `tokio/full`。
-  - 模型目录（Catalog）采用紧凑静态表或宿主按需注册（类似 `pi-ai` 的按 Provider Factory 注册），不把几百个冷门模型元数据硬塞进默认二进制。
-
----
-
-## 6. 测试规范与首版演进切片
-
-严格执行**零单元测试、只写极简核心业务 E2E** 原则：
-- 源码 `src/` 下**禁止写 `#[cfg(test)]` 单元测试**，不测内部私有函数，不用 `sleep` 做任何时序等待。
-- 建立独立的 `crates/pikra-testkit`：内置确定性的 **Faux Streaming Provider**（模拟真实 SSE 分块吐字、Thinking 块、并行工具调用、网络中断、Usage 回报，并自动记录每次实际发出的序列化 Payload 以断言 **Prompt Cache 前缀字节级未破坏**）。
-- 每个模块仅维护 1~3 条端到端业务闭环测试；真实模型联调通过环境变量显式开启。
-
-### 分阶段交付路线图
-
-1. **Slice 1（底座闭环：`schema` + `ai` + `agent`）**
-   - 跑通 JSON Schema 三遍纠偏校验、`openai-responses` / `openai-completions` / `anthropic-messages` / `google-generative-ai` 四大流式协议、Agent Turn Loop（含并发工具保序、`steer` 插话、全链路原生 Hooks）及前缀稳定性 E2E 验证。
-2. **Slice 2（会话与组装：`session` + `kit` + `rpc`）**
-   - 跑通追加式会话树、分支 `fork`、保前缀缓存的 `<system-reminder>` 上下文块与自动 Compaction、延迟工具（`tool_search` / `call_tool`）、Skill 加载、MCP Client 与 `pikra-rpc` JSONL 协议。
-3. **Slice 3（QuickJS 能力：`codemode` + `js`）**
-   - 落地 `rquickjs` 受限工具编排沙盒与 `.js` 动态扩展热加载。
-4. **Slice 4（跨语言 SDK：`Swift` + `Wasm` + `Kotlin`）**
-   - 打通 `pikra-ffi`（生成 `PikraKit` Swift Package 并实测单架构二进制体积）与 `pikra-wasm`（跑通浏览器/Workers 流式调用），达到生产级嵌入标准。
-
----
-
-## 7. 代码体量预算与工期评估（对照 `pi` 实测非空 LOC）
-
-基于 `earendil-works/pi` 各包真实源码行数（排除生成表、单测、TUI、CLI 安装器及冷门长尾适配器）折算：
-
-| 模块 | `pi` 源码实测 (TS) | `pikra` 预估 (Rust) | 裁剪与折算说明 |
-| :--- | ---: | ---: | :--- |
-| **`pikra-schema`** | 4,307 行 | **1,200 ~ 1,600 行** | 省去 TS `Static` 类型体操层，保留核心 JSON Schema 校验 + 三遍 Coercion |
-| **`pikra-ai`** (+ `http`) | 26,309 行 | **4,800 ~ 6,500 行** | 首版聚焦 4 大核心协议（Responses / Completions / Anthropic / Gemini，在 `pi` 中合计 ~6,600 行）+ 跨模型 Handoff + SSE/计费；砍掉 ~1.8 万行冷门云厂商/图像/分类器胶水 |
-| **`pikra-agent`** | 2,315 行 | **2,200 ~ 2,800 行** | 1:1 复刻状态机、并发保序工具执行、`steer`/`followUp` 与全套拦截 Hook |
-| **`pikra-session`** | 3,322 行 | **2,000 ~ 2,500 行** | 对标 `session-manager.ts` (1,847) + `compaction/` (1,475) |
-| **`pikra-kit`** (+ `mcp`) | ~8,500 行 | **2,500 ~ 3,200 行** | 保留 Skills、`tool_search`、上下文片段、Streamable HTTP/stdio MCP；剔除 CLI 包管理与 HTML 导出 |
-| **`pikra-tools`** + **`rpc`** | ~6,200 行 | **2,000 ~ 2,800 行** | 可选本地文件/Shell 工具集 + 严格 LF JSONL RPC 二进制 |
-| **`pikra-codemode`** + **`js`** | 2,855 行 | **1,800 ~ 2,500 行** | 直接绑定原生 `rquickjs`，省去 Node Worker / WASI 胶水层 |
-| **多语言 SDK 层** (`ffi`/`wasm`/Swift/Kotlin) | — | **2,000 ~ 2,800 行** | UniFFI 导出定义 + Swift `URLSession`/`AsyncStream` + Kotlin `OkHttp`/`Flow` + Wasm `fetch` |
-| **首版产品代码合计** | — | **18,500 ~ 24,700 行** | 另加 `pikra-testkit` 与核心 E2E 约 **3,000 ~ 4,000 行** |
-| **二期 `pikra-durable`**（独立演进） | 33,630 行 | **+4,500 ~ 6,500 行** | 剥离 `chord` 分布式对象框架，仅做单库原子事务 + Task Checkpoint + Signal/Sleep |
-
+### 3.4 宿主拦截切面与工具 Schema 自定义
+宿主无需重写内置工具代码即可完成产品化定制：
+- **定义层覆盖（`ToolDefinitionOverride`）**：挂载内置工具时可改工具名（如把 `exec_command` 暴露为 `bash`）、替换或追加工具描述文案、隐藏指定可选参数并注入固定默认值。
+- **执行层切面（`AgentMiddleware` / SDK Hooks）**：`before_tool_call` 统一拦截权限审批与参数改写；`env_provider` 动态注入终端环境变量；`after_tool_call` 统一对输出中的敏感密钥打码脱敏或落盘截断。
