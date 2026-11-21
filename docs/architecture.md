@@ -96,6 +96,7 @@ flowchart TD
 ### 3.1 双轨网络抽象（`HttpTransport`）
 - **Linux / Windows / CLI / 服务端**：直接注入 `pikra-http::ReqwestTransport`（纯 Rust `reqwest` + `rustls` + 操作系统原生根证书库），单文件静态分发，完美避开 Linux OpenSSL 版本冲突与 Windows WinHTTP 流式缺陷，同时兼容企业内网根证书与系统代理。
 - **macOS / iOS 原生 App（`PikraKit`）**：`pikra-ffi` 不打包任何网络或 TLS 库，由 Swift 侧无痕 `URLSession` 实现同一套 `HttpTransport`。不仅省掉双份 TLS 体积，还能天然支持 iOS 联网权限弹窗、VPN 分流工具按应用规则代理以及 `web_fetch` 零额外依赖联网。
+- **网页访问策略**：`pikra-tools` 为每次页面请求和每一跳重定向检查 DNS 和地址范围。符合公网域名规则的名称可以解析到 `198.18.0.0/15` TUN Fake-IP。ACP 复用这套检查，用标准权限请求批准指定来源的本地访问。链路本地地址始终拦截。本地主机名解析到 IPv6 链路本地地址和其他可用地址时，只用可用地址继续。
 
 ### 3.2 Prompt Cache 绝对前缀保护
 所有动态能力均围绕「已发送前缀字节恒定」设计：

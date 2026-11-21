@@ -159,9 +159,9 @@ public struct PikraURLSessionHTTPClient: PikraHTTPClient {
         try Task.checkCancellation()
 
         var urlRequest = request.toURLRequest()
-        let manualRedirect = urlRequest.value(forHTTPHeaderField: "x-pikra-no-redirect") != nil
-        urlRequest.setValue(nil, forHTTPHeaderField: "x-pikra-no-redirect")
-        urlRequest.setValue(nil, forHTTPHeaderField: "x-pikra-resolve-addrs")
+        let manualRedirect = urlRequest.value(forHTTPHeaderField: "x-no-redirect") != nil
+        urlRequest.setValue(nil, forHTTPHeaderField: "x-no-redirect")
+        urlRequest.setValue(nil, forHTTPHeaderField: "x-resolve-addrs")
         let (bytes, response) = try await session.bytes(
             for: urlRequest,
             delegate: CredentialRedirectPolicy(manualRedirect: manualRedirect)

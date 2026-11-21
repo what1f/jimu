@@ -11,6 +11,7 @@ use pikra_agent::{
     ToolProgressCallback, TurnDecision,
 };
 use pikra_ai::{BoxFuture, CancelToken, ToolDefinition};
+use pikra_tools::WebFetchTool;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -18,10 +19,12 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use url::Origin;
 
 struct Call {
     fields: acp::ToolCallUpdateFields,
     changes: Vec<Change>,
+    private_origin: Option<Origin>,
     ended: bool,
 }
 
@@ -30,6 +33,7 @@ enum Permission {
     Files,
     Execute,
     Tool(String),
+    WebFetch(Origin),
 }
 
 pub(crate) struct Bridge {
@@ -38,6 +42,7 @@ pub(crate) struct Bridge {
     pub(crate) capabilities: acp::ClientCapabilities,
     pub(crate) peer: Arc<Peer>,
     pub(crate) mode: Mutex<Mode>,
+    web_fetch: Option<Arc<WebFetchTool>>,
     roots: Vec<PathBuf>,
     permissions: Mutex<HashMap<Permission, bool>>,
     calls: Mutex<HashMap<String, Call>>,
@@ -54,6 +59,7 @@ impl Bridge {
         mode: Mode,
         capabilities: acp::ClientCapabilities,
         peer: Arc<Peer>,
+        web_fetch: Option<Arc<WebFetchTool>>,
     ) -> Self {
         let roots = std::iter::once(&cwd)
             .chain(additional)
@@ -64,6 +70,7 @@ impl Bridge {
             cwd,
             capabilities,
             peer,
+            web_fetch,
             roots,
             mode: Mutex::new(mode),
             permissions: Mutex::default(),
@@ -161,7 +168,7 @@ impl Bridge {
         inside: bool,
         cancel: &CancelToken,
     ) -> Result<(), String> {
-        if mode == Mode::Plan {
+        if mode == Mode::Plan && !matches!(permission, Permission::WebFetch(_)) {
             return Err("Plan mode allows inspection only. Present a plan without changing files or running commands.".into());
         }
         if mode == Mode::Bypass
@@ -330,6 +337,26 @@ impl Bridge {
         if let Some(permission) = permission {
             self.approve(id, &permission, mode, inside, cancel).await?;
         }
+        if let Some(web_fetch) = self.web_fetch.as_ref().filter(|_| name == "web_fetch") {
+            let url = args["url"].as_str().ok_or("Enter an HTTP or HTTPS URL")?;
+            if let Some(origin) = web_fetch
+                .private_origin(url, cancel)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                self.approve(
+                    id,
+                    &Permission::WebFetch(origin.clone()),
+                    mode,
+                    inside,
+                    cancel,
+                )
+                .await?;
+                let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+                let call = calls.get_mut(id).ok_or("Tool call state missing.")?;
+                call.private_origin = Some(origin);
+            }
+        }
         if cancel.is_cancelled() {
             return Err("Operation cancelled.".into());
         }
@@ -370,6 +397,7 @@ impl Bridge {
             Call {
                 fields,
                 changes,
+                private_origin: None,
                 ended: false,
             },
         );
@@ -768,6 +796,23 @@ impl AgentTool for IdeTool {
                         .map(|call| std::mem::take(&mut call.changes))
                         .ok_or("The edit was not approved.")?;
                     return edits::apply(&self.bridge, &changes, &cancel).await;
+                }
+                "web_fetch" => {
+                    let origin = self
+                        .bridge
+                        .calls
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&id)
+                        .and_then(|call| call.private_origin.take());
+                    if let (Some(origin), Some(tool)) = (origin, &self.bridge.web_fetch) {
+                        return tool
+                            .as_ref()
+                            .clone()
+                            .with_private_origin(origin)
+                            .execute(id, args, cancel, on_update)
+                            .await;
+                    }
                 }
                 "exec_command"
                     if self.bridge.capabilities.terminal

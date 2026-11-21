@@ -20,6 +20,7 @@ pikra --mode rpc \
   - `"type": "response"`：对应某条输入命令的同步确认或查询结果（原样回传 `"id"`、`"command"`、`"success"`、`"data"` / `"error"`）；
   - 流式会话事件：回合执行期间实时推送的 `agent_start`、`message_update`（含 `text_delta` / `thinking_delta` / `toolcall_delta`）、`tool_execution_start`、`tool_execution_end`、`agent_end`、`compaction_start` / `compaction_end` 等事件。
 - **单次命令行模式**：若只需跑一轮非交互任务，可直接用 `pikra ask "你的问题"`（失败或报错时向 `stderr` 输出原因并以非 0 状态码退出）。
+- **网页访问**：RPC 会话中的 `web_fetch` 逐跳检查目标。符合公网域名规则的名称可解析到 `198.18.0.0/15` TUN Fake-IP。工具拦截该网段的 IP 字面量、本地地址和链路本地地址。
 
 ---
 

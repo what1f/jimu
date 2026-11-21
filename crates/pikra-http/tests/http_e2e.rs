@@ -120,8 +120,8 @@ async fn resolve_addrs_pins_tcp_destination_and_strips_internal_headers() {
                 method: "GET".into(),
                 url: format!("http://pinned.example.invalid:{}/hello", addr.port()),
                 headers: vec![
-                    ("x-pikra-no-redirect".into(), "1".into()),
-                    ("x-pikra-resolve-addrs".into(), addr.to_string()),
+                    ("x-no-redirect".into(), "1".into()),
+                    ("x-resolve-addrs".into(), addr.to_string()),
                     ("x-custom-header".into(), "kept".into()),
                 ],
                 body: Bytes::new(),
@@ -144,11 +144,11 @@ async fn resolve_addrs_pins_tcp_destination_and_strips_internal_headers() {
         "normal headers must pass through: {raw_request}"
     );
     assert!(
-        !lower.contains("x-pikra-no-redirect"),
+        !lower.contains("x-no-redirect"),
         "internal redirect header must be stripped: {raw_request}"
     );
     assert!(
-        !lower.contains("x-pikra-resolve-addrs"),
+        !lower.contains("x-resolve-addrs"),
         "internal resolve header must be stripped: {raw_request}"
     );
 }

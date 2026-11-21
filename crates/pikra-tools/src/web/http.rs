@@ -3,14 +3,16 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use pikra_ai::{CancelToken, HttpRequest, HttpTransport, TransportError};
-use url::Url;
+use url::{Origin, Url};
 
 use super::policy::{WebFetchConfig, check_destination};
 use super::web2md::Web2MdError;
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(20);
+pub(super) const TIMEOUT: Duration = Duration::from_secs(20);
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+const READER_USER_AGENT: &str = "Mozilla/5.0 (compatible; Web2MD/1.0)";
 pub(crate) const PAGE_ACCEPT: &str =
     "text/html,application/xhtml+xml,application/json,text/plain,text/markdown,image/*,*/*;q=0.8";
 
@@ -18,6 +20,7 @@ pub(crate) const PAGE_ACCEPT: &str =
 pub(crate) struct Fetcher {
     pub transport: Arc<dyn HttpTransport>,
     pub config: WebFetchConfig,
+    pub private_origin: Option<Origin>,
 }
 
 pub(crate) struct Download {
@@ -91,15 +94,22 @@ impl Fetcher {
         cancel: &CancelToken,
     ) -> Result<Download, Web2MdError> {
         for hop in 0..=MAX_REDIRECTS {
-            let addrs = check_destination(&url, &self.config).await?;
+            let addrs = check_destination(&url, &self.config, self.private_origin.as_ref()).await?;
             url.set_fragment(None);
+            let user_agent = match url.host_str() {
+                Some(host)
+                    if host == "github.com"
+                        || host.ends_with(".github.com")
+                        || host == "api.fxtwitter.com" =>
+                {
+                    READER_USER_AGENT
+                }
+                _ => BROWSER_USER_AGENT,
+            };
             let mut headers = vec![
-                ("x-pikra-no-redirect".into(), "1".into()),
+                ("x-no-redirect".into(), "1".into()),
                 ("accept".into(), accept.into()),
-                (
-                    "user-agent".into(),
-                    concat!("Pikra/", env!("CARGO_PKG_VERSION")).into(),
-                ),
+                ("user-agent".into(), user_agent.into()),
             ];
             if !addrs.is_empty() {
                 let addrs_csv = addrs
@@ -107,7 +117,7 @@ impl Fetcher {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
-                headers.push(("x-pikra-resolve-addrs".into(), addrs_csv));
+                headers.push(("x-resolve-addrs".into(), addrs_csv));
             }
             let request = HttpRequest {
                 method: "GET".into(),

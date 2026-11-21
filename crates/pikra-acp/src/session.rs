@@ -689,6 +689,12 @@ impl Session {
     ) -> Result<Self> {
         let server = &connection.server;
         let cfg = &server.config;
+        let web_fetch = cfg.enable_tools.then(|| {
+            Arc::new(WebFetchTool::new(
+                server.transport.clone(),
+                WebFetchConfig::default(),
+            ))
+        });
         let bridge = Arc::new(Bridge::new(
             meta.session_id.clone().into(),
             meta.cwd.clone(),
@@ -696,6 +702,7 @@ impl Session {
             meta.mode,
             capabilities,
             connection.peer.clone(),
+            web_fetch.clone(),
         ));
         let turn = Arc::new(TurnSlot::default());
         let compaction = Arc::new(Compaction::new(bridge.clone(), turn.clone()));
@@ -815,10 +822,7 @@ impl Session {
                 tools.push(Arc::new(MonitorTool::new(monitors.clone())));
                 local_processes = Some((processes, monitors));
             }
-            tools.push(Arc::new(WebFetchTool::new(
-                server.transport.clone(),
-                WebFetchConfig::default(),
-            )));
+            tools.extend(web_fetch.map(|tool| tool as Arc<dyn pikra_agent::AgentTool>));
             opts.tools.extend(
                 tools
                     .into_iter()

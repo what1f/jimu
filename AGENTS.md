@@ -75,7 +75,7 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
 5. **进程、安全与取消收尾**：
    - **零孤儿进程**：所有子进程（`exec_command`、`monitor`、stdio MCP）必须独立成进程组，超时、取消或会话关闭时对整个负进程组发送 `SIGKILL` 并回收句柄。
    - **取消收尾义务**：`abort()` 即使在事件流未被外部轮询时也必须推进底层取消收尾，清理未消费的 `steer` 队列，确保紧接着的下一轮调用绝不误报 `Busy`。
-   - **网络与文件安全**：Swift `URLSession` 必须使用无痕会话（`ephemeral`、`urlCache = nil`）；`web_fetch` 默认拦截环回、局域网与云元数据内网地址（含重定向跳数检查）；`write`/`edit`/`apply_patch` 遇到软链接时写入真实目标文件而非破坏软链接本身。
+   - **网络与文件安全**：Swift `URLSession` 必须使用无痕会话（`ephemeral`、`urlCache = nil`）。`web_fetch` 逐跳检查目标，默认限制为公网访问，仅对域名解析结果放行 `198.18.0.0/15` TUN Fake-IP。ACP 的本地访问许可只覆盖同一协议、主机和端口。IPv4 和 IPv6 链路本地地址始终拦截。本地主机名的解析结果可丢弃 IPv6 链路本地地址，再用剩余地址执行审批和访问。`write`/`edit`/`apply_patch` 遇到软链接时写入真实目标文件而非破坏软链接本身。
 
 ---
 

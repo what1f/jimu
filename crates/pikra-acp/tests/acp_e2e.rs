@@ -38,6 +38,9 @@ impl ModelFixture {
             for deltas in replies {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                let get = line.starts_with("GET ");
                 let mut length = None;
                 loop {
                     let mut line = String::new();
@@ -51,11 +54,13 @@ impl ModelFixture {
                         length = Some(value.trim().parse().unwrap());
                     }
                 }
-                let mut body = vec![0; length.unwrap()];
+                let mut body = vec![0; if get { 0 } else { length.unwrap() }];
                 reader.read_exact(&mut body).await.unwrap();
-                log.lock()
-                    .unwrap()
-                    .push(serde_json::from_slice(&body).unwrap());
+                log.lock().unwrap().push(if get {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body).unwrap()
+                });
 
                 let has_tool = deltas.iter().any(|delta| delta.get("tool_calls").is_some());
                 let mut body = String::new();
@@ -143,6 +148,7 @@ async fn ask(
 
 #[tokio::test]
 async fn official_client_drives_the_ide_workflow_over_stdio() {
+    let page = ModelFixture::start(vec![text("Local fixture")]).await;
     let mut read = vec![
         json!({"reasoning_content":"Consider the buffer."}),
         json!({"content":"I will check it."}),
@@ -156,6 +162,8 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
         read,
         tool("patch-id", "apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: input.txt\n@@\n head\n-unsaved\n+new buffer\n*** End Patch"})),
         tool("bash-id", "exec_command", json!({"command":"printf fixture"})),
+        tool("page-id", "web_fetch", json!({"url":page.url})),
+        tool("metadata-id", "web_fetch", json!({"url":"http://169.254.169.254/"})),
         text("Finished."),
     ]).await;
     let workspace = tempfile::tempdir().unwrap();
@@ -227,7 +235,11 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
                         assert_eq!(fields.locations.unwrap()[0].line, Some(2));
                         assert_eq!(fields.status, Some(ToolCallStatus::Pending));
                         trace.lock().unwrap().push("permission:patch");
+                    } else if req.tool_call.tool_call_id.0.as_ref() == "page-id" {
+                        assert_eq!(fields.status, Some(ToolCallStatus::Pending));
+                        trace.lock().unwrap().push("permission:web_fetch");
                     } else {
+                        assert_eq!(req.tool_call.tool_call_id.0.as_ref(), "bash-id");
                         trace.lock().unwrap().push("permission:shell");
                     }
                     reply.respond(approved())
@@ -399,7 +411,7 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
                 );
                 let response = cx.send_request(prompt).block_task().await?;
                 assert_eq!(response.stop_reason, StopReason::EndTurn);
-                assert_eq!(response.usage.unwrap().total_tokens, 200);
+                assert_eq!(response.usage.unwrap().total_tokens, 300);
                 Ok(())
             },
         )
@@ -415,7 +427,8 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
             "create",
             "wait",
             "output",
-            "release"
+            "release",
+            "permission:web_fetch"
         ]
     );
     assert_eq!(
@@ -468,6 +481,13 @@ async fn official_client_drives_the_ide_workflow_over_stdio() {
     assert!(first_req.contains("context text"));
     assert!(requests[1].to_string().contains("unsaved"));
     assert!(requests[3].to_string().contains("terminal output"));
+    assert!(requests[4].to_string().contains("Local fixture"));
+    assert!(
+        requests[5]
+            .to_string()
+            .contains("This address is not public")
+    );
+    assert_eq!(page.finish().await, [Value::Null]);
 }
 
 #[tokio::test]

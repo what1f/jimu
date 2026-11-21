@@ -8,11 +8,11 @@ use pikra_schema::{
     bool_schema, int_schema, obj_schema, str_schema, with_bounds, with_description,
 };
 use serde_json::{Value, json};
+use url::Origin;
 
-use super::http::{Download, PAGE_ACCEPT, ResponseHead};
-use super::policy::{WebFetchConfig, parse_url};
-use super::web2md::Routed;
-use super::web2md::Web2Md;
+use super::http::{Download, PAGE_ACCEPT, ResponseHead, TIMEOUT};
+use super::policy::{WebFetchConfig, parse_url, resolve_destination};
+use super::web2md::{Routed, Web2Md, Web2MdError};
 use crate::truncate_output;
 
 /// Fetch public URLs and return readable Markdown, text, or an image.
@@ -29,6 +29,35 @@ impl WebFetchTool {
 
     pub fn with_web2md(web2md: Web2Md) -> Self {
         Self { web2md }
+    }
+
+    /// Return the origin that needs private access, if any. Invalid and link-local
+    /// destinations return errors. The fetch checks the destination again before connecting.
+    pub async fn private_origin(
+        &self,
+        input: &str,
+        cancel: &CancelToken,
+    ) -> Result<Option<Origin>, Web2MdError> {
+        let url = parse_url(input)?;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(Web2MdError::Cancelled),
+            result = tokio::time::timeout(
+                TIMEOUT,
+                resolve_destination(&url, &self.web2md.fetcher.config, true),
+            ) => {
+                let (private, _) = result.map_err(|_| Web2MdError::Timeout)??;
+                Ok(private.then(|| url.origin()))
+            }
+        }
+    }
+
+    /// Permit private access only to this origin. Other origins use the public policy,
+    /// including redirect targets and requests made by page parsers.
+    pub fn with_private_origin(mut self, origin: Origin) -> Self {
+        self.web2md.fetcher.config.allow_private_hosts = true;
+        self.web2md.fetcher.private_origin = Some(origin);
+        self
     }
 }
 

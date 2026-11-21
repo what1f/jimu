@@ -16,8 +16,8 @@ use std::time::Duration;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
-const MANUAL_REDIRECT_HEADER: &str = "x-pikra-no-redirect";
-const RESOLVE_ADDRS_HEADER: &str = "x-pikra-resolve-addrs";
+const MANUAL_REDIRECT_HEADER: &str = "x-no-redirect";
+const RESOLVE_ADDRS_HEADER: &str = "x-resolve-addrs";
 
 fn has_proxy_env() -> bool {
     [
@@ -102,7 +102,7 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     /// Use native and public WebPKI roots, system proxies, and same-origin redirects.
-    /// Requests carrying `x-pikra-no-redirect` receive the redirect response directly.
+    /// Requests carrying `x-no-redirect` receive the redirect response directly.
     pub fn new() -> Result<Self, reqwest::Error> {
         let policy = || {
             reqwest::redirect::Policy::custom(|attempt| {

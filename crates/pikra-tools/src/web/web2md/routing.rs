@@ -140,12 +140,16 @@ pub(crate) enum Routed {
 
 impl Web2Md {
     /// The transport must return redirect responses for requests bearing
-    /// `x-pikra-no-redirect`, so each destination can be checked before it is contacted.
+    /// `x-no-redirect`, so each destination can be checked before it is contacted.
     /// Hosts should use the same address policy when connecting or route requests through
     /// a trusted proxy that enforces it. A preflight DNS lookup does not pin the connection.
     pub fn new(transport: Arc<dyn HttpTransport>, config: WebFetchConfig) -> Self {
         Self {
-            fetcher: Fetcher { transport, config },
+            fetcher: Fetcher {
+                transport,
+                config,
+                private_origin: None,
+            },
             rules: vec![parsers::x::rule()],
         }
     }

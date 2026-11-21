@@ -50,12 +50,19 @@ impl HttpTransport for Replay {
                 request
                     .headers
                     .iter()
-                    .any(|(name, _)| name == "x-pikra-no-redirect")
+                    .any(|(name, _)| name == "x-no-redirect")
             );
             assert!(request.headers.iter().all(|(name, _)| !matches!(
                 name.as_str(),
                 "authorization" | "cookie" | "x-api-key"
             )));
+            if request.url.starts_with("https://api.fxtwitter.com/") {
+                let reader = (
+                    "user-agent".into(),
+                    "Mozilla/5.0 (compatible; Web2MD/1.0)".into(),
+                );
+                assert!(request.headers.contains(&reader));
+            }
             let url = request.url;
             self.requests.lock().unwrap().push(url.clone());
             let response = match self.responses.get(&url) {
@@ -323,6 +330,7 @@ async fn returns_text_and_images_with_limits_and_blocks_private_redirects() {
     let image = "https://public.example/image";
     let large = "https://public.example/large";
     let redirect = "https://public.example/private-redirect";
+    let local_redirect = "https://public.example/local-redirect";
     let loop_url = "https://public.example/loop";
     let private = "http://169.254.169.254/metadata";
     let replay = Arc::new(Replay::new([
@@ -334,6 +342,10 @@ async fn returns_text_and_images_with_limits_and_blocks_private_redirects() {
         (image, Reply::Body("image/png", "abc".into())),
         (large, Reply::Oversize),
         (redirect, Reply::Redirect(307, private)),
+        (
+            local_redirect,
+            Reply::Redirect(302, "http://127.0.0.1:8080/"),
+        ),
         (loop_url, Reply::Redirect(308, "/loop")),
     ]));
     let tool = WebFetchTool::new(
@@ -381,9 +393,11 @@ async fn returns_text_and_images_with_limits_and_blocks_private_redirects() {
         "http://[::1]/",
         "http://[fd00::1]/",
         "http://[fe80::1]/",
+        "http://[3fff::1]/",
         "http://[::ffff:127.0.0.1]/",
         "https://private.example/",
         redirect,
+        local_redirect,
     ] {
         assert_eq!(
             fetch(&tool, json!({"url":url})).await.unwrap_err(),
@@ -406,6 +420,14 @@ async fn returns_text_and_images_with_limits_and_blocks_private_redirects() {
         fetch(&tool, json!({"url":loop_url})).await.unwrap_err(),
         "The website redirected too many times"
     );
+    for (url, scope) in [(local_redirect, redirect), (private, private)] {
+        let origin = url::Url::parse(scope).unwrap().origin();
+        let scoped_tool = tool.clone().with_private_origin(origin);
+        assert_eq!(
+            fetch(&scoped_tool, json!({"url":url})).await.unwrap_err(),
+            "This address is not public"
+        );
+    }
     let requests = replay.requests.lock().unwrap();
     assert_eq!(
         &requests[..5],
@@ -417,7 +439,9 @@ async fn returns_text_and_images_with_limits_and_blocks_private_redirects() {
             redirect
         ]
     );
-    assert_eq!(&requests[5..], [loop_url; 6]);
+    assert_eq!(requests[5], local_redirect);
+    assert_eq!(&requests[6..12], [loop_url; 6]);
+    assert_eq!(&requests[12..], [local_redirect]);
 }
 
 // Article/status bodies from web2md-swift Tools/fixtures/x-article-formats.json (MIT).
@@ -579,7 +603,8 @@ Ends with inline `code`"###
 
 #[tokio::test]
 async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
-    use std::net::{IpAddr, Ipv4Addr};
+    const FINAL_URL: &str = "https://docs.github.com/final";
+    const LOCAL_URL: &str = "http://macbook-pro.local:3000/";
 
     struct HeaderCapture {
         headers: Mutex<Vec<Vec<(String, String)>>>,
@@ -615,16 +640,16 @@ async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
         }
     }
 
-    // 1. Domain requests carry `x-pikra-resolve-addrs`; IP literals do not; redirects route on final URL.
+    // 1. Domain requests carry `x-resolve-addrs`; IP literals do not; redirects route on final URL.
     let capture = Arc::new(HeaderCapture {
         headers: Mutex::default(),
         responses: HashMap::from([
             (
                 "https://short.example/go".into(),
-                Reply::Redirect(302, "https://docs.example/final"),
+                Reply::Redirect(302, FINAL_URL),
             ),
             (
-                "https://docs.example/final".into(),
+                FINAL_URL.into(),
                 Reply::Body(
                     "text/html",
                     "<html><body><article><p>Fallback</p></article></body></html>".into(),
@@ -634,11 +659,20 @@ async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
                 "https://93.184.216.34/ip".into(),
                 Reply::Body("text/plain", "ip-ok".into()),
             ),
+            (
+                LOCAL_URL.into(),
+                Reply::Body("text/plain", "local-ok".into()),
+            ),
         ]),
     });
     let config = WebFetchConfig {
-        host_resolver: Some(Arc::new(|_| {
-            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+        host_resolver: Some(Arc::new(|host| {
+            let ips: &[&str] = if host == "macbook-pro.local" {
+                &["fe80::1", "::1", "127.0.0.1", "192.168.1.5"]
+            } else {
+                &["198.18.0.18", "::ffff:198.19.0.18"]
+            };
+            Ok(ips.iter().map(|ip| ip.parse().unwrap()).collect())
         })),
         ..WebFetchConfig::default()
     };
@@ -664,7 +698,7 @@ async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
 
     let mut engine = Web2Md::new(capture.clone(), config.clone());
     engine.register(ParserRule::for_url(
-        |url| url.as_str() == "https://docs.example/final",
+        |url| url.as_str() == FINAL_URL,
         RedirectRuleParser,
     ));
     let redirected = engine
@@ -672,35 +706,60 @@ async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
         .await
         .unwrap();
     assert_eq!(redirected.parser, "redirect-final");
-    assert!(redirected.markdown.contains("https://docs.example/final"));
+    assert!(redirected.markdown.contains(FINAL_URL));
 
     let ip_tool = WebFetchTool::new(capture.clone(), config);
-    let _ = ip_tool
-        .execute(
-            "ip-call".into(),
-            json!({"url": "https://93.184.216.34/ip"}),
-            CancelToken::new(),
-            Arc::new(|_| {}),
-        )
+    fetch(&ip_tool, json!({"url": "https://93.184.216.34/ip"}))
         .await
         .unwrap();
 
+    for url in ["http://198.18.0.18/", "http://[::ffff:198.19.0.18]/"] {
+        assert_eq!(
+            fetch(&ip_tool, json!({"url":url})).await.unwrap_err(),
+            "This address is not public"
+        );
+    }
+
+    let origin = ip_tool
+        .private_origin(LOCAL_URL, &CancelToken::new())
+        .await
+        .unwrap()
+        .unwrap();
+    fetch(
+        &ip_tool.with_private_origin(origin),
+        json!({"url":LOCAL_URL}),
+    )
+    .await
+    .unwrap();
+
     {
         let recorded = capture.headers.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        let names_and_values = format!("{recorded:?}").to_ascii_lowercase();
+        assert!(!names_and_values.contains("pikra"));
+        let browser = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+        let reader = "Mozilla/5.0 (compatible; Web2MD/1.0)";
+        for (headers, ua) in recorded.iter().zip([browser, reader, browser]) {
+            assert!(headers.contains(&("user-agent".into(), ua.into())));
+        }
+        let pinned = (
+            "x-resolve-addrs".into(),
+            "198.18.0.18:443,[::ffff:198.19.0.18]:443".into(),
+        );
         assert!(
-            recorded[0]
-                .iter()
-                .any(|(k, v)| k == "x-pikra-resolve-addrs" && v == "93.184.216.34:443"),
+            recorded[0].contains(&pinned),
             "domain fetch must pin resolved SocketAddr: {:?}",
             recorded[0]
         );
         assert!(
-            !recorded[2]
-                .iter()
-                .any(|(k, _)| k == "x-pikra-resolve-addrs"),
-            "IP literal fetch must not send x-pikra-resolve-addrs: {:?}",
+            !recorded[2].iter().any(|(k, _)| k == "x-resolve-addrs"),
+            "IP literal fetch must not send x-resolve-addrs: {:?}",
             recorded[2]
         );
+        assert!(recorded[3].contains(&(
+            "x-resolve-addrs".into(),
+            "[::1]:3000,127.0.0.1:3000,192.168.1.5:3000".into(),
+        )));
     }
 
     // 2. Offline convert_html never calls XParser over network, handles self-referential footnote,

@@ -95,6 +95,7 @@ for try await event in stream {
 - **打包自动瘦身**：Xcode Release 编译默认开启 `-dead_strip`，你的代码里没引用的重型工具（如内嵌 `ripgrep` 的 `grep` 或内嵌 Defuddle HTML 解析器的 `webFetch`）会在最终打 `.app` 包时被链接器整块剔除。
 - **平台边界**：`read`、`write`、`edit`、`applyPatch`、`find`、`grep`、`sleep`、`webFetch` 在 **macOS 与 iOS 全可用**；涉及子进程的 `execCommandOneShot` / `execCommand` / `writeStdin` / `monitor` 仅在 **macOS** 可用（iOS 编译期自动隔离）。
 - **定制描述与 Schema**：每个内置工具均支持传入覆盖配置（改工具名、替换/追加描述文案、隐藏特定可选参数并固定默认值）。
+- **网页访问**：`webFetch` 默认访问公网地址，支持符合公网域名规则的名称解析到 `198.18.0.0/15` TUN Fake-IP。工具逐跳检查重定向并拦截本地和链路本地地址。`URLSession` 使用系统解析与代理配置。
 
 ### 3.2 用 Swift 闭包注册宿主专属工具
 涉及 macOS / iOS 系统原生 API（如读取日历、控制窗口、剪贴板）的工具，直接用 `PikraTool` 编写，可自由选择设为常驻（`deferred: false`）或延迟加载（`deferred: true`）：

@@ -105,6 +105,7 @@ require("codecompanion").setup({
 | **编辑器未保存缓冲区与内联 Diff** | 当客户端声明 `fs.readTextFile` / `fs.writeTextFile` 时，`read` 直接读取编辑器当前未保存内容，`write` / `edit` / `apply_patch` 在审批前与完成后均输出标准 `Diff` 与行号定位 `ToolCallLocation`，在 IDE 内直接渲染双栏或行内对比 |
 | **IDE 内嵌实时终端** | 当客户端声明 `terminal` 能力时，终端命令自动通过 `terminal/create` 在编辑器面板内嵌实时输出流，并在取消或超时时自动 `terminal/kill` + `terminal/release`；无此能力的客户端自动无缝回退至 Pikra 本地终端引擎 |
 | **四档权限模式与交互审批** | 内置 `default`（读写与命令走 `session/request_permission` 弹窗，支持单次允许 / 本会话始终允许 / 拒绝）、`acceptEdits`（工作区内改文件自动放行，跑命令弹窗确认）、`plan`（只读探索出方案，拦截写操作）与 `bypassPermissions`（全自动放行） |
+| **网页访问** | 公网地址直接访问，含解析到 TUN Fake-IP 的公网域名。本地地址通过 `session/request_permission` 审批，记住的许可按协议、主机和端口生效。`bypassPermissions` 直接许可本地来源。公网链接重定向到本地地址、跳转到其他本地来源、以及任何链路本地地址都会被拦截。本地主机名可使用剔除 IPv6 链路本地地址后剩余的地址 |
 | **会话全生命周期持久化** | 完整实现 `session/new`、`session/load`（严格按序回放历史消息、思考、工具卡片与压缩记录）、`session/resume`（免回放秒连）、`session/list`（按工作目录筛选与游标分页）、`session/fork`、`session/delete`、`session/archive`、`session/set_title`（首轮自动生成会话标题） |
 | **流中插话（`_session/steering`）与随时取消** | 兼容 `codex-acp` / `claude-agent-acp` 的 `_session/steering` 扩展（运行中实时注入指令，空闲时支持 `promptRequired`，携带 `"isMeta": true` 时作为仅模型可见的隐藏提醒注入且不在 `session/load` 回放用户气泡）；收到 `session/cancel` 立即中断流式生成、在途终端与审批等待并返回 `cancelled` |
 | **动态面板配置、MCP 与斜杠命令** | 原生暴露模型、思考档位、`fast` 模式与权限模式选择器；自动挂载客户端传入的 `mcpServers`（`stdio` + `http`）；自动将 `/compact`、`/plan`、`/reload-skills` 及项目 `.agents/skills` / `.pikra/skills` 注册为编辑器 `/` 快捷命令 |
