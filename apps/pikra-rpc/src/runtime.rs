@@ -35,8 +35,93 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const SKILLS_CONTEXT_NAME: &str = "skills";
+const RPC_MODEL_CUSTOM_TYPE: &str = "pikra.rpc.model";
 const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedRpcModel {
+    provider: String,
+    model_id: String,
+    api: ApiKind,
+    base_url: String,
+    context_window: u32,
+    max_output_tokens: u32,
+    supports_images: bool,
+    supports_reasoning: bool,
+}
+
+impl From<&Model> for PersistedRpcModel {
+    fn from(model: &Model) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+            api: model.api.clone(),
+            base_url: model.base_url.clone(),
+            context_window: model.context_window,
+            max_output_tokens: model.max_output_tokens,
+            supports_images: model.supports_images,
+            supports_reasoning: model.supports_reasoning,
+        }
+    }
+}
+
+impl From<PersistedRpcModel> for Model {
+    fn from(pm: PersistedRpcModel) -> Self {
+        Self {
+            name: pm.model_id.clone(),
+            id: pm.model_id,
+            provider: pm.provider,
+            api: pm.api,
+            base_url: pm.base_url,
+            context_window: pm.context_window,
+            max_output_tokens: pm.max_output_tokens,
+            supports_images: pm.supports_images,
+            supports_reasoning: pm.supports_reasoning,
+            cost: ModelCost::default(),
+            headers: Vec::new(),
+            compat: None,
+        }
+    }
+}
+
+fn restore_persisted_model(session: &SessionManager, known_models: &[Model]) -> Option<Model> {
+    enum LatestModel {
+        Ref(String, String),
+        Full(PersistedRpcModel),
+    }
+
+    let mut latest: Option<LatestModel> = None;
+    for entry in session.active_branch() {
+        match entry.payload {
+            SessionEntryPayload::ModelChange { provider, model_id } => {
+                latest = Some(LatestModel::Ref(provider, model_id));
+            }
+            SessionEntryPayload::Custom { custom_type, data }
+                if custom_type == RPC_MODEL_CUSTOM_TYPE =>
+            {
+                if let Ok(pm) = serde_json::from_value::<PersistedRpcModel>(data) {
+                    latest = Some(LatestModel::Full(pm));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match latest {
+        Some(LatestModel::Full(pm)) => Some(pm.into()),
+        Some(LatestModel::Ref(provider, model_id)) => known_models
+            .iter()
+            .find(|m| m.provider == provider && m.id == model_id)
+            .cloned()
+            .or_else(|| {
+                Some(build_model(
+                    &provider, &model_id, None, None, None, None, None, None,
+                ))
+            }),
+        None => None,
+    }
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -50,7 +135,7 @@ fn default_provider_spec(provider: &str) -> (ApiKind, &'static str, &'static str
         "anthropic" => (
             ApiKind::AnthropicMessages,
             "https://api.anthropic.com",
-            "claude-sonnet-4-20250514",
+            "claude-sonnet-5-5",
         ),
         "google" | "gemini" => (
             ApiKind::GoogleGenerativeAi,
@@ -60,7 +145,7 @@ fn default_provider_spec(provider: &str) -> (ApiKind, &'static str, &'static str
         "deepseek" => (
             ApiKind::OpenaiCompletions,
             "https://api.deepseek.com/v1",
-            "deepseek-chat",
+            "deepseek-flash",
         ),
         "openrouter" => (
             ApiKind::OpenaiCompletions,
@@ -161,6 +246,12 @@ struct ActiveRunTask {
     handle: JoinHandle<()>,
 }
 
+struct ActiveCompactionTask {
+    running: Arc<AtomicBool>,
+    cancel: CancelToken,
+    handle: JoinHandle<()>,
+}
+
 struct SessionRuntimeState {
     session: Arc<Mutex<SessionManager>>,
     agent: Arc<Agent>,
@@ -183,6 +274,7 @@ pub struct RpcRuntime {
     queued_steering: Arc<Mutex<VecDeque<(String, String)>>>,
     queued_follow_up: Arc<Mutex<VecDeque<(String, String)>>>,
     active_run: AsyncMutex<Option<ActiveRunTask>>,
+    active_compaction: AsyncMutex<Option<ActiveCompactionTask>>,
     is_compacting: Arc<AtomicBool>,
     compaction_cancel: Arc<Mutex<Option<CancelToken>>>,
     writer: JsonlWriter,
@@ -245,22 +337,22 @@ impl RpcRuntime {
             Some(rt)
         };
 
-        let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
         if args.enable_codemode
             && !resident
                 .iter()
                 .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
         {
+            // Snapshot resident tools BEFORE pushing `exec` so `CodemodeExecTool` never holds
+            // a strong Arc cycle back to itself.
+            let codemode_resident_handle = Arc::new(Mutex::new(resident.clone()));
             let exec_tool: Arc<dyn AgentTool> = Arc::new(CodemodeExecTool::new(
-                Arc::clone(&resident_tools_handle),
+                codemode_resident_handle,
                 Arc::clone(&deferred_registry),
                 CodemodeSandboxOptions::default(),
             ));
             resident.push(exec_tool);
-            *resident_tools_handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = resident.clone();
         }
+        let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
 
         let mut compaction = CompactionConfig::default();
         if let Some(reserve) = args.compact_tokens {
@@ -280,6 +372,7 @@ impl RpcRuntime {
             (Arc::new(MemorySessionStore::new()), None)
         };
 
+        let explicit_model_override = args.provider.is_some() || args.model.is_some();
         let (session_manager, agent) = build_session_and_agent(
             Arc::clone(&provider),
             api_key_resolver.clone(),
@@ -290,18 +383,24 @@ impl RpcRuntime {
             js_runtime.as_ref(),
             &args.skill_dirs,
             compaction.clone(),
-            initial_model.clone(),
+            initial_model,
+            !explicit_model_override,
+            &[],
+            args.api.clone(),
+            args.base_url.clone(),
+            args.context_window,
             args.thinking,
             args.fast,
             QueueMode::OneAtATime,
             QueueMode::OneAtATime,
             None,
         )?;
+        let effective_model = agent.model();
 
         Ok(Self {
             provider,
             api_key_resolver,
-            models: Mutex::new(vec![initial_model]),
+            models: Mutex::new(vec![effective_model]),
             cwd: args.cwd.clone(),
             base_system_prompt,
             resident_tools: resident_tools_handle,
@@ -318,6 +417,7 @@ impl RpcRuntime {
             queued_steering: Arc::new(Mutex::new(VecDeque::new())),
             queued_follow_up: Arc::new(Mutex::new(VecDeque::new())),
             active_run: AsyncMutex::new(None),
+            active_compaction: AsyncMutex::new(None),
             is_compacting: Arc::new(AtomicBool::new(false)),
             compaction_cancel: Arc::new(Mutex::new(None)),
             writer,
@@ -341,10 +441,21 @@ impl RpcRuntime {
         }
     }
 
+    async fn reap_finished_compaction_locked(&self, guard: &mut Option<ActiveCompactionTask>) {
+        if let Some(task) = guard.as_ref()
+            && !task.running.load(Ordering::Acquire)
+            && let Some(finished) = guard.take()
+        {
+            let _ = finished.handle.await;
+        }
+    }
+
     async fn is_busy(&self) -> bool {
-        let mut guard = self.active_run.lock().await;
-        self.reap_finished_run_locked(&mut guard).await;
-        guard.is_some() || self.is_compacting.load(Ordering::Acquire)
+        let mut run_guard = self.active_run.lock().await;
+        self.reap_finished_run_locked(&mut run_guard).await;
+        let mut comp_guard = self.active_compaction.lock().await;
+        self.reap_finished_compaction_locked(&mut comp_guard).await;
+        run_guard.is_some() || comp_guard.is_some() || self.is_compacting.load(Ordering::Acquire)
     }
 
     pub async fn handle_command(&self, id: Option<String>, cmd: RpcCommand) {
@@ -420,12 +531,17 @@ impl RpcRuntime {
                 ));
             }
             RpcCommand::GetState => {
-                let is_streaming = {
-                    let mut guard = self.active_run.lock().await;
-                    self.reap_finished_run_locked(&mut guard).await;
-                    guard.is_some()
+                let (is_streaming, is_compacting) = {
+                    let mut run_guard = self.active_run.lock().await;
+                    self.reap_finished_run_locked(&mut run_guard).await;
+                    let mut comp_guard = self.active_compaction.lock().await;
+                    self.reap_finished_compaction_locked(&mut comp_guard).await;
+                    (
+                        run_guard.is_some(),
+                        comp_guard.is_some() || self.is_compacting.load(Ordering::Acquire),
+                    )
                 };
-                let data = self.snapshot_state(is_streaming);
+                let data = self.snapshot_state(is_streaming, is_compacting);
                 self.writer.send_json(&RpcResponse::ok(
                     id,
                     command_name,
@@ -539,16 +655,7 @@ impl RpcRuntime {
             RpcCommand::Compact {
                 custom_instructions,
             } => {
-                if self.is_busy().await {
-                    self.writer.send_json(&RpcResponse::error(
-                        id,
-                        command_name,
-                        "Cannot compact while session is busy",
-                    ));
-                    return;
-                }
-                let res = self.handle_manual_compact(custom_instructions).await;
-                self.send_result(id, command_name, res);
+                self.handle_manual_compact(id, custom_instructions).await;
             }
             RpcCommand::SetAutoCompaction { enabled } => {
                 {
@@ -748,13 +855,17 @@ impl RpcRuntime {
             return;
         }
 
-        if self.is_compacting.load(Ordering::Acquire) {
-            self.writer.send_json(&RpcResponse::error(
-                id,
-                "prompt",
-                "Session is currently compacting",
-            ));
-            return;
+        {
+            let mut comp_guard = self.active_compaction.lock().await;
+            self.reap_finished_compaction_locked(&mut comp_guard).await;
+            if comp_guard.is_some() || self.is_compacting.load(Ordering::Acquire) {
+                self.writer.send_json(&RpcResponse::error(
+                    id,
+                    "prompt",
+                    "Session is currently compacting",
+                ));
+                return;
+            }
         }
 
         let content = build_content_parts(message, images);
@@ -836,12 +947,13 @@ impl RpcRuntime {
             }
 
             let mut saw_abort = false;
+            let persistence_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             let mut next_stream = Some((initial_stream, flushed_count));
 
             while let Some((mut stream, skip_ends)) = next_stream.take() {
                 let mut seen_ends = 0usize;
-                while let Some(ev) = stream.next().await {
-                    match &ev {
+                while let Some(mut ev) = stream.next().await {
+                    match &mut ev {
                         AgentEvent::Steered { id: steer_id, .. } => {
                             let mut q = task_steering.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(pos) = q.iter().position(|(qid, _)| qid == steer_id) {
@@ -866,11 +978,43 @@ impl RpcRuntime {
                                 saw_abort = true;
                             }
                             if seen_ends >= skip_ends {
-                                let mut sess =
-                                    task_session.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = sess.append_message(message.clone());
+                                let persist_res = {
+                                    let mut sess =
+                                        task_session.lock().unwrap_or_else(|e| e.into_inner());
+                                    sess.append_message(message.clone())
+                                };
+                                if let Err(err) = persist_res {
+                                    let mut slot =
+                                        persistence_error.lock().unwrap_or_else(|e| e.into_inner());
+                                    if slot.is_none() {
+                                        *slot = Some(format!(
+                                            "failed to persist session message: {err}"
+                                        ));
+                                    }
+                                    drop(slot);
+                                    task_agent.abort_now();
+                                }
+                            }
+                            if let Some(err_msg) = persistence_error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                                && let AgentMessage::Llm(Message::Assistant(a)) = message
+                            {
+                                a.stop_reason = StopReason::Error;
+                                a.error_message = Some(err_msg);
                             }
                             seen_ends += 1;
+                        }
+                        AgentEvent::TurnEnd { message, .. } => {
+                            if let Some(err_msg) = persistence_error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                            {
+                                message.stop_reason = StopReason::Error;
+                                message.error_message = Some(err_msg);
+                            }
                         }
                         AgentEvent::AgentEnd { .. } => {
                             // Unread steering items were discarded by Agent on AgentEnd.
@@ -888,6 +1032,14 @@ impl RpcRuntime {
 
                 drop(stream);
 
+                if persistence_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+                {
+                    break;
+                }
+
                 if task_aborted.load(Ordering::Acquire) {
                     saw_abort = true;
                     break;
@@ -902,6 +1054,7 @@ impl RpcRuntime {
                     &task_deferred,
                     &task_compacting,
                     &task_compaction_cancel,
+                    CancelToken::new(),
                     &task_writer,
                     true,
                     None,
@@ -931,9 +1084,17 @@ impl RpcRuntime {
                 }
             }
 
-            let final_aborted = saw_abort || task_aborted.load(Ordering::Acquire);
+            let persist_err = persistence_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let final_aborted = if persist_err.is_some() {
+                task_aborted.load(Ordering::Acquire)
+            } else {
+                saw_abort || task_aborted.load(Ordering::Acquire)
+            };
             task_running.store(false, Ordering::Release);
-            task_writer.send_json(&AgentSettledEvent::new(final_aborted));
+            task_writer.send_json(&AgentSettledEvent::with_error(final_aborted, persist_err));
         });
 
         match started_rx.await {
@@ -968,6 +1129,7 @@ impl RpcRuntime {
 
     pub async fn abort_active(&self) {
         let mut active_guard = self.active_run.lock().await;
+        let mut comp_guard = self.active_compaction.lock().await;
         if let Some(cancel) = self
             .compaction_cancel
             .lock()
@@ -975,6 +1137,10 @@ impl RpcRuntime {
             .as_ref()
         {
             cancel.cancel();
+        }
+        if let Some(comp_task) = comp_guard.take() {
+            comp_task.cancel.cancel();
+            let _ = comp_task.handle.await;
         }
         if let Some(task) = active_guard.take() {
             task.aborted.store(true, Ordering::SeqCst);
@@ -989,6 +1155,10 @@ impl RpcRuntime {
         let mut active_guard = self.active_run.lock().await;
         if let Some(task) = active_guard.take() {
             let _ = task.handle.await;
+        }
+        let mut comp_guard = self.active_compaction.lock().await;
+        if let Some(comp_task) = comp_guard.take() {
+            let _ = comp_task.handle.await;
         }
     }
 
@@ -1006,6 +1176,12 @@ impl RpcRuntime {
             && let Some(task) = guard.take()
         {
             task.handle.abort();
+        }
+        if let Ok(mut comp_guard) = self.active_compaction.try_lock()
+            && let Some(comp_task) = comp_guard.take()
+        {
+            comp_task.cancel.cancel();
+            comp_task.handle.abort();
         }
     }
 
@@ -1081,11 +1257,16 @@ impl RpcRuntime {
         agent
             .set_model(resolved.clone())
             .map_err(|e| e.to_string())?;
-        self.current_session()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_model_change(resolved.provider.clone(), resolved.id.clone())
-            .map_err(|e| e.to_string())?;
+        let persisted_model_json =
+            serde_json::to_value(PersistedRpcModel::from(&resolved)).map_err(|e| e.to_string())?;
+        {
+            let session = self.current_session();
+            let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
+            sess.append_model_change(resolved.provider.clone(), resolved.id.clone())
+                .map_err(|e| e.to_string())?;
+            sess.append_custom(RPC_MODEL_CUSTOM_TYPE, persisted_model_json)
+                .map_err(|e| e.to_string())?;
+        }
 
         if let Some(slot) = models
             .iter_mut()
@@ -1099,27 +1280,79 @@ impl RpcRuntime {
         serde_json::to_value(resolved).map_err(|e| e.to_string())
     }
 
-    async fn handle_manual_compact(
-        &self,
-        custom_instructions: Option<String>,
-    ) -> Result<serde_json::Value, String> {
+    async fn handle_manual_compact(&self, id: Option<String>, custom_instructions: Option<String>) {
+        let mut run_guard = self.active_run.lock().await;
+        self.reap_finished_run_locked(&mut run_guard).await;
+        let mut comp_guard = self.active_compaction.lock().await;
+        self.reap_finished_compaction_locked(&mut comp_guard).await;
+
+        if run_guard.is_some() || comp_guard.is_some() || self.is_compacting.load(Ordering::Acquire)
+        {
+            self.writer.send_json(&RpcResponse::error(
+                id,
+                "compact",
+                "Cannot compact while session is busy",
+            ));
+            return;
+        }
+
         let session = self.current_session();
         let agent = self.current_agent();
-        let result = run_compaction_task(
-            &self.provider,
-            &self.api_key_resolver,
-            &session,
-            &agent,
-            &self.deferred_registry,
-            &self.is_compacting,
-            &self.compaction_cancel,
-            &self.writer,
-            false,
-            custom_instructions,
-        )
-        .await?;
-        let dto = CompactionResponseData::from(result);
-        serde_json::to_value(dto).map_err(|e| e.to_string())
+        let cancel = CancelToken::new();
+        let running = Arc::new(AtomicBool::new(true));
+
+        self.is_compacting.store(true, Ordering::Release);
+        *self
+            .compaction_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
+
+        let task_provider = Arc::clone(&self.provider);
+        let task_resolver = self.api_key_resolver.clone();
+        let task_deferred = Arc::clone(&self.deferred_registry);
+        let task_compacting = Arc::clone(&self.is_compacting);
+        let task_compaction_cancel = Arc::clone(&self.compaction_cancel);
+        let task_writer = self.writer.clone();
+        let task_running = Arc::clone(&running);
+        let task_cancel = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            let outcome = run_compaction_task(
+                &task_provider,
+                &task_resolver,
+                &session,
+                &agent,
+                &task_deferred,
+                &task_compacting,
+                &task_compaction_cancel,
+                task_cancel,
+                &task_writer,
+                false,
+                custom_instructions,
+            )
+            .await
+            .and_then(|res| {
+                let dto = CompactionResponseData::from(res);
+                serde_json::to_value(dto).map_err(|e| e.to_string())
+            });
+
+            *task_compaction_cancel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            task_compacting.store(false, Ordering::Release);
+            task_running.store(false, Ordering::Release);
+
+            match outcome {
+                Ok(data) => task_writer.send_json(&RpcResponse::ok(id, "compact", Some(data))),
+                Err(err) => task_writer.send_json(&RpcResponse::error(id, "compact", err)),
+            }
+        });
+
+        *comp_guard = Some(ActiveCompactionTask {
+            running,
+            cancel,
+            handle,
+        });
     }
 
     fn handle_new_session(
@@ -1178,6 +1411,11 @@ impl RpcRuntime {
             &self.skill_roots,
             compaction,
             current_model,
+            false,
+            &[],
+            None,
+            None,
+            None,
             current_thinking,
             current_fast,
             steer_mode,
@@ -1236,6 +1474,12 @@ impl RpcRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        let known_models = self
+            .models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
         let (session_manager, agent) = build_session_and_agent(
             Arc::clone(&self.provider),
             self.api_key_resolver.clone(),
@@ -1247,6 +1491,11 @@ impl RpcRuntime {
             &self.skill_roots,
             compaction,
             current_model,
+            true,
+            &known_models,
+            None,
+            None,
+            None,
             current_thinking,
             current_fast,
             steer_mode,
@@ -1254,18 +1503,16 @@ impl RpcRuntime {
             None,
         )?;
 
-        // If the reopened session recorded a ModelChange, restore that model from catalog if known.
-        let reconstructed = session_manager.reconstruct_context();
-        if let Some((rec_provider, rec_model_id)) = reconstructed.model {
-            let maybe_known = self
-                .models
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .find(|m| m.provider == rec_provider && m.id == rec_model_id)
-                .cloned();
-            if let Some(m) = maybe_known {
-                let _ = agent.set_model(m);
+        let restored_model = agent.model();
+        {
+            let mut models = self.models.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = models
+                .iter_mut()
+                .find(|m| m.provider == restored_model.provider && m.id == restored_model.id)
+            {
+                *slot = restored_model;
+            } else {
+                models.push(restored_model);
             }
         }
 
@@ -1321,7 +1568,7 @@ impl RpcRuntime {
         }))
     }
 
-    fn snapshot_state(&self, is_streaming: bool) -> RpcStateData {
+    fn snapshot_state(&self, is_streaming: bool, is_compacting: bool) -> RpcStateData {
         let (session, agent, session_file) = {
             let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -1364,7 +1611,7 @@ impl RpcRuntime {
             thinking_level: agent.thinking_level(),
             fast: agent.fast(),
             is_streaming,
-            is_compacting: self.is_compacting.load(Ordering::Acquire),
+            is_compacting,
             steering_mode: agent.steering_mode(),
             follow_up_mode: agent.follow_up_mode(),
             session_file: session_file.map(|p| p.display().to_string()),
@@ -1445,19 +1692,61 @@ impl RpcRuntime {
         let mut seen_ends = 0usize;
         let mut printed_any_text = false;
         let mut saw_abort = false;
+        let mut last_stop_reason: Option<StopReason> = None;
+        let mut last_error_message: Option<String> = None;
+        let persistence_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-        while let Some(ev) = stream.next().await {
-            if let AgentEvent::MessageEnd { message } = &ev {
-                if let AgentMessage::Llm(Message::Assistant(a)) = message
-                    && a.stop_reason == StopReason::Aborted
-                {
-                    saw_abort = true;
+        while let Some(mut ev) = stream.next().await {
+            match &mut ev {
+                AgentEvent::MessageEnd { message } => {
+                    if let AgentMessage::Llm(Message::Assistant(a)) = message {
+                        if a.stop_reason == StopReason::Aborted {
+                            saw_abort = true;
+                        }
+                        last_stop_reason = Some(a.stop_reason);
+                        if a.error_message.is_some() {
+                            last_error_message = a.error_message.clone();
+                        }
+                    }
+                    if seen_ends >= flushed_count {
+                        let persist_res = {
+                            let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
+                            sess.append_message(message.clone())
+                        };
+                        if let Err(err) = persist_res {
+                            let mut slot =
+                                persistence_error.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(format!("failed to persist session message: {err}"));
+                            }
+                            drop(slot);
+                            agent.abort_now();
+                        }
+                    }
+                    if let Some(err_msg) = persistence_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        && let AgentMessage::Llm(Message::Assistant(a)) = message
+                    {
+                        a.stop_reason = StopReason::Error;
+                        a.error_message = Some(err_msg);
+                    }
+                    seen_ends += 1;
                 }
-                if seen_ends >= flushed_count {
-                    let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = sess.append_message(message.clone());
+                AgentEvent::TurnEnd { message, .. } => {
+                    if let Some(err_msg) = persistence_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        message.stop_reason = StopReason::Error;
+                        message.error_message = Some(err_msg);
+                    }
+                    last_stop_reason = Some(message.stop_reason);
+                    last_error_message = message.error_message.clone();
                 }
-                seen_ends += 1;
+                _ => {}
             }
 
             match mode {
@@ -1489,13 +1778,36 @@ impl RpcRuntime {
 
         drop(stream);
 
+        let persist_err = persistence_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
         if mode == CliMode::Text && printed_any_text {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             let _ = stdout.write_all(b"\n");
             let _ = stdout.flush();
         } else if mode == CliMode::Json {
-            self.writer.send_json(&AgentSettledEvent::new(saw_abort));
+            let settled_aborted = if persist_err.is_some() {
+                false
+            } else {
+                saw_abort
+            };
+            self.writer.send_json(&AgentSettledEvent::with_error(
+                settled_aborted,
+                persist_err.clone(),
+            ));
+        }
+
+        if let Some(err_msg) = persist_err {
+            return Err(err_msg);
+        }
+        if last_stop_reason == Some(StopReason::Error) {
+            return Err(last_error_message.unwrap_or_else(|| "Model request failed".to_string()));
+        }
+        if saw_abort || last_stop_reason == Some(StopReason::Aborted) {
+            return Err(last_error_message.unwrap_or_else(|| "Operation aborted".to_string()));
         }
 
         Ok(())
@@ -1513,7 +1825,12 @@ fn build_session_and_agent(
     js_runtime: Option<&Arc<JsExtensionRuntime>>,
     skill_roots: &[PathBuf],
     compaction: CompactionConfig,
-    model: Model,
+    fallback_model: Model,
+    should_restore_model: bool,
+    known_models: &[Model],
+    cli_api_override: Option<ApiKind>,
+    cli_base_url_override: Option<String>,
+    cli_context_window_override: Option<u32>,
     thinking_level: ThinkingLevel,
     fast: bool,
     steering_mode: QueueMode,
@@ -1532,6 +1849,26 @@ fn build_session_and_agent(
     let reconstructed = session_manager.reconstruct_context();
     let session_id = session_manager.session_id().to_string();
 
+    let effective_model = if should_restore_model {
+        match restore_persisted_model(&session_manager, known_models) {
+            Some(mut restored) => {
+                if let Some(api) = cli_api_override {
+                    restored.api = api;
+                }
+                if let Some(url) = cli_base_url_override {
+                    restored.base_url = url;
+                }
+                if let Some(cw) = cli_context_window_override {
+                    restored.context_window = cw;
+                }
+                restored
+            }
+            None => fallback_model,
+        }
+    } else {
+        fallback_model
+    };
+
     let effective_thinking = reconstructed
         .thinking
         .map(|(lvl, _)| lvl)
@@ -1548,7 +1885,7 @@ fn build_session_and_agent(
         middlewares.push(Arc::clone(rt) as Arc<dyn AgentMiddleware>);
     }
 
-    let mut agent_cfg = AgentConfig::new(model)
+    let mut agent_cfg = AgentConfig::new(effective_model)
         .with_system_prompt(reconstructed.system_prompt)
         .with_tools(resident_tools.to_vec())
         .with_thinking_level(effective_thinking)
@@ -1583,13 +1920,25 @@ async fn run_compaction_task(
     deferred_registry: &Arc<DeferredToolRegistry>,
     is_compacting: &Arc<AtomicBool>,
     compaction_cancel: &Arc<Mutex<Option<CancelToken>>>,
+    cancel: CancelToken,
     writer: &JsonlWriter,
     auto_only: bool,
     custom_instructions: Option<String>,
 ) -> Result<Option<CompactionResult>, String> {
+    if cancel.is_cancelled() {
+        *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        is_compacting.store(false, Ordering::Release);
+        return Err("Compaction aborted".to_string());
+    }
+
     let model = agent.model();
-    let cancel = CancelToken::new();
     let api_key = api_key_resolver(&model.provider).await;
+    if cancel.is_cancelled() {
+        *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        is_compacting.store(false, Ordering::Release);
+        return Err("Compaction aborted".to_string());
+    }
+
     let session_id = session
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1612,9 +1961,13 @@ async fn run_compaction_task(
     let mut prepared = {
         let sess = session.lock().unwrap_or_else(|e| e.into_inner());
         if auto_only && !sess.needs_compaction(&model) {
+            *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            is_compacting.store(false, Ordering::Release);
             return Ok(None);
         }
         let Some(prep) = sess.prepare_compaction(&model, options) else {
+            *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            is_compacting.store(false, Ordering::Release);
             return Ok(None);
         };
         sess.notify_compaction_start(prep.input.tokens_before);
@@ -1626,8 +1979,9 @@ async fn run_compaction_task(
     }
 
     let tokens_before = prepared.input.tokens_before;
+    let expected_leaf = prepared.expected_leaf_id.clone();
     is_compacting.store(true, Ordering::Release);
-    *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
+    *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
 
     writer.send_json(&SessionEvent::CompactionStart { tokens_before });
 
@@ -1636,15 +1990,23 @@ async fn run_compaction_task(
     *compaction_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
     is_compacting.store(false, Ordering::Release);
 
+    if cancel.is_cancelled() {
+        return Err("Compaction aborted".to_string());
+    }
+
     let output = exec_result.map_err(|e| e.to_string())?;
 
-    let (result, reconstructed) = {
+    let (maybe_result, reconstructed) = {
         let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
         let res = sess
-            .commit_compaction(output, tokens_before)
+            .commit_compaction_if_leaf_matches(output, tokens_before, expected_leaf.as_deref())
             .map_err(|e| e.to_string())?;
         let recon = sess.reconstruct_context();
         (res, recon)
+    };
+
+    let Some(result) = maybe_result else {
+        return Ok(None);
     };
 
     deferred_registry.clear_seen_schemas();

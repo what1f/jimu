@@ -270,9 +270,11 @@ public actor PikraAgent {
     /// Adds or replaces deferred tools while idle without mutating the resident `tools` array.
     public func upsertTools(_ tools: [PikraTool]) throws {
         let session = try requireSession()
+        if let collision = bridge.residentCollision(in: tools.map(\.name)) {
+            throw PikraError.invalidArgument("Cannot upsert tool '\(collision)': collides with a resident tool")
+        }
         let wireSpecs = tools.map { WireToolSpec(tool: $0, forceDeferred: true) }
         let json = try encodeJSONString(wireSpecs)
-        bridge.upsertTools(tools)
         var errorPtr: UnsafeMutablePointer<CChar>?
         let status = json.withCString { cstr in
             pikra_session_upsert_tools(session, cstr, &errorPtr)
@@ -280,13 +282,15 @@ public actor PikraAgent {
         if status != PIKRA_OK {
             throw mapStatusError(status, message: takeOwnedCString(errorPtr))
         }
+        bridge.upsertTools(tools)
     }
 
     /// Removes deferred tools by name while idle.
     @discardableResult
     public func removeTools(named names: [String]) throws -> Int {
         let session = try requireSession()
-        let json = try encodeJSONString(names)
+        let removableNames = names.filter { !bridge.isResidentTool($0) }
+        let json = try encodeJSONString(removableNames)
         var removed: Int = 0
         var errorPtr: UnsafeMutablePointer<CChar>?
         let status = json.withCString { cstr in
@@ -295,7 +299,7 @@ public actor PikraAgent {
         if status != PIKRA_OK {
             throw mapStatusError(status, message: takeOwnedCString(errorPtr))
         }
-        bridge.removeTools(named: names)
+        bridge.removeTools(named: removableNames)
         return removed
     }
 

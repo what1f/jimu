@@ -363,9 +363,11 @@ final class PikraSessionBridge: @unchecked Sendable {
     private let beforeRequest: (@Sendable (Data) async throws -> Void)?
 
     private let lock = NSLock()
+    private let residentToolNames: Set<String>
     private var toolsByName: [String: PikraTool]
     private var httpTasks: [UInt64: Task<Void, Never>] = [:]
     private var toolTasks: [UInt64: Task<Void, Never>] = [:]
+    private var cancelledToolHandles: Set<UInt64> = []
 
     init(
         httpClient: any PikraHTTPClient,
@@ -377,15 +379,28 @@ final class PikraSessionBridge: @unchecked Sendable {
         self.authorizeRequest = authorizeRequest
         self.beforeRequest = beforeRequest
         var map: [String: PikraTool] = [:]
+        var resident: Set<String> = []
         for tool in initialTools {
             map[tool.name] = tool
+            if !tool.deferred {
+                resident.insert(tool.name)
+            }
         }
         self.toolsByName = map
+        self.residentToolNames = resident
+    }
+
+    func residentCollision(in names: [String]) -> String? {
+        names.first { residentToolNames.contains($0) }
+    }
+
+    func isResidentTool(_ name: String) -> Bool {
+        residentToolNames.contains(name)
     }
 
     func upsertTools(_ tools: [PikraTool]) {
         lock.withLock {
-            for tool in tools {
+            for tool in tools where !residentToolNames.contains(tool.name) {
                 toolsByName[tool.name] = tool
             }
         }
@@ -393,7 +408,7 @@ final class PikraSessionBridge: @unchecked Sendable {
 
     func removeTools(named names: [String]) {
         lock.withLock {
-            for name in names {
+            for name in names where !residentToolNames.contains(name) {
                 toolsByName.removeValue(forKey: name)
             }
         }
@@ -405,6 +420,7 @@ final class PikraSessionBridge: @unchecked Sendable {
             let t = Array(toolTasks.values)
             httpTasks.removeAll()
             toolTasks.removeAll()
+            cancelledToolHandles.removeAll()
             return (h, t)
         }
         for task in httpList { task.cancel() }
@@ -579,36 +595,52 @@ final class PikraSessionBridge: @unchecked Sendable {
         argsJSON: String,
         completionPtr: SendableToolCompletionPtr
     ) {
-        let task = Task { [weak self] in
-            defer {
-                self?.removeToolTask(callHandleID)
+        let alreadyCancelled = lock.withLock { () -> Bool in
+            if cancelledToolHandles.remove(callHandleID) != nil {
+                return true
             }
-            guard let self else {
-                "session destroyed".withCString { cstr in
-                    pikra_tool_complete(completionPtr.raw, nil, cstr)
+            let task = Task { [weak self] in
+                defer {
+                    self?.removeToolTask(callHandleID)
                 }
-                return
+                guard let self else {
+                    "session destroyed".withCString { cstr in
+                        pikra_tool_complete(completionPtr.raw, nil, cstr)
+                    }
+                    return
+                }
+                await self.driveTool(
+                    toolCallID: toolCallID,
+                    toolName: toolName,
+                    argsJSON: argsJSON,
+                    completionPtr: completionPtr
+                )
             }
-            await self.driveTool(
-                toolCallID: toolCallID,
-                toolName: toolName,
-                argsJSON: argsJSON,
-                completionPtr: completionPtr
-            )
-        }
-        lock.withLock {
             toolTasks[callHandleID] = task
+            return false
+        }
+        if alreadyCancelled {
+            "cancelled".withCString { cstr in
+                pikra_tool_complete(completionPtr.raw, nil, cstr)
+            }
         }
     }
 
     func cancelTool(callHandleID: UInt64) {
-        let task = lock.withLock { toolTasks.removeValue(forKey: callHandleID) }
+        let task = lock.withLock { () -> Task<Void, Never>? in
+            if let existing = toolTasks.removeValue(forKey: callHandleID) {
+                return existing
+            }
+            cancelledToolHandles.insert(callHandleID)
+            return nil
+        }
         task?.cancel()
     }
 
     private func removeToolTask(_ callHandleID: UInt64) {
         lock.withLock {
             _ = toolTasks.removeValue(forKey: callHandleID)
+            _ = cancelledToolHandles.remove(callHandleID)
         }
     }
 

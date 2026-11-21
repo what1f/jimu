@@ -590,7 +590,7 @@ async fn rpc_live_deepseek_smoke_if_key_present() {
         "--provider",
         "deepseek",
         "--model",
-        "deepseek-chat",
+        "deepseek-flash",
         "--api",
         "openai-completions",
         "--base-url",
@@ -633,4 +633,308 @@ async fn rpc_live_deepseek_smoke_if_key_present() {
 
     let status = proc.close_stdin_and_wait().await;
     assert!(status.success(), "expected clean exit 0, got {status}");
+}
+
+#[tokio::test]
+async fn rpc_review_regressions_defaults_init_oneshot_model_restore_and_async_compact() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = tmp.path();
+    let cwd_str = ws.display().to_string();
+
+    // #13: Initialization failure (--session pointing to a directory) must exit non-zero immediately without hanging.
+    let bad_init = Command::new(env!("CARGO_BIN_EXE_pikra"))
+        .args(["--mode", "rpc", "--cwd", &cwd_str, "--session", &cwd_str])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run pikra with dir session");
+    assert!(
+        !bad_init.status.success(),
+        "expected non-zero exit when --session is a directory"
+    );
+    let bad_stderr = String::from_utf8_lossy(&bad_init.stderr);
+    assert!(
+        bad_stderr.contains("error:"),
+        "expected error on stderr: {bad_stderr}"
+    );
+
+    // #9: Default Anthropic and DeepSeek models use non-retired IDs.
+    for (provider, expected_model) in [
+        ("anthropic", "claude-sonnet-5-5"),
+        ("deepseek", "deepseek-flash"),
+    ] {
+        let mut p = RpcClientProc::spawn(&[
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-tools",
+            "--provider",
+            provider,
+        ]);
+        p.send_json(&json!({ "id": "st", "type": "get_state" }))
+            .await;
+        let (resp, _) = p.read_response_for("st").await;
+        assert_eq!(resp["data"]["model"]["id"], expected_model);
+        assert!(p.close_stdin_and_wait().await.success());
+    }
+
+    // #14: One-shot text & json modes exit non-zero on provider request failure (closed loopback port).
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let dead_addr = dead_listener.local_addr().expect("addr");
+    drop(dead_listener);
+    let dead_url = format!("http://{dead_addr}/v1");
+
+    let oneshot_text = Command::new(env!("CARGO_BIN_EXE_pikra"))
+        .args([
+            "ask",
+            "--no-session",
+            "--no-tools",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-1",
+            "--api",
+            "openai-completions",
+            "--base-url",
+            &dead_url,
+            "ping",
+        ])
+        .output()
+        .await
+        .expect("run oneshot text");
+    assert!(
+        !oneshot_text.status.success(),
+        "expected non-zero exit in text mode"
+    );
+    assert!(
+        !oneshot_text.stderr.is_empty(),
+        "expected error message on stderr in text mode"
+    );
+
+    let oneshot_json = Command::new(env!("CARGO_BIN_EXE_pikra"))
+        .args([
+            "--mode",
+            "json",
+            "--no-session",
+            "--no-tools",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-1",
+            "--api",
+            "openai-completions",
+            "--base-url",
+            &dead_url,
+            "ping",
+        ])
+        .output()
+        .await
+        .expect("run oneshot json");
+    assert!(
+        !oneshot_json.status.success(),
+        "expected non-zero exit in json mode"
+    );
+
+    // #15 & #16: Model persistence across restart + non-blocking manual compact with get_state & abort.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("local addr");
+    let compact_req_seen = Arc::new(Notify::new());
+    let srv_compact_seen = Arc::clone(&compact_req_seen);
+
+    let server = tokio::spawn(async move {
+        let mut idx = 0usize;
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let _ = read_http_request_body(&mut sock).await;
+            idx += 1;
+            write_sse_headers(&mut sock).await;
+            if idx == 1 {
+                let c = sse_chunk(
+                    json!({ "role": "assistant", "content": "turn1 ok" }),
+                    Some("stop"),
+                );
+                let _ = sock.write_all(c.as_bytes()).await;
+                let _ = sock.write_all(b"data: [DONE]\n\n").await;
+                let _ = sock.flush().await;
+            } else {
+                // Stall compaction summarization stream until aborted by client.
+                srv_compact_seen.notify_one();
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf).await;
+            }
+        }
+    });
+
+    let base_url = format!("http://{addr}/v1");
+    let session_path = ws.join("persist-model.jsonl");
+    let session_str = session_path.display().to_string();
+
+    // First process: set_model to custom local/chosen + run 1 turn so compaction has messages.
+    {
+        let mut p1 = RpcClientProc::spawn(&[
+            "--mode",
+            "rpc",
+            "--cwd",
+            &cwd_str,
+            "--no-tools",
+            "--session",
+            &session_str,
+        ]);
+        p1.send_json(&json!({
+            "id": "sm1",
+            "type": "set_model",
+            "provider": "local",
+            "model_id": "chosen",
+            "api": "openai-completions",
+            "base_url": base_url,
+            "context_window": 32000,
+            "max_output_tokens": 4096,
+            "supports_images": false,
+            "supports_reasoning": false
+        }))
+        .await;
+        let (sm_resp, _) = p1.read_response_for("sm1").await;
+        assert_eq!(sm_resp["success"], true);
+
+        p1.send_json(&json!({ "id": "pr1", "type": "prompt", "message": "hello" }))
+            .await;
+        let (pr_resp, _) = p1.read_response_for("pr1").await;
+        assert_eq!(pr_resp["success"], true);
+        loop {
+            let ev = p1.next_record().await;
+            if ev["type"] == "agent_settled" {
+                assert_eq!(ev["aborted"], false);
+                break;
+            }
+        }
+        assert!(p1.close_stdin_and_wait().await.success());
+    }
+
+    // Second process: reopen same --session WITHOUT --provider/--model -> restores local/chosen & custom base_url!
+    {
+        let mut p2 = RpcClientProc::spawn(&[
+            "--mode",
+            "rpc",
+            "--cwd",
+            &cwd_str,
+            "--no-tools",
+            "--session",
+            &session_str,
+        ]);
+        p2.send_json(&json!({ "id": "gs1", "type": "get_state" }))
+            .await;
+        let (gs_resp, _) = p2.read_response_for("gs1").await;
+        assert_eq!(gs_resp["data"]["model"]["provider"], "local");
+        assert_eq!(gs_resp["data"]["model"]["id"], "chosen");
+        assert_eq!(gs_resp["data"]["model"]["base_url"], base_url);
+        assert_eq!(gs_resp["data"]["model"]["context_window"], 32000);
+
+        // #16: Trigger manual compact (stalls on mock server), then verify get_state & busy prompt & abort do NOT block!
+        p2.send_json(&json!({ "id": "cmp1", "type": "compact" }))
+            .await;
+        compact_req_seen.notified().await;
+
+        p2.send_json(&json!({ "id": "gs2", "type": "get_state" }))
+            .await;
+        let (gs2_resp, _) = p2.read_response_for("gs2").await;
+        assert_eq!(gs2_resp["success"], true);
+        assert_eq!(gs2_resp["data"]["is_compacting"], true);
+
+        p2.send_json(&json!({ "id": "busy1", "type": "prompt", "message": "blocked" }))
+            .await;
+        let (busy_resp, _) = p2.read_response_for("busy1").await;
+        assert_eq!(busy_resp["success"], false);
+
+        p2.send_json(&json!({ "id": "ab_cmp", "type": "abort" }))
+            .await;
+        let (ab_resp, between) = p2.read_response_for("ab_cmp").await;
+        assert_eq!(ab_resp["success"], true);
+        assert!(
+            between
+                .iter()
+                .any(|r| r["type"] == "response" && r["id"] == "cmp1" && r["success"] == false),
+            "expected aborted compact error response before abort settled: {between:?}"
+        );
+
+        assert!(p2.close_stdin_and_wait().await.success());
+    }
+
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rpc_reports_persistence_error_when_session_file_unwritable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = tmp.path();
+    let session_path = ws.join("readonly.jsonl");
+    let cwd_str = ws.display().to_string();
+    let session_str = session_path.display().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = read_http_request_body(&mut sock).await;
+            write_sse_headers(&mut sock).await;
+            let c = sse_chunk(
+                json!({ "role": "assistant", "content": "ok" }),
+                Some("stop"),
+            );
+            let _ = sock.write_all(c.as_bytes()).await;
+            let _ = sock.write_all(b"data: [DONE]\n\n").await;
+            let _ = sock.flush().await;
+        }
+    });
+
+    let base_url = format!("http://{addr}/v1");
+    let mut proc = RpcClientProc::spawn(&[
+        "--mode",
+        "rpc",
+        "--cwd",
+        &cwd_str,
+        "--no-tools",
+        "--provider",
+        "mock",
+        "--model",
+        "mock-1",
+        "--api",
+        "openai-completions",
+        "--base-url",
+        &base_url,
+        "--session",
+        &session_str,
+    ]);
+
+    // Ensure session header/baseline is written, then make file read-only so append_message fails.
+    proc.send_json(&json!({ "id": "s0", "type": "get_state" }))
+        .await;
+    let _ = proc.read_response_for("s0").await;
+    std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o444))
+        .expect("chmod 0444");
+
+    proc.send_json(&json!({ "id": "p_err", "type": "prompt", "message": "cannot persist" }))
+        .await;
+    let (p_resp, _) = proc.read_response_for("p_err").await;
+    assert_eq!(p_resp["success"], true);
+
+    let settled_error = loop {
+        let ev = proc.next_record().await;
+        if ev["type"] == "agent_settled" {
+            break ev["error"].as_str().map(ToString::to_string);
+        }
+    };
+
+    // Restore permissions so tempdir cleanup succeeds.
+    let _ = std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o644));
+    assert!(
+        settled_error
+            .as_deref()
+            .is_some_and(|e| e.contains("failed to persist session message")),
+        "expected persistence failure on agent_settled, got: {settled_error:?}"
+    );
+
+    assert!(proc.close_stdin_and_wait().await.success());
+    server.abort();
 }

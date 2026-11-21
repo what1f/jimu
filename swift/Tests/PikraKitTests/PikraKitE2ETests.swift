@@ -655,8 +655,8 @@ struct PikraKitE2ETests {
         }
 
         let model = PikraModel(
-            id: "deepseek-chat",
-            name: "DeepSeek Chat",
+            id: "deepseek-flash",
+            name: "DeepSeek Flash",
             provider: "deepseek",
             api: .openaiCompletions,
             baseURL: "https://api.deepseek.com/v1",
@@ -1151,6 +1151,253 @@ struct PikraKitE2ETests {
             "ws-plugin:bash:dangerous",
             "ws-plugin:bash:dangerous",
         ])
+
+        await agent.close()
+    }
+
+    @Test("8. Review regressions: OAuth account-switch guard, lossless Int64 JSONValue, CRLF read, write cancellation, tool registry sync, skill removal & FFI persistence error")
+    func reviewRegressionsE2E() async throws {
+        // #35: Lossless Int64 round-trip in JSONValue (above IEEE-754 2^53 safe integer bound)
+        let bigID: Int64 = 9_007_199_254_740_993
+        let rawBigJSON = Data("{\"id\":\(bigID),\"flt\":1.5}".utf8)
+        let decodedBig = try JSONDecoder().decode(JSONValue.self, from: rawBigJSON)
+        #expect(decodedBig["id"] == .integer(bigID))
+        #expect(decodedBig["id"]?.int64Value == bigID)
+        #expect(decodedBig["id"]?.intValue == Int(bigID))
+        #expect(decodedBig["flt"]?.doubleValue == 1.5)
+        let reencodedBig = try JSONEncoder().encode(decodedBig)
+        let roundTrippedBig = try JSONDecoder().decode(JSONValue.self, from: reencodedBig)
+        #expect(roundTrippedBig["id"]?.int64Value == bigID)
+
+        // #2: PikraCodexSubscription must not clobber Account B when Account A's refresh finishes late
+        func makeExpJWT(accountID: String, expOffset: TimeInterval) throws -> String {
+            func b64url(_ data: Data) -> String {
+                data.base64EncodedString()
+                    .replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: "=", with: "")
+            }
+            let header = try JSONSerialization.data(withJSONObject: ["alg": "none", "typ": "JWT"])
+            let payload = try JSONSerialization.data(withJSONObject: [
+                "exp": Date().addingTimeInterval(expOffset).timeIntervalSince1970,
+                "https://api.openai.com/auth": ["chatgpt_account_id": accountID],
+            ])
+            return "\(b64url(header)).\(b64url(payload)).sig"
+        }
+
+        let acctAInitial = try PikraCodexCredentials(
+            accessToken: makeExpJWT(accountID: "acct_A", expOffset: 30),
+            refreshToken: "rt_A_old"
+        ).normalized()
+        let acctARefreshedJWT = try makeExpJWT(accountID: "acct_A", expOffset: 3600)
+        let acctB = try PikraCodexCredentials(
+            accessToken: makeExpJWT(accountID: "acct_B", expOffset: 3600),
+            refreshToken: "rt_B"
+        ).normalized()
+
+        actor AccountStore {
+            var active: PikraCodexCredentials
+            var saved: [PikraCodexCredentials] = []
+            init(_ initial: PikraCodexCredentials) { self.active = initial }
+            func load() -> PikraCodexCredentials { active }
+            func switchTo(_ next: PikraCodexCredentials) { active = next }
+            func save(_ creds: PikraCodexCredentials) {
+                active = creds
+                saved.append(creds)
+            }
+            func history() -> [PikraCodexCredentials] { saved }
+        }
+
+        let store = AccountStore(acctAInitial)
+        let refreshAStarted = Signal()
+        let allowRefreshAFinish = Signal()
+        let oauthClient = MockSSEClient(handlers: [
+            { _, _ in
+                await refreshAStarted.fire()
+                await allowRefreshAFinish.wait()
+                return MockSSEClient.sseResponse(chunks: [
+                    "{\"access_token\":\"\(acctARefreshedJWT)\",\"refresh_token\":\"rt_A_new\"}"
+                ])
+            }
+        ])
+        let sub = PikraCodexSubscription(
+            credentials: { await store.load() },
+            onRefresh: { updated in await store.save(updated) },
+            httpClient: oauthClient
+        )
+
+        let refreshATask = Task { try await sub.currentCredentials() }
+        await refreshAStarted.wait()
+        // Switch active account to B while A's refresh is suspended!
+        await store.switchTo(acctB)
+        let fetchedB = try await sub.currentCredentials()
+        #expect(fetchedB.accountID == "acct_B")
+        await allowRefreshAFinish.fire()
+        _ = try await refreshATask.value
+        // B must remain intact on disk and onRefresh(A) must NOT have been called!
+        #expect(await store.load().accountID == "acct_B")
+        #expect(await store.history().isEmpty)
+        // Switching back to A retries saving A's pending rotated credentials!
+        await store.switchTo(acctAInitial)
+        let restoredA = try await sub.currentCredentials()
+        #expect(restoredA.refreshToken == "rt_A_new")
+        #expect(await store.load().refreshToken == "rt_A_new")
+
+        // #36 & #37: CRLF read slicing + cancelled write must not execute
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pikra-reg-e2e-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let crlfFile = tmpDir.appendingPathComponent("crlf.txt")
+        try Data("alpha\r\nbeta\r\ngamma".utf8).write(to: crlfFile)
+
+        let wsTools = PikraWorkspaceTools(workspace: tmpDir)
+        let readTool = try #require(wsTools.tools([.readFile]).first)
+        let writeTool = try #require(wsTools.tools([.writeFile]).first)
+        let dummyCtx = PikraToolCallContext(toolCallID: "c1", toolName: "read") { _ in }
+
+        let line2 = try await readTool.execute(dummyCtx, ["path": "crlf.txt", "offset": 2, "limit": 1])
+        #expect(line2.textOutput == "beta")
+        let lines23 = try await readTool.execute(dummyCtx, ["path": "crlf.txt", "offset": 2, "limit": 2])
+        #expect(lines23.textOutput == "beta\ngamma")
+
+        let cancelledTarget = tmpDir.appendingPathComponent("should_not_exist.txt")
+        let cancelledWriteTask = Task {
+            try await writeTool.execute(dummyCtx, ["path": "should_not_exist.txt", "content": "nope"])
+        }
+        cancelledWriteTask.cancel()
+        _ = try? await cancelledWriteTask.value
+        #expect(!FileManager.default.fileExists(atPath: cancelledTarget.path))
+
+        // #11 & #38 & #7: Resident tool collision/removal safety, skill deletion reload, and FFI persistence error
+        let skillRoot = tmpDir.appendingPathComponent("skills", isDirectory: true)
+        let oneSkillDir = skillRoot.appendingPathComponent("demo", isDirectory: true)
+        try FileManager.default.createDirectory(at: oneSkillDir, withIntermediateDirectories: true)
+        let skillFile = oneSkillDir.appendingPathComponent("SKILL.md")
+        try "---\nname: demo\ndescription: Demo skill\n---\n# Demo\n".write(to: skillFile, atomically: true, encoding: .utf8)
+
+        let journalURL = tmpDir.appendingPathComponent("ffi-reg.jsonl")
+        let residentBusyStarted = Signal()
+        let residentBusyRelease = Signal()
+
+        let residentEcho = PikraTool(
+            name: "res_echo",
+            description: "Resident echo",
+            parameters: ["type": "object", "properties": ["id": ["type": "integer"]], "required": ["id"]],
+            deferred: false
+        ) { _, args in
+            let idVal = args["id"]?.int64Value ?? 0
+            return .text("resident:\(idVal)")
+        }
+        let blockerTool = PikraTool(
+            name: "blocker",
+            description: "Blocks until released",
+            parameters: ["type": "object", "properties": [:]],
+            deferred: false
+        ) { _, _ in
+            await residentBusyStarted.fire()
+            await residentBusyRelease.wait()
+            return .text("unblocked")
+        }
+        let dynToolV1 = PikraTool(
+            name: "dyn_tool",
+            description: "Dynamic v1",
+            parameters: ["type": "object", "properties": [:]],
+            deferred: true
+        ) { _, _ in .text("dyn:v1") }
+        let dynToolV2 = PikraTool(
+            name: "dyn_tool",
+            description: "Dynamic v2",
+            parameters: ["type": "object", "properties": [:]],
+            deferred: true
+        ) { _, _ in .text("dyn:v2") }
+
+        let mockClient = MockSSEClient(handlers: [
+            // Turn 1: call blocker (while running, test busy upsertTools rejection!) -> then call call_tool(dyn_tool) -> text
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(id: "t1", name: "blocker", argumentsJSON: "{}")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(id: "t2", name: "call_tool", argumentsJSON: "{\"name\":\"dyn_tool\",\"arguments\":{}}")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(id: "t3", name: "res_echo", argumentsJSON: "{\"id\":\(bigID)}")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Turn 1 done")) },
+            // Turn 2 (after deleting skill & calling reloadSkills + removeTools(["res_echo"])): call res_echo again!
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.toolCallChunks(id: "t4", name: "res_echo", argumentsJSON: "{\"id\":\(bigID)}")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Turn 2 done")) },
+            // Turn 3 (read-only journal -> persistence error!)
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Should fail persistence")) },
+        ])
+
+        let agent = try await PikraAgent.open(
+            configuration: PikraConfiguration(
+                model: testModel(),
+                systemPrompt: "Regression test",
+                tools: [residentEcho, blockerTool, dynToolV1],
+                skillRoots: [skillRoot],
+                enableDeferredGateway: true,
+                persistenceURL: journalURL,
+                httpClient: mockClient
+            )
+        )
+
+        // Resident collision in upsertTools must be rejected
+        await #expect(throws: PikraError.self) {
+            try await agent.upsertTools([residentEcho])
+        }
+
+        // Start Turn 1; while blocker is active, upsertTools([dynToolV2]) must fail with .busy AND NOT overwrite dynToolV1!
+        let t1Stream = try await agent.prompt("Run turn 1")
+        let t1Task = Task { try await collectEvents(t1Stream) }
+        await residentBusyStarted.wait()
+        await #expect(throws: PikraError.busy) {
+            try await agent.upsertTools([dynToolV2])
+        }
+        await residentBusyRelease.fire()
+        let t1Events = try await t1Task.value
+        let dynResult = t1Events.compactMap { ev -> String? in
+            if case .toolFinished(_, "call_tool", let res, false) = ev { return res.textOutput }
+            return nil
+        }.first
+        #expect(dynResult == "dyn:v1")
+        let bigEchoResult = t1Events.compactMap { ev -> String? in
+            if case .toolFinished(_, "res_echo", let res, false) = ev { return res.textOutput }
+            return nil
+        }.first
+        #expect(bigEchoResult == "resident:\(bigID)")
+
+        // #11: removeTools(["res_echo"]) returns 0 and must NOT remove res_echo from Swift bridge!
+        let removedRes = try await agent.removeTools(named: ["res_echo"])
+        #expect(removedRes == 0)
+
+        // #38: Delete last skill and reloadSkills() -> must report changed == true and emit empty <available_skills>
+        try FileManager.default.removeItem(at: oneSkillDir)
+        let skillChanged = try await agent.reloadSkills()
+        #expect(skillChanged == true)
+
+        let t2Events = try await collectEvents(try await agent.prompt("Run turn 2"))
+        #expect(t2Events.contains { ev in
+            if case .contextAppended(let name, let text) = ev {
+                return name == "skills" && text == "<available_skills>\n</available_skills>"
+            }
+            return false
+        })
+        #expect(t2Events.contains { ev in
+            if case .toolFinished(_, "res_echo", let res, false) = ev {
+                return res.textOutput == "resident:\(bigID)"
+            }
+            return false
+        })
+
+        // #7: Make journal read-only so append_message fails during Turn 3 -> TurnEnded must report .error!
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: journalURL.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: journalURL.path)
+        }
+        let t3Events = try await collectEvents(try await agent.prompt("Run turn 3 unwritable"))
+        if case .turnEnded(let reason, _, let errMsg) = t3Events.last {
+            #expect(reason == .error)
+            #expect(errMsg?.contains("failed to persist session message") == true)
+        } else {
+            Issue.record("Expected TurnEnded(.error) on persistence failure, got \(String(describing: t3Events.last))")
+        }
 
         await agent.close()
     }

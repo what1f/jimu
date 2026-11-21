@@ -196,6 +196,8 @@ impl AgentTool for FfiAgentTool {
                 // SAFETY: Callback was null, so ownership never transferred to host.
                 let dropped = unsafe { Box::from_raw(completion_ptr) };
                 dropped.complete(Err("host tool execute callback not configured".to_string()));
+            } else if cancel.is_cancelled() && !finished.load(Ordering::Acquire) {
+                callbacks.fire_cancel(call_handle_id);
             }
 
             match done_rx.await {

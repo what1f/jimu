@@ -300,13 +300,16 @@ pub struct AgentSettledEvent {
     #[serde(rename = "type")]
     pub record_type: &'static str,
     pub aborted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl AgentSettledEvent {
-    pub fn new(aborted: bool) -> Self {
+    pub fn with_error(aborted: bool, error: Option<String>) -> Self {
         Self {
             record_type: "agent_settled",
             aborted,
+            error,
         }
     }
 }

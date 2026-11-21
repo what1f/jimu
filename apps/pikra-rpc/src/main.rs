@@ -68,6 +68,7 @@ async fn run_rpc(cli: args::CliArgs) -> ExitCode {
         Ok(rt) => rt,
         Err(err) => {
             eprintln!("error: {err}");
+            drop(writer);
             writer_guard.finish().await;
             return ExitCode::FAILURE;
         }

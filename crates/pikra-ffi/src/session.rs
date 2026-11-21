@@ -86,6 +86,7 @@ pub struct FfiSession {
     deferred_registry: Arc<DeferredToolRegistry>,
     skills: Mutex<SkillCatalog>,
     skill_roots: Vec<PathBuf>,
+    had_skills_catalog: Mutex<bool>,
     had_deferred_catalog: Mutex<bool>,
     http_callbacks: SendHttpCallbacks,
     tool_callbacks: SendToolCallbacks,
@@ -180,26 +181,24 @@ impl FfiSession {
             }
         }
 
-        let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
-
         if config.enable_codemode
             && !resident
                 .iter()
                 .any(|t| t.definition().name == CODEMODE_EXEC_TOOL_NAME)
         {
+            // Snapshot resident tools BEFORE pushing `exec` so `CodemodeExecTool` never holds
+            // a strong Arc cycle back to itself.
+            let resident_tools_handle = Arc::new(Mutex::new(resident.clone()));
             let cm_opts = config.codemode_options.map(Into::into).unwrap_or_default();
             let exec_tool: Arc<dyn AgentTool> = Arc::new(
                 CodemodeExecTool::new(
-                    Arc::clone(&resident_tools_handle),
+                    resident_tools_handle,
                     Arc::clone(&deferred_registry),
                     cm_opts,
                 )
                 .with_middlewares(middlewares.clone()),
             );
             resident.push(exec_tool);
-            *resident_tools_handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = resident.clone();
         }
 
         let resident_defs: Vec<ToolDefinition> = resident.iter().map(|t| t.definition()).collect();
@@ -232,8 +231,12 @@ impl FfiSession {
 
         let skill_roots: Vec<PathBuf> = config.skill_roots.into_iter().map(PathBuf::from).collect();
         let skills = SkillCatalog::discover(&skill_roots);
+        let mut had_skills_catalog = reconstructed
+            .all_branch_context_blocks
+            .contains_key(SKILLS_CONTEXT_NAME);
         if let Some(skills_xml) = skills.format_for_context() {
             session_manager.set_context(SKILLS_CONTEXT_NAME, skills_xml);
+            had_skills_catalog = true;
         }
 
         let mut had_deferred_catalog = false;
@@ -270,6 +273,7 @@ impl FfiSession {
             deferred_registry,
             skills: Mutex::new(skills),
             skill_roots,
+            had_skills_catalog: Mutex::new(had_skills_catalog),
             had_deferred_catalog: Mutex::new(had_deferred_catalog),
             http_callbacks: http_cb,
             tool_callbacks: tool_cb,
@@ -414,6 +418,7 @@ impl FfiSession {
 
             let mut seen_ends = 0usize;
             let mut deferred_persist: Vec<AgentMessage> = Vec::new();
+            let persistence_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             let mut last_stop_reason = StopReason::Stop;
             let mut last_error_message: Option<String> = None;
             let mut user_message_kept = true;
@@ -425,9 +430,22 @@ impl FfiSession {
                             if this.rollback_first_turn_on_failure {
                                 deferred_persist.push(message.clone());
                             } else {
-                                let mut session =
-                                    this.session.lock().unwrap_or_else(|e| e.into_inner());
-                                let _ = session.append_message(message.clone());
+                                let persist_res = {
+                                    let mut session =
+                                        this.session.lock().unwrap_or_else(|e| e.into_inner());
+                                    session.append_message(message.clone())
+                                };
+                                if let Err(err) = persist_res {
+                                    let mut slot =
+                                        persistence_error.lock().unwrap_or_else(|e| e.into_inner());
+                                    if slot.is_none() {
+                                        *slot = Some(format!(
+                                            "failed to persist session message: {err}"
+                                        ));
+                                    }
+                                    drop(slot);
+                                    this.agent.abort_now();
+                                }
                             }
                         }
                         seen_ends += 1;
@@ -530,18 +548,34 @@ impl FfiSession {
             if this.rollback_first_turn_on_failure && user_message_kept {
                 let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
                 for msg in deferred_persist {
-                    let _ = session.append_message(msg);
+                    if let Err(err) = session.append_message(msg) {
+                        let mut slot = persistence_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(format!("failed to persist session message: {err}"));
+                        }
+                        break;
+                    }
                 }
             }
 
             // Ensure Agent's internal active_run is fully released before auto-compaction.
             this.agent.wait_for_idle().await;
 
-            // Run auto-compaction if needed and not cancelled.
-            if !prompt_cancel.is_cancelled() && !this.is_closed() {
+            let persist_err = persistence_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+
+            // Run auto-compaction if needed, not cancelled, and persistence succeeded.
+            if persist_err.is_none() && !prompt_cancel.is_cancelled() && !this.is_closed() {
                 let _ = this
                     .run_compaction_internal(true, Some(&emit), prompt_cancel.clone())
                     .await;
+            }
+
+            if let Some(err_msg) = persist_err {
+                last_stop_reason = StopReason::Error;
+                last_error_message = Some(err_msg);
             }
 
             // Release busy state BEFORE emitting `.turnEnded` and `on_done` so any Swift consumer
@@ -764,6 +798,18 @@ impl FfiSession {
     ) -> Result<(), (PikraStatus, String)> {
         self.check_open_and_idle()
             .map_err(|s| (s, status_message(s)))?;
+        let resident_defs = self.agent.tool_definitions();
+        for spec in &specs {
+            if resident_defs.iter().any(|t| t.name == spec.name) {
+                return Err((
+                    PikraStatus::ErrInvalidArgument,
+                    format!(
+                        "cannot upsert tool `{}`: collides with a resident tool",
+                        spec.name
+                    ),
+                ));
+            }
+        }
         let tools: Vec<Arc<dyn AgentTool>> = specs
             .iter()
             .map(|spec| {
@@ -1069,14 +1115,28 @@ impl FfiSession {
         let discovered = SkillCatalog::discover(&self.skill_roots);
         let formatted = discovered.format_for_context();
         *self.skills.lock().unwrap_or_else(|e| e.into_inner()) = discovered;
-        if let Some(xml) = formatted {
-            Ok(self
+        let mut had_catalog = self
+            .had_skills_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match formatted {
+            Some(xml) => {
+                *had_catalog = true;
+                Ok(self
+                    .session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_context(SKILLS_CONTEXT_NAME, xml))
+            }
+            None if *had_catalog => Ok(self
                 .session
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set_context(SKILLS_CONTEXT_NAME, xml))
-        } else {
-            Ok(false)
+                .set_context(
+                    SKILLS_CONTEXT_NAME,
+                    "<available_skills>\n</available_skills>",
+                )),
+            None => Ok(false),
         }
     }
 }

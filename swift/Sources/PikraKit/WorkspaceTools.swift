@@ -292,7 +292,7 @@ public struct PikraWorkspaceTools: Sendable {
                 return .text(text)
             }
 
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            let lines = Self.splitLines(text)
             let startIndex = (offset ?? 1) - 1
             guard startIndex < lines.count else {
                 return .text("")
@@ -305,6 +305,33 @@ public struct PikraWorkspaceTools: Sendable {
             }
             return .text(lines[startIndex..<endIndex].joined(separator: "\n"))
         }
+    }
+
+    /// Splits lines strictly on Unicode scalar `\n`, stripping a single preceding `\r`,
+    /// avoiding Swift `Character`'s CRLF grapheme-cluster trap.
+    private static func splitLines(_ text: String) -> [String] {
+        let scalars = text.unicodeScalars
+        var lines: [String] = []
+        var lineStart = scalars.startIndex
+        var idx = lineStart
+        while idx < scalars.endIndex {
+            if scalars[idx] == "\n" {
+                var lineEnd = idx
+                if lineEnd > lineStart {
+                    let prev = scalars.index(before: lineEnd)
+                    if scalars[prev] == "\r" {
+                        lineEnd = prev
+                    }
+                }
+                lines.append(String(scalars[lineStart..<lineEnd]))
+                idx = scalars.index(after: idx)
+                lineStart = idx
+            } else {
+                idx = scalars.index(after: idx)
+            }
+        }
+        lines.append(String(scalars[lineStart..<scalars.endIndex]))
+        return lines
     }
 
     // MARK: - write
@@ -343,6 +370,8 @@ public struct PikraWorkspaceTools: Sendable {
                     try Self.atomicWrite(data, to: targetURL)
                 }
                 return .text("Wrote \(data.count) bytes to \(requestedURL.path)")
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 return .error(error.localizedDescription)
             }
@@ -407,6 +436,8 @@ public struct PikraWorkspaceTools: Sendable {
                     try Self.atomicWrite(Data(updated.utf8), to: targetURL)
                     return .text("Edited \(requestedURL.path)")
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 return .error(error.localizedDescription)
             }
@@ -549,7 +580,7 @@ public struct PikraWorkspaceTools: Sendable {
             )
 
             let payload: JSONValue = [
-                "exit_code": .number(Double(result.exitCode)),
+                "exit_code": .integer(Int64(result.exitCode)),
                 "output": .string(result.output),
                 "output_truncated": .bool(result.outputTruncated),
             ]
@@ -835,26 +866,64 @@ public struct PikraWorkspaceTools: Sendable {
 
 /// Per-path async FIFO mutex serializing concurrent `write` and `edit` mutations to the same target file.
 private actor FileWriteCoordinator {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
     private var active: Set<String> = []
-    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var waiters: [String: [Waiter]] = [:]
 
     func withExclusiveAccess<T: Sendable>(
         path: String,
         operation: @Sendable () throws -> T
-    ) async rethrows -> T {
-        await acquire(path: path)
+    ) async throws -> T {
+        try Task.checkCancellation()
+        try await acquire(path: path)
         defer { release(path: path) }
+        try Task.checkCancellation()
         return try operation()
     }
 
-    private func acquire(path: String) async {
+    private func acquire(path: String) async throws {
         if !active.contains(path) {
             active.insert(path)
             return
         }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            waiters[path, default: []].append(cont)
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                if !active.contains(path) {
+                    active.insert(path)
+                    cont.resume()
+                    return
+                }
+                waiters[path, default: []].append(Waiter(id: waiterID, continuation: cont))
+            }
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(path: path, id: waiterID)
+            }
         }
+    }
+
+    private func cancelWaiter(path: String, id: UUID) {
+        guard var queue = waiters[path],
+              let idx = queue.firstIndex(where: { $0.id == id })
+        else {
+            return
+        }
+        let waiter = queue.remove(at: idx)
+        if queue.isEmpty {
+            waiters.removeValue(forKey: path)
+        } else {
+            waiters[path] = queue
+        }
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
     private func release(path: String) {
@@ -865,7 +934,7 @@ private actor FileWriteCoordinator {
             } else {
                 waiters[path] = queue
             }
-            next.resume()
+            next.continuation.resume()
         } else {
             active.remove(path)
         }

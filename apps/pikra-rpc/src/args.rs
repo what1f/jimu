@@ -53,7 +53,7 @@ MODES:
 
 MODEL & PROVIDER OPTIONS:
   --provider <id>           Provider id (e.g. openai, anthropic, google, deepseek)
-  --model <id>              Model id (e.g. gpt-5.4, deepseek-chat)
+  --model <id>              Model id (e.g. gpt-5.4, claude-sonnet-5-5, deepseek-flash)
   --api <kind>              Wire protocol: openai-responses | openai-completions |
                             anthropic-messages | google-generative-ai
   --base-url <url>          Override provider API base URL

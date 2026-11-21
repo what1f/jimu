@@ -4,6 +4,7 @@ import Foundation
 public enum JSONValue: Codable, Sendable, Equatable, Hashable {
     case null
     case bool(Bool)
+    case integer(Int64)
     case number(Double)
     case string(String)
     case array([JSONValue])
@@ -16,7 +17,7 @@ public enum JSONValue: Codable, Sendable, Equatable, Hashable {
         } else if let bool = try? container.decode(Bool.self) {
             self = .bool(bool)
         } else if let intVal = try? container.decode(Int64.self) {
-            self = .number(Double(intVal))
+            self = .integer(intVal)
         } else if let number = try? container.decode(Double.self) {
             self = .number(number)
         } else if let string = try? container.decode(String.self) {
@@ -35,14 +36,10 @@ public enum JSONValue: Codable, Sendable, Equatable, Hashable {
             try container.encodeNil()
         case .bool(let value):
             try container.encode(value)
+        case .integer(let value):
+            try container.encode(value)
         case .number(let value):
-            if value.isFinite, value.rounded() == value,
-               value >= Double(Int64.min), value < Double(Int64.max)
-            {
-                try container.encode(Int64(value))
-            } else {
-                try container.encode(value)
-            }
+            try container.encode(value)
         case .string(let value):
             try container.encode(value)
         case .array(let value):
@@ -73,16 +70,33 @@ public enum JSONValue: Codable, Sendable, Equatable, Hashable {
     }
 
     public var doubleValue: Double? {
-        guard case .number(let n) = self else { return nil }
-        return n
+        switch self {
+        case .integer(let i):
+            return Double(i)
+        case .number(let n):
+            return n
+        default:
+            return nil
+        }
+    }
+
+    public var int64Value: Int64? {
+        switch self {
+        case .integer(let i):
+            return i
+        case .number(let n):
+            guard n.isFinite, n.rounded() == n,
+                  n >= -9_007_199_254_740_992.0, n <= 9_007_199_254_740_992.0
+            else { return nil }
+            return Int64(n)
+        default:
+            return nil
+        }
     }
 
     public var intValue: Int? {
-        guard case .number(let n) = self,
-              n.isFinite, n.rounded() == n,
-              n >= Double(Int.min), n < Double(Int.max)
-        else { return nil }
-        return Int(n)
+        guard let i64 = int64Value else { return nil }
+        return Int(exactly: i64)
     }
 
     public var arrayValue: [JSONValue]? {
@@ -105,7 +119,7 @@ extension JSONValue: ExpressibleByBooleanLiteral {
 }
 
 extension JSONValue: ExpressibleByIntegerLiteral {
-    public init(integerLiteral value: Int) { self = .number(Double(value)) }
+    public init(integerLiteral value: Int64) { self = .integer(value) }
 }
 
 extension JSONValue: ExpressibleByFloatLiteral {

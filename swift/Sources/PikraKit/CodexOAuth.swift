@@ -298,7 +298,6 @@ public struct PikraCodexOAuth: Sendable {
             }
         }
 
-        let bodyText = String(data: rawBody, encoding: .utf8) ?? ""
         guard (200..<300).contains(response.statusCode) else {
             let safeError = Self.extractSafeOAuthErrorMessage(from: rawBody, statusCode: response.statusCode)
             throw isRefresh
@@ -383,9 +382,16 @@ public actor PikraCodexSubscription {
     private let oauth: PikraCodexOAuth
     private let allowedBaseURL: URL
 
-    /// Retains rotated credentials if `onRefresh` transiently threw after a single-use token rotation.
-    private var pendingSave: (sourceRefreshToken: String?, credentials: PikraCodexCredentials)?
-    private var inFlightRefresh: (key: String, task: Task<PikraCodexCredentials, any Error>)?
+    private struct PendingSave {
+        let sourceAccountID: String?
+        let sourceRefreshToken: String?
+        let credentials: PikraCodexCredentials
+    }
+
+    /// Retains rotated credentials per account/token identity if `onRefresh` transiently threw or
+    /// was deferred across an account switch after a single-use token rotation.
+    private var pendingSaves: [String: PendingSave] = [:]
+    private var inFlightRefreshes: [String: Task<PikraCodexCredentials, any Error>] = [:]
 
     public init(
         credentials: @escaping @Sendable () async throws -> PikraCodexCredentials,
@@ -407,26 +413,26 @@ public actor PikraCodexSubscription {
     /// CLI token rotations while coalescing concurrent refreshes for the same account/token.
     public func currentCredentials(forceRefresh: Bool = false) async throws -> PikraCodexCredentials {
         let diskCreds = try await loadCredentials().normalized()
+        let diskKey = Self.identityKey(for: diskCreds)
 
-        // If a previous rotation succeeded in OAuth but `onRefresh` failed to persist, reuse the rotated
-        // credentials as long as the caller hasn't switched accounts on disk, and retry `onRefresh`.
+        // If a previous rotation succeeded in OAuth for this exact account/token but `onRefresh`
+        // failed or was deferred during an account switch, retry `onRefresh` only while the store
+        // still holds this account/token.
         let current: PikraCodexCredentials
-        if let pending = pendingSave {
-            if pending.sourceRefreshToken == diskCreds.refreshToken && pending.credentials.accountID == diskCreds.accountID {
-                try await onRefresh(pending.credentials)
-                pendingSave = nil
-                current = pending.credentials
-            } else {
-                pendingSave = nil
-                current = diskCreds
-            }
+        if let pending = pendingSaves[diskKey],
+           pending.sourceAccountID == diskCreds.accountID,
+           pending.sourceRefreshToken == diskCreds.refreshToken
+        {
+            try await onRefresh(pending.credentials)
+            pendingSaves.removeValue(forKey: diskKey)
+            current = pending.credentials
         } else {
             current = diskCreds
         }
 
         let key = Self.identityKey(for: current)
-        if let active = inFlightRefresh, active.key == key {
-            return try await active.task.value
+        if let activeTask = inFlightRefreshes[key] {
+            return try await activeTask.value
         }
 
         let isExpiring = current.expiresAt.map { $0.timeIntervalSinceNow <= Self.refreshLeewaySeconds } ?? false
@@ -439,19 +445,29 @@ public actor PikraCodexSubscription {
         let refreshTask = Task<PikraCodexCredentials, any Error> {
             try await oauth.refreshCredentials(current)
         }
-        inFlightRefresh = (key: key, task: refreshTask)
+        inFlightRefreshes[key] = refreshTask
         defer {
-            if inFlightRefresh?.key == key {
-                inFlightRefresh = nil
-            }
+            inFlightRefreshes.removeValue(forKey: key)
         }
 
         let refreshed = try await refreshTask.value
-        // Retain rotated token in memory BEFORE calling `onRefresh` so a transient persistence error
-        // never loses a single-use refresh token.
-        pendingSave = (sourceRefreshToken: current.refreshToken, credentials: refreshed)
-        try await onRefresh(refreshed)
-        pendingSave = nil
+        // Retain rotated token per account/token identity BEFORE persisting so a transient error
+        // or account switch never loses a single-use refresh token.
+        pendingSaves[key] = PendingSave(
+            sourceAccountID: current.accountID,
+            sourceRefreshToken: current.refreshToken,
+            credentials: refreshed
+        )
+
+        // Re-check the underlying store before invoking `onRefresh` so a late-finishing refresh
+        // for Account A never overwrites Account B after an account switch.
+        if let latestDisk = try? await loadCredentials().normalized(),
+           latestDisk.accountID == current.accountID,
+           latestDisk.refreshToken == current.refreshToken
+        {
+            try await onRefresh(refreshed)
+            pendingSaves.removeValue(forKey: key)
+        }
         return refreshed
     }
 
