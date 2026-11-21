@@ -482,12 +482,14 @@ impl Connection {
                     let _operation = session.steering.lock().await;
                     session.turn.begin()?
                 };
+                let is_meta = is_meta_prompt(&req);
                 encode(
                     turn::prompt(
                         &self.server,
                         &session,
                         guard,
                         req.prompt,
+                        is_meta,
                         cancel,
                         session_cancel,
                     )
@@ -793,13 +795,20 @@ impl Connection {
             () = cancel.cancelled() => return Err(acp::Error::request_cancelled()),
         };
         check_cancel(cancel, &self.peer)?;
+        let is_meta = is_meta_prompt(&req);
         let parts = turn::convert(&self.server, &session, req.prompt, cancel).await?;
         if let Some(state) = session.turn.current() {
             if state.running.load(std::sync::atomic::Ordering::Acquire)
                 && session.kit.is_running()
                 && !state.cancel.is_cancelled()
             {
-                session.steers.send(&session.kit, parts);
+                if is_meta {
+                    session
+                        .kit
+                        .steer_meta_parts(uuid::Uuid::new_v4().to_string(), parts);
+                } else {
+                    session.steers.send(&session.kit, parts);
+                }
                 return Ok(json!({"outcome":"injected"}));
             }
             if !prompt_required {
@@ -826,7 +835,7 @@ impl Connection {
                 state,
                 &never,
                 &never,
-                turn::run_prompt(&server, &session, state, parts),
+                turn::run_prompt(&server, &session, state, parts, is_meta),
             )
             .await;
             if result.is_err() {
@@ -854,4 +863,12 @@ fn check_cancel(cancel: &CancelToken, peer: &Peer) -> Result<()> {
 
 fn meta(value: Value) -> acp::Meta {
     serde_json::from_value(value).expect("ACP metadata is an object")
+}
+
+fn is_meta_prompt(req: &acp::PromptRequest) -> bool {
+    req.meta
+        .as_ref()
+        .and_then(|meta| meta.get("isMeta").or_else(|| meta.get("is_meta")))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }

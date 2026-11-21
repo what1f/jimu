@@ -397,8 +397,22 @@ export default function(pikra) {
     let (r_ctx1, _) = proc.read_response_for("ctx1").await;
     assert_eq!(r_ctx1["data"]["changed"], true);
 
+    for command in [
+        json!({"id":"append-ctx","type":"append_context","name":"fixture","text":"one-off RPC context"}),
+        json!({"id":"append-meta","type":"append_meta","text":"raw RPC context"}),
+        json!({"id":"steer-mode","type":"set_steering_mode","mode":"all"}),
+    ] {
+        proc.send_json(&command).await;
+        assert_eq!(
+            proc.read_response_for(command["id"].as_str().unwrap())
+                .await
+                .0["success"],
+            true
+        );
+    }
+
     // 4. Send prompt containing raw UTF-8 U+2028 inside JSON string (must not split record!).
-    let raw_prompt = "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"hello\u{2028}world\"}\r\n";
+    let raw_prompt = "{\"id\":\"p1\",\"type\":\"prompt\",\"isMeta\":true,\"message\":\"hello\u{2028}world\"}\r\n";
     proc.send_raw_bytes(raw_prompt.as_bytes()).await;
     let (p1_resp, _) = proc.read_response_for("p1").await;
     assert_eq!(p1_resp["success"], true);
@@ -449,6 +463,15 @@ export default function(pikra) {
     assert_eq!(st1_resp["success"], true);
     assert_eq!(st1_resp["data"]["disposition"], "queued");
 
+    proc.send_json(&json!({
+        "id":"hidden-steer","type":"steer","message":"hidden RPC steer","isMeta":true
+    }))
+    .await;
+    assert_eq!(
+        proc.read_response_for("hidden-steer").await.0["data"]["disposition"],
+        "queued"
+    );
+
     // Release Request 1 so tool calls run and queued steer is delivered to Request 2.
     release_req1.notify_one();
 
@@ -459,9 +482,8 @@ export default function(pikra) {
         let ev = proc.next_record().await;
         match ev["type"].as_str() {
             Some("steered") => {
-                if ev["text"] == "switch to beta" {
-                    saw_steered = true;
-                }
+                assert_eq!(ev["text"], "switch to beta");
+                saw_steered = true;
             }
             Some("tool_execution_end") => {
                 if ev["tool_name"] == "read" {
@@ -528,6 +550,51 @@ export default function(pikra) {
         let req2_str = serde_json::to_string(&bodies[1]).unwrap();
         assert!(req2_str.contains("[js-hook-ok]"));
         assert!(req2_str.contains("switch to beta"));
+        assert!(req2_str.contains("hidden RPC steer"));
+        assert!(req1_msgs.contains(&"raw RPC context"));
+        assert!(
+            req1_msgs
+                .iter()
+                .any(|text| text.contains("one-off RPC context"))
+        );
+        for body in &bodies[..2] {
+            let bytes = body.to_string();
+            assert!(!bytes.contains("is_meta") && !bytes.contains("isMeta"));
+        }
+    }
+
+    for include_meta in [true, false] {
+        let mut command = json!({"id":"msgs","type":"get_messages"});
+        if !include_meta {
+            command["includeMeta"] = json!(false);
+        }
+        proc.send_json(&command).await;
+        let (response, _) = proc.read_response_for("msgs").await;
+        let users = response["data"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .collect::<Vec<_>>();
+        assert!(
+            users
+                .iter()
+                .any(|user| user["content"][0]["text"] == "switch to beta")
+        );
+        for text in ["hello\u{2028}world", "raw RPC context", "hidden RPC steer"] {
+            let matching = users
+                .iter()
+                .filter(|user| user["content"][0]["text"] == text)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), usize::from(include_meta), "{text}");
+            assert!(
+                matching.iter().all(|user| user["is_meta"] == true),
+                "{text}"
+            );
+        }
+        if !include_meta {
+            assert_eq!(users.len(), 1);
+        }
     }
 
     // Check deduplication after turn flushed the context block onto the branch.
@@ -584,6 +651,13 @@ export default function(pikra) {
     let (ent_resp, _) = proc.read_response_for("ent1").await;
     let entries = ent_resp["data"]["entries"].as_array().unwrap();
     assert!(entries.len() >= 4);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["message"]["content"][0]["text"] == "raw RPC context")
+            .count(),
+        1
+    );
     let fork_target_id = entries[1]["id"].as_str().unwrap().to_string();
 
     proc.send_json(&json!({ "id": "fk1", "type": "fork", "entry_id": fork_target_id }))

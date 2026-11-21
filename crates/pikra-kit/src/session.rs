@@ -26,7 +26,7 @@ use pikra_codemode::CodemodeSandboxOptions;
 use pikra_session::{
     CompactionConfig, CompactionResult, CompactionStrategy, MemorySessionStore, SessionConfig,
     SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore, SessionTreeNode,
-    baseline_to_system_message, context_block_to_agent_message,
+    baseline_to_system_message, prepare_flushed_prompt,
 };
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -565,6 +565,10 @@ impl KitSession {
         self.agent.messages()
     }
 
+    pub fn visible_messages(&self) -> Vec<AgentMessage> {
+        self.agent.visible_messages()
+    }
+
     pub fn model(&self) -> Model {
         self.agent.model()
     }
@@ -739,6 +743,27 @@ impl KitSession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .append_context(text);
+    }
+
+    pub fn append_named_context(&self, name: impl Into<String>, text: impl Into<String>) {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_named_context(name, text);
+    }
+
+    pub fn append_meta(&self, text: impl Into<String>) {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_meta(text);
+    }
+
+    pub fn append_meta_parts(&self, content: Vec<ContentPart>) {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_meta_parts(content);
     }
 
     /// Dynamically add or update deferred tools while idle.
@@ -923,12 +948,28 @@ impl KitSession {
         self.agent.steer(id, text);
     }
 
+    pub fn steer_meta(&self, id: impl Into<String>, text: impl Into<String>) {
+        self.agent.steer_meta(id, text);
+    }
+
+    pub fn steer_meta_parts(&self, id: impl Into<String>, content: Vec<ContentPart>) {
+        self.agent.steer_meta_parts(id, content);
+    }
+
     pub fn drain_steering(&self) -> Vec<(String, Vec<ContentPart>)> {
         self.agent.drain_steering()
     }
 
     pub fn follow_up(&self, id: impl Into<String>, text: impl Into<String>) {
         self.agent.follow_up(id, text);
+    }
+
+    pub fn follow_up_meta(&self, id: impl Into<String>, text: impl Into<String>) {
+        self.agent.follow_up_meta(id, text);
+    }
+
+    pub fn follow_up_meta_parts(&self, id: impl Into<String>, content: Vec<ContentPart>) {
+        self.agent.follow_up_meta_parts(id, content);
     }
 
     pub fn abort_now(&self) {
@@ -960,12 +1001,24 @@ impl KitSession {
         &self,
         content: Vec<ContentPart>,
     ) -> Result<Vec<AgentMessage>, KitError> {
-        let user_msg = AgentMessage::Llm(Message::User(UserMessage {
-            id: None,
-            content,
-            timestamp: now_ms(),
-        }));
-        self.prompt_agent_message(user_msg).await
+        let user = Message::User(UserMessage::parts(content, now_ms()));
+        self.prompt_agent_message(user.into()).await
+    }
+
+    pub async fn prompt_meta(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<Vec<AgentMessage>, KitError> {
+        let user = Message::User(UserMessage::meta_text(text, now_ms()));
+        self.prompt_agent_message(user.into()).await
+    }
+
+    pub async fn prompt_meta_parts(
+        &self,
+        content: Vec<ContentPart>,
+    ) -> Result<Vec<AgentMessage>, KitError> {
+        let user = Message::User(UserMessage::meta_parts(content, now_ms()));
+        self.prompt_agent_message(user.into()).await
     }
 
     async fn prompt_agent_message(
@@ -1011,10 +1064,34 @@ impl KitSession {
 
     /// Run a text prompt as a stream of agent and session events.
     pub fn prompt_stream(&self, text: impl Into<String>) -> Result<KitEventStream<'_>, KitError> {
+        self.prompt_user_stream(UserMessage::text(text, now_ms()))
+    }
+
+    pub fn prompt_parts_stream(
+        &self,
+        content: Vec<ContentPart>,
+    ) -> Result<KitEventStream<'_>, KitError> {
+        self.prompt_user_stream(UserMessage::parts(content, now_ms()))
+    }
+
+    pub fn prompt_meta_stream(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<KitEventStream<'_>, KitError> {
+        self.prompt_user_stream(UserMessage::meta_text(text, now_ms()))
+    }
+
+    pub fn prompt_meta_parts_stream(
+        &self,
+        content: Vec<ContentPart>,
+    ) -> Result<KitEventStream<'_>, KitError> {
+        self.prompt_user_stream(UserMessage::meta_parts(content, now_ms()))
+    }
+
+    fn prompt_user_stream(&self, user: UserMessage) -> Result<KitEventStream<'_>, KitError> {
         let origin = KitTurnOrigin::Foreground;
         let activity = self.try_begin_activity(Activity::Prompt(origin))?;
-        let user_msg = AgentMessage::Llm(Message::User(UserMessage::text(text, now_ms())));
-        Ok(self.start_prompt_stream(Some(user_msg), origin, activity))
+        Ok(self.start_prompt_stream(Some(Message::User(user).into()), origin, activity))
     }
 
     fn start_prompt_stream(
@@ -1055,7 +1132,7 @@ impl KitSession {
         };
         let background = activity.start(origin);
         let user_msg = user_msg.unwrap_or_else(|| {
-            Message::User(UserMessage::text(
+            Message::User(UserMessage::meta_text(
                 background.expect("background turn has a reserved batch"),
                 now_ms(),
             ))
@@ -1121,27 +1198,23 @@ impl KitSession {
         let skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
         let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
         let content = match &user_msg {
-            AgentMessage::Llm(Message::User(user)) if origin == KitTurnOrigin::Foreground => {
+            AgentMessage::Llm(Message::User(user))
+                if origin == KitTurnOrigin::Foreground && !user.is_meta =>
+            {
                 Some(user.content.as_slice())
             }
             _ => None,
         };
-        let flushed = known.flush_for_prompt(&mut session, &skills, content)?;
-
-        let mut prompt_messages = Vec::with_capacity(flushed.len() + 1);
-        let mut events = Vec::with_capacity(flushed.len());
-        for entry in &flushed {
-            if let SessionEntryPayload::ContextBlock { name, text } = &entry.payload {
-                prompt_messages.push(context_block_to_agent_message(name, text, entry.timestamp));
-                events.push(SessionEvent::ContextAppended {
-                    name: name.clone(),
-                    text: text.clone(),
-                });
+        let flushed = match known.flush_for_prompt(&mut session, &skills, content) {
+            Ok(flushed) => flushed,
+            Err(err) => {
+                self.agent
+                    .replace_messages(session.reconstruct_context().messages)?;
+                return Err(err.into());
             }
-        }
-        let flushed_count = prompt_messages.len();
-        prompt_messages.push(user_msg);
-        Ok((prompt_messages, flushed_count, events))
+        };
+
+        Ok(prepare_flushed_prompt(flushed, user_msg))
     }
 
     async fn resolve_compaction_options(&self, model: &Model) -> SimpleStreamOptions {

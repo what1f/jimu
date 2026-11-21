@@ -442,6 +442,7 @@ fn anthropic_tool_result_merging_error_image_splitting_cache_control_and_cross_p
             sample_tools(),
             vec![
                 Message::User(UserMessage {
+                    is_meta: false,
                     id: None,
                     content: vec![
                         ContentPart::Text(TextContent::plain("Check this")),
@@ -1268,4 +1269,47 @@ fn anthropic_thinking_modes_budget_floor_root_schema_and_completions_tool_images
     assert!(trailing_parts.iter().any(|p| {
         p["type"] == "image_url" && p["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
     }));
+}
+
+#[test]
+fn hidden_user_flags_preserve_provider_request_bytes() {
+    let ordinary = UserMessage::text("Context for the model", 1);
+    let hidden: UserMessage = serde_json::from_value(json!({
+        "content": ordinary.content, "isMeta": true, "timestamp": 1,
+    }))
+    .unwrap();
+    assert!(hidden.is_meta);
+    assert_eq!(serde_json::to_value(&hidden).unwrap()["is_meta"], true);
+    assert!(
+        serde_json::to_value(&ordinary)
+            .unwrap()
+            .get("is_meta")
+            .is_none()
+    );
+
+    let transcript =
+        |user| TranscriptContext::new("Base", sample_tools(), vec![Message::User(user)]);
+    let (ordinary, hidden) = (transcript(ordinary), transcript(hidden));
+    let options = SimpleStreamOptions::default();
+    type BodyBuilder = fn(&Model, &TranscriptContext, &SimpleStreamOptions) -> Value;
+    for (model, build) in [
+        (
+            openai_responses_model(),
+            openai_responses::build_request_body as BodyBuilder,
+        ),
+        (
+            openai_completions_model(),
+            openai_completions::build_request_body,
+        ),
+        (anthropic_model(), anthropic_messages::build_request_body),
+        (google_model(), google_generative_ai::build_request_body),
+    ] {
+        let body = serde_json::to_string(&build(&model, &hidden, &options)).unwrap();
+        assert_eq!(
+            body,
+            serde_json::to_string(&build(&model, &ordinary, &options)).unwrap()
+        );
+        assert!(body.contains("Context for the model"));
+        assert!(!body.contains("is_meta") && !body.contains("isMeta"));
+    }
 }

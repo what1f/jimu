@@ -1531,7 +1531,7 @@ fn scoped_skills_search_reload_reopen_and_compact_without_prefix_drift() {
             .into_iter()
             .rev()
             .find_map(|entry| match entry.payload {
-                pikra_session::SessionEntryPayload::ContextBlock { name, text }
+                pikra_session::SessionEntryPayload::ContextBlock { name, text, .. }
                     if name == "skills" =>
                 {
                     Some(text)
@@ -1753,6 +1753,177 @@ fn background_events_coalesce_and_wait_for_clean_foreground_completion() {
                 .drain_background_prompt()
                 .unwrap()
                 .contains("<monitor_event>6</monitor_event>")
+        );
+    });
+}
+
+#[test]
+fn meta_context_is_delivered_and_persisted_without_visible_user_bubbles() {
+    use pikra_agent::AgentMessage;
+    use pikra_session::{JsonlSessionStore, SessionEntryPayload};
+
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let http = Arc::new(FauxTransport::new());
+        let provider = Arc::new(Client::new(http.clone()));
+        let config = KitSessionConfig::new(test_model())
+            .with_skill_discovery(SkillDiscoveryConfig {
+                include_agents_skills: false,
+                include_user_skills: false,
+                ..Default::default()
+            })
+            .with_store(Arc::new(JsonlSessionStore::new(
+                dir.path().join("meta.jsonl"),
+            )));
+        let session = KitSession::new(provider.clone(), config.clone()).unwrap();
+        assert!(session.set_context("env", "active-env"));
+        session.append_context("one-off-default");
+        session.append_named_context("env", "one-off-env");
+        session.append_meta("raw-meta");
+
+        let gate = http.enqueue_gated_sse();
+        for id in ["steer", "follow-up", "human", "background", "summary"] {
+            http.enqueue_sse(openai_sse_text(id, id));
+        }
+        let mut stream = session.prompt_meta_stream("direct-meta").unwrap();
+        let chunks = openai_sse_text("direct", "Got the context");
+        for chunk in &chunks[..2] {
+            assert!(gate.push_str(chunk));
+        }
+        loop {
+            let event = stream.next().await.unwrap();
+            assert!(!matches!(event, KitEvent::Error(_)), "{event:?}");
+            if matches!(
+                event,
+                KitEvent::Agent(AgentEvent::MessageUpdate {
+                    assistant_message_event: pikra_ai::AssistantMessageEvent::TextDelta { .. },
+                    ..
+                })
+            ) {
+                break;
+            }
+        }
+        session.steer_meta("s", "steer-meta");
+        session.follow_up_meta("f", "follow-up-meta");
+        for chunk in &chunks[2..] {
+            assert!(gate.push_str(chunk));
+        }
+        gate.close();
+
+        let mut steer_stages = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                KitEvent::Agent(AgentEvent::Steered { .. }) | KitEvent::Error(_) => {
+                    panic!("{event:?}")
+                }
+                KitEvent::Agent(AgentEvent::MessageStart {
+                    message: AgentMessage::Llm(Message::User(user)),
+                }) if user.id.as_deref() == Some("s") => steer_stages.push(("start", user.is_meta)),
+                KitEvent::Agent(AgentEvent::MessageEnd {
+                    message: AgentMessage::Llm(Message::User(user)),
+                }) if user.id.as_deref() == Some("s") => steer_stages.push(("end", user.is_meta)),
+                _ => {}
+            }
+        }
+        drop(stream);
+        assert_eq!(steer_stages, [("start", true), ("end", true)]);
+
+        let human = "<system-reminder>This is visible user text.</system-reminder>";
+        session.prompt(human).await.unwrap();
+        session.background_sender().send(BackgroundNotification {
+            source_id: "fixture".into(),
+            kind: "monitor".into(),
+            summary: "Background change".into(),
+            xml_payload: "<monitor_event>background-meta</monitor_event>".into(),
+            timestamp_ms: 1,
+        });
+        let mut stream = session.run_background_turn().unwrap().unwrap();
+        while let Some(event) = stream.next().await {
+            assert!(!matches!(event, KitEvent::Error(_)), "{event:?}");
+        }
+        drop(stream);
+
+        let meta_texts = [
+            "<system-reminder name=\"env\">\nactive-env\n</system-reminder>",
+            "<system-reminder name=\"context\">\none-off-default\n</system-reminder>",
+            "<system-reminder name=\"env\">\none-off-env\n</system-reminder>",
+            "raw-meta",
+            "direct-meta",
+            "steer-meta",
+            "follow-up-meta",
+            "<background_events>\n<monitor_event>background-meta</monitor_event>\n</background_events>",
+        ];
+        let users = |messages: Vec<AgentMessage>| {
+            messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    AgentMessage::Llm(Message::User(user)) => match user.content.as_slice() {
+                        [ContentPart::Text(text)] => Some((text.text.clone(), user.is_meta)),
+                        _ => panic!("expected a text message"),
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot = users(session.messages());
+        assert_eq!(snapshot.len(), meta_texts.len() + 1);
+        for text in meta_texts {
+            assert!(snapshot.contains(&(text.to_owned(), true)), "{text}");
+        }
+        assert_eq!(
+            users(session.visible_messages()),
+            [(human.to_owned(), false)]
+        );
+        let requests = http.requests();
+        assert_eq!(requests.len(), 5);
+        for request in &requests {
+            let body = request.body_json.to_string();
+            assert!(!body.contains("is_meta") && !body.contains("isMeta"));
+        }
+        let final_input = requests[4].body_json["input"].as_array().unwrap();
+        for text in meta_texts {
+            assert!(
+                final_input
+                    .iter()
+                    .any(|item| item["role"] == "user" && item["content"][0]["text"] == text),
+                "{text}"
+            );
+        }
+        drop(session);
+
+        let session = KitSession::new(provider.clone(), config.clone()).unwrap();
+        assert_eq!(users(session.messages()), snapshot);
+        assert!(!session.set_context("env", "active-env"));
+        assert!(session.compact().await.unwrap().is_some());
+        drop(session);
+
+        let session = KitSession::new(provider, config).unwrap();
+        let compacted = users(session.messages());
+        assert!(
+            compacted
+                .iter()
+                .any(|(text, meta)| *meta && text.starts_with("<compaction-summary>"))
+        );
+        assert!(compacted.contains(&(meta_texts[7].into(), true)));
+        let raw_entries = session
+            .entries()
+            .into_iter()
+            .filter_map(|entry| match entry.payload {
+                SessionEntryPayload::Message { message } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users(raw_entries)
+                .iter()
+                .filter(|(text, meta)| text == "raw-meta" && *meta)
+                .count(),
+            1
+        );
+        assert!(
+            users(session.visible_messages())
+                .iter()
+                .all(|(_, meta)| !meta)
         );
     });
 }

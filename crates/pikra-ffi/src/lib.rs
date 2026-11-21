@@ -335,6 +335,16 @@ pub unsafe extern "C" fn pikra_session_steer(
     id: *const c_char,
     text: *const c_char,
 ) -> bool {
+    unsafe { pikra_session_steer_ex(session, id, text, false) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_session_steer_ex(
+    session: *mut PikraSession,
+    id: *const c_char,
+    text: *const c_char,
+    is_meta: bool,
+) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
         if session.is_null() {
             return false;
@@ -347,7 +357,8 @@ pub unsafe extern "C" fn pikra_session_steer(
         };
         // SAFETY: Caller guarantees `session` is live.
         let s = unsafe { &*session };
-        s.inner.steer(id_str.to_string(), text_str.to_string())
+        s.inner
+            .steer(id_str.to_string(), text_str.to_string(), is_meta)
     }))
     .unwrap_or(false)
 }
@@ -357,6 +368,17 @@ pub unsafe extern "C" fn pikra_session_follow_up(
     session: *mut PikraSession,
     id: *const c_char,
     text: *const c_char,
+    out_error: *mut *mut c_char,
+) -> PikraStatus {
+    unsafe { pikra_session_follow_up_ex(session, id, text, false, out_error) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_session_follow_up_ex(
+    session: *mut PikraSession,
+    id: *const c_char,
+    text: *const c_char,
+    is_meta: bool,
     out_error: *mut *mut c_char,
 ) -> PikraStatus {
     catch_unwind(AssertUnwindSafe(|| {
@@ -378,7 +400,10 @@ pub unsafe extern "C" fn pikra_session_follow_up(
                 return PikraStatus::ErrInvalidArgument;
             }
         };
-        match s.inner.follow_up(id_str.to_string(), text_str.to_string()) {
+        match s
+            .inner
+            .follow_up(id_str.to_string(), text_str.to_string(), is_meta)
+        {
             Ok(()) => PikraStatus::Ok,
             Err((code, msg)) => {
                 unsafe { write_out_string(out_error, msg) };
@@ -462,6 +487,40 @@ pub unsafe extern "C" fn pikra_session_append_context(
     text: *const c_char,
     out_error: *mut *mut c_char,
 ) -> PikraStatus {
+    unsafe { pikra_session_append_named_context(session, c"context".as_ptr(), text, out_error) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_session_append_named_context(
+    session: *mut PikraSession,
+    name: *const c_char,
+    text: *const c_char,
+    out_error: *mut *mut c_char,
+) -> PikraStatus {
+    queue_session_context(session, text, out_error, |s, text| {
+        let name = unsafe { read_cstr(name, "name") }
+            .map_err(|err| (PikraStatus::ErrInvalidArgument, err))?;
+        s.inner.append_named_context(name.to_string(), text)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pikra_session_append_meta(
+    session: *mut PikraSession,
+    text: *const c_char,
+    out_error: *mut *mut c_char,
+) -> PikraStatus {
+    queue_session_context(session, text, out_error, |s, text| {
+        s.inner.append_meta(text)
+    })
+}
+
+fn queue_session_context(
+    session: *mut PikraSession,
+    text: *const c_char,
+    out_error: *mut *mut c_char,
+    append: impl FnOnce(&PikraSession, String) -> Result<(), (PikraStatus, String)>,
+) -> PikraStatus {
     catch_unwind(AssertUnwindSafe(|| {
         let s = match with_session(session, out_error) {
             Ok(s) => s,
@@ -474,7 +533,7 @@ pub unsafe extern "C" fn pikra_session_append_context(
                 return PikraStatus::ErrInvalidArgument;
             }
         };
-        match s.inner.append_context(text_str.to_string()) {
+        match append(s, text_str.to_string()) {
             Ok(()) => PikraStatus::Ok,
             Err((code, msg)) => {
                 unsafe { write_out_string(out_error, msg) };

@@ -11,7 +11,10 @@ use crate::types::{
     compaction_summary_to_agent_message, context_block_to_agent_message, now_ms,
 };
 use pikra_agent::AgentMessage;
-use pikra_ai::{Model, SimpleStreamOptions, StreamProvider, ThinkingLevel, ToolDefinition};
+use pikra_ai::{
+    ContentPart, Message, Model, SimpleStreamOptions, StreamProvider, TextContent, ThinkingLevel,
+    ToolDefinition, UserMessage,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -98,8 +101,9 @@ pub struct SessionManager {
     active_context_hashes: HashMap<String, [u8; 32]>,
     /// Named context blocks waiting to be flushed before the next user prompt.
     pending_context: Vec<(String, String)>,
-    /// One-off unnamed context blocks queued via `append_context`.
-    pending_ephemeral_context: Vec<String>,
+    /// One-off context blocks and raw meta messages queued for the next turn.
+    pending_ephemeral_context: Vec<(String, String)>,
+    pending_ephemeral_meta: Vec<Vec<ContentPart>>,
 
     compaction_config: CompactionConfig,
     compaction_strategy: Arc<dyn CompactionStrategy>,
@@ -154,6 +158,7 @@ impl SessionManager {
             active_context_hashes: HashMap::new(),
             pending_context: Vec::new(),
             pending_ephemeral_context: Vec::new(),
+            pending_ephemeral_meta: Vec::new(),
             compaction_config: config.compaction,
             compaction_strategy: strategy,
             listeners: Vec::new(),
@@ -332,22 +337,42 @@ impl SessionManager {
 
     /// Queue a one-off context block to be injected before the next user prompt.
     pub fn append_context(&mut self, text: impl Into<String>) {
-        self.pending_ephemeral_context.push(text.into());
+        self.append_named_context("context", text);
     }
 
-    /// Returns `true` if there are queued context blocks waiting to flush before the next turn.
+    /// Queue a one-off context block without changing the state set by `set_context`.
+    pub fn append_named_context(&mut self, name: impl Into<String>, text: impl Into<String>) {
+        self.pending_ephemeral_context
+            .push((name.into(), text.into()));
+    }
+
+    /// Queue a raw meta message for the next turn.
+    pub fn append_meta(&mut self, text: impl Into<String>) {
+        self.append_meta_parts(vec![ContentPart::Text(TextContent::plain(text))]);
+    }
+
+    /// Queue a raw multimodal meta message for the next turn.
+    pub fn append_meta_parts(&mut self, content: Vec<ContentPart>) {
+        self.pending_ephemeral_meta.push(content);
+    }
+
+    /// Returns `true` if there is queued context or meta input waiting for the next turn.
     pub fn has_pending_context(&self) -> bool {
-        !self.pending_context.is_empty() || !self.pending_ephemeral_context.is_empty()
+        !self.pending_context.is_empty()
+            || !self.pending_ephemeral_context.is_empty()
+            || !self.pending_ephemeral_meta.is_empty()
     }
 
-    /// Flush all pending named and ephemeral context blocks into the append-only session log,
+    /// Flush all pending context and meta messages into the append-only session log,
     /// emitting [`SessionEvent::ContextAppended`] for each written block.
     ///
-    /// Returns the appended `SessionEntry` items (which callers can turn into `AgentMessage`s via
-    /// [`context_block_to_agent_message`] immediately before the next user prompt).
+    /// Returns the appended context blocks and messages in transcript order.
     pub fn flush_pending_context(&mut self) -> Result<Vec<SessionEntry>, SessionError> {
-        let mut appended =
-            Vec::with_capacity(self.pending_context.len() + self.pending_ephemeral_context.len());
+        let mut appended = Vec::with_capacity(
+            self.pending_context.len()
+                + self.pending_ephemeral_context.len()
+                + self.pending_ephemeral_meta.len(),
+        );
 
         while let Some((name, text)) = self.pending_context.first().cloned() {
             let hash = sha256_bytes(&text);
@@ -358,6 +383,7 @@ impl SessionManager {
             let entry = self.append_payload(SessionEntryPayload::ContextBlock {
                 name: name.clone(),
                 text: text.clone(),
+                ephemeral: false,
             })?;
             self.pending_context.remove(0);
             self.active_context_hashes.insert(name.clone(), hash);
@@ -365,15 +391,21 @@ impl SessionManager {
             appended.push(entry);
         }
 
-        while let Some(text) = self.pending_ephemeral_context.first().cloned() {
-            let name = "context".to_string();
+        while let Some((name, text)) = self.pending_ephemeral_context.first().cloned() {
             let entry = self.append_payload(SessionEntryPayload::ContextBlock {
                 name: name.clone(),
                 text: text.clone(),
+                ephemeral: true,
             })?;
             self.pending_ephemeral_context.remove(0);
             self.emit(SessionEvent::ContextAppended { name, text });
             appended.push(entry);
+        }
+
+        while let Some(parts) = self.pending_ephemeral_meta.first().cloned() {
+            let message = Message::User(UserMessage::meta_parts(parts, now_ms())).into();
+            appended.push(self.append_message(message)?);
+            self.pending_ephemeral_meta.remove(0);
         }
 
         Ok(appended)
@@ -499,13 +531,21 @@ impl SessionManager {
                 SessionEntryPayload::ThinkingChange { level, fast } => {
                     thinking = Some((*level, *fast));
                 }
-                SessionEntryPayload::ContextBlock { name, text } => {
+                SessionEntryPayload::ContextBlock {
+                    name,
+                    text,
+                    ephemeral: false,
+                } => {
                     all_branch_context_blocks.insert(name.clone(), text.clone());
                 }
                 SessionEntryPayload::Compaction { .. } => {
                     latest_compaction_idx = Some(idx);
                 }
-                SessionEntryPayload::Message { .. } | SessionEntryPayload::Custom { .. } => {}
+                SessionEntryPayload::Message { .. }
+                | SessionEntryPayload::Custom { .. }
+                | SessionEntryPayload::ContextBlock {
+                    ephemeral: true, ..
+                } => {}
             }
         }
 
@@ -528,8 +568,14 @@ impl SessionManager {
                     SessionEntryPayload::Message { message } => {
                         messages.push(message.clone());
                     }
-                    SessionEntryPayload::ContextBlock { name, text } => {
-                        visible_ctx.insert(name.clone(), text.clone());
+                    SessionEntryPayload::ContextBlock {
+                        name,
+                        text,
+                        ephemeral,
+                    } => {
+                        if !ephemeral {
+                            visible_ctx.insert(name.clone(), text.clone());
+                        }
                         messages.push(context_block_to_agent_message(name, text, entry.timestamp));
                     }
                     SessionEntryPayload::SystemBaseline { .. }

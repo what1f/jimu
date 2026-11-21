@@ -358,16 +358,41 @@ pub struct UserMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub content: Vec<ContentPart>,
+    #[serde(default, alias = "isMeta", skip_serializing_if = "std::ops::Not::not")]
+    pub is_meta: bool,
     pub timestamp: u64,
 }
 
 impl UserMessage {
     pub fn text(text: impl Into<String>, timestamp: u64) -> Self {
+        Self::parts(vec![ContentPart::Text(TextContent::plain(text))], timestamp)
+    }
+
+    pub fn meta_text(text: impl Into<String>, timestamp: u64) -> Self {
+        Self::text(text, timestamp).with_meta(true)
+    }
+
+    pub fn parts(content: Vec<ContentPart>, timestamp: u64) -> Self {
         Self {
             id: None,
-            content: vec![ContentPart::Text(TextContent::plain(text))],
+            content,
+            is_meta: false,
             timestamp,
         }
+    }
+
+    pub fn meta_parts(content: Vec<ContentPart>, timestamp: u64) -> Self {
+        Self::parts(content, timestamp).with_meta(true)
+    }
+
+    pub fn with_id(mut self, id: Option<String>) -> Self {
+        self.id = id;
+        self
+    }
+
+    pub fn with_meta(mut self, is_meta: bool) -> Self {
+        self.is_meta = is_meta;
+        self
     }
 }
 

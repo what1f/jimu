@@ -23,8 +23,7 @@ use pikra_kit::{
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
-    SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
-    context_block_to_agent_message,
+    SessionEntryPayload, SessionEvent, SessionManager, SessionStore, prepare_flushed_prompt,
 };
 use pikra_tools::{
     BuiltinToolSet, SleepTool, WakeGate, WebFetchConfig, WebFetchTool, WorkspaceTools,
@@ -521,34 +520,29 @@ impl RpcRuntime {
                 message,
                 images,
                 streaming_behavior,
+                is_meta,
             } => {
-                self.handle_prompt(id, message, images, streaming_behavior)
+                self.handle_prompt(id, message, images, streaming_behavior, is_meta)
                     .await;
             }
-            RpcCommand::Steer { message, images } => {
-                let agent = self.current_agent();
-                let queue_id = Uuid::now_v7().to_string();
-                let parts = build_content_parts(message.clone(), images);
-                self.queued_steering
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back((queue_id.clone(), message));
-                agent.steer_with_parts(queue_id, parts);
+            RpcCommand::Steer {
+                message,
+                images,
+                is_meta,
+            } => {
+                self.queue_steer(message, images, is_meta);
                 self.writer.send_json(&RpcResponse::ok(
                     id,
                     command_name,
                     Some(json!({ "disposition": "queued" })),
                 ));
             }
-            RpcCommand::FollowUp { message, images } => {
-                let agent = self.current_agent();
-                let queue_id = Uuid::now_v7().to_string();
-                let parts = build_content_parts(message.clone(), images);
-                self.queued_follow_up
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back((queue_id.clone(), message));
-                agent.follow_up_with_parts(queue_id, parts);
+            RpcCommand::FollowUp {
+                message,
+                images,
+                is_meta,
+            } => {
+                self.queue_follow_up(message, images, is_meta);
                 self.writer.send_json(&RpcResponse::ok(
                     id,
                     command_name,
@@ -708,6 +702,22 @@ impl RpcRuntime {
                     Some(json!({ "changed": changed })),
                 ));
             }
+            RpcCommand::AppendContext { name, text } => {
+                self.current_session()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .append_named_context(name.as_deref().unwrap_or("context"), text);
+                self.writer
+                    .send_json(&RpcResponse::ok(id, command_name, None));
+            }
+            RpcCommand::AppendMeta { text, images } => {
+                self.current_session()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .append_meta_parts(build_content_parts(text, images));
+                self.writer
+                    .send_json(&RpcResponse::ok(id, command_name, None));
+            }
             RpcCommand::Compact {
                 custom_instructions,
             } => {
@@ -812,8 +822,13 @@ impl RpcRuntime {
                     Some(json!({ "tree": tree, "leaf_id": leaf_id })),
                 ));
             }
-            RpcCommand::GetMessages => {
-                let messages = self.current_agent().messages();
+            RpcCommand::GetMessages { include_meta } => {
+                let agent = self.current_agent();
+                let messages = if include_meta.unwrap_or(true) {
+                    agent.messages()
+                } else {
+                    agent.visible_messages()
+                };
                 self.writer.send_json(&RpcResponse::ok(
                     id,
                     command_name,
@@ -859,27 +874,51 @@ impl RpcRuntime {
         }
     }
 
+    fn queue_steer(&self, message: String, images: Option<Vec<RpcImageInput>>, is_meta: bool) {
+        let agent = self.current_agent();
+        let queue_id = Uuid::now_v7().to_string();
+        if is_meta {
+            agent.steer_meta_parts(queue_id, build_content_parts(message, images));
+        } else {
+            let parts = build_content_parts(message.clone(), images);
+            self.queued_steering
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((queue_id.clone(), message));
+            agent.steer_with_parts(queue_id, parts);
+        }
+    }
+
+    fn queue_follow_up(&self, message: String, images: Option<Vec<RpcImageInput>>, is_meta: bool) {
+        let agent = self.current_agent();
+        let queue_id = Uuid::now_v7().to_string();
+        let parts = build_content_parts(message.clone(), images);
+        self.queued_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((queue_id.clone(), message));
+        if is_meta {
+            agent.follow_up_meta_parts(queue_id, parts);
+        } else {
+            agent.follow_up_with_parts(queue_id, parts);
+        }
+    }
+
     async fn handle_prompt(
         &self,
         id: Option<String>,
         message: String,
         images: Option<Vec<RpcImageInput>>,
         streaming_behavior: Option<StreamingBehavior>,
+        is_meta: bool,
     ) {
         let mut active_guard = self.active_run.lock().await;
         self.reap_finished_run_locked(&mut active_guard).await;
 
         if active_guard.is_some() {
-            let agent = self.current_agent();
             match streaming_behavior {
                 Some(StreamingBehavior::Steer) => {
-                    let queue_id = Uuid::now_v7().to_string();
-                    let parts = build_content_parts(message.clone(), images);
-                    self.queued_steering
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back((queue_id.clone(), message));
-                    agent.steer_with_parts(queue_id, parts);
+                    self.queue_steer(message, images, is_meta);
                     self.writer.send_json(&RpcResponse::ok(
                         id,
                         "prompt",
@@ -887,13 +926,7 @@ impl RpcRuntime {
                     ));
                 }
                 Some(StreamingBehavior::FollowUp) => {
-                    let queue_id = Uuid::now_v7().to_string();
-                    let parts = build_content_parts(message.clone(), images);
-                    self.queued_follow_up
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back((queue_id.clone(), message));
-                    agent.follow_up_with_parts(queue_id, parts);
+                    self.queue_follow_up(message, images, is_meta);
                     self.writer.send_json(&RpcResponse::ok(
                         id,
                         "prompt",
@@ -925,11 +958,8 @@ impl RpcRuntime {
         }
 
         let content = build_content_parts(message, images);
-        let user_msg = AgentMessage::Llm(Message::User(UserMessage {
-            id: None,
-            content,
-            timestamp: now_ms(),
-        }));
+        let user_msg =
+            Message::User(UserMessage::parts(content, now_ms()).with_meta(is_meta)).into();
 
         let session = self.current_session();
         let agent = self.current_agent();
@@ -939,6 +969,7 @@ impl RpcRuntime {
             let flushed = match sess.flush_pending_context() {
                 Ok(f) => f,
                 Err(err) => {
+                    let _ = agent.replace_messages(sess.reconstruct_context().messages);
                     self.writer.send_json(&RpcResponse::ok(
                         id,
                         "prompt",
@@ -951,20 +982,7 @@ impl RpcRuntime {
                     return;
                 }
             };
-            let mut msgs = Vec::with_capacity(flushed.len() + 1);
-            let mut events = Vec::with_capacity(flushed.len());
-            for entry in &flushed {
-                if let SessionEntryPayload::ContextBlock { name, text } = &entry.payload {
-                    msgs.push(context_block_to_agent_message(name, text, entry.timestamp));
-                    events.push(SessionEvent::ContextAppended {
-                        name: name.clone(),
-                        text: text.clone(),
-                    });
-                }
-            }
-            let count = msgs.len();
-            msgs.push(user_msg);
-            (msgs, count, events)
+            prepare_flushed_prompt(flushed, user_msg)
         };
 
         let running = Arc::new(AtomicBool::new(true));
@@ -1740,20 +1758,7 @@ impl RpcRuntime {
             let flushed = sess
                 .flush_pending_context()
                 .map_err(|e| format!("failed to flush pending context: {e}"))?;
-            let mut msgs = Vec::with_capacity(flushed.len() + 1);
-            let mut events = Vec::with_capacity(flushed.len());
-            for entry in &flushed {
-                if let SessionEntryPayload::ContextBlock { name, text } = &entry.payload {
-                    msgs.push(context_block_to_agent_message(name, text, entry.timestamp));
-                    events.push(SessionEvent::ContextAppended {
-                        name: name.clone(),
-                        text: text.clone(),
-                    });
-                }
-            }
-            let count = msgs.len();
-            msgs.push(user_msg);
-            (msgs, count, events)
+            prepare_flushed_prompt(flushed, user_msg)
         };
 
         if mode == CliMode::Json {

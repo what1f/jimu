@@ -357,7 +357,7 @@ pub(crate) fn select_first_kept_entry_id(
     for rel_idx in (0..slice.len()).rev() {
         let entry_tokens = match &slice[rel_idx].payload {
             SessionEntryPayload::Message { message } => estimate_agent_message_tokens(message),
-            SessionEntryPayload::ContextBlock { name, text } => {
+            SessionEntryPayload::ContextBlock { name, text, .. } => {
                 chars_to_tokens(name.len() + text.len() + 40)
             }
             _ => 0,

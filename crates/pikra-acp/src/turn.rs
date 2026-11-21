@@ -8,12 +8,13 @@ use crate::{
 };
 use base64::Engine;
 use futures_util::{StreamExt, stream};
-use pikra_agent::AgentMessage;
+use pikra_agent::{AgentEvent, AgentMessage};
 use pikra_ai::{
     AssistantBlock, AssistantEventStream, AssistantMessageEvent, BoxFuture, CancelToken,
     ContentPart, HttpTransport, ImageContent, Message, Model, SimpleStreamOptions, StopReason,
     StreamProvider, TextContent, TranscriptContext, Usage, UserMessage,
 };
+use pikra_kit::KitEvent;
 use pikra_session::{
     CompactionInput, CompactionOutput, CompactionStrategy, DefaultCompactionStrategy, SessionEntry,
     SessionEntryPayload, SessionError, SessionHeader, SessionStore,
@@ -129,7 +130,8 @@ impl Steers {
     }
 
     fn apply(&self, user: &mut UserMessage, bridge: Option<&Bridge>) {
-        if let Some(id) = &user.id
+        if !user.is_meta
+            && let Some(id) = &user.id
             && let Some((parts, announced)) = self.items.lock().unwrap().get_mut(id)
         {
             user.content.clone_from(parts);
@@ -478,12 +480,13 @@ pub(crate) async fn prompt(
     session: &Session,
     guard: TurnGuard,
     items: Vec<acp::ContentBlock>,
+    is_meta: bool,
     rpc_cancel: &CancelToken,
     session_cancel: &CancelToken,
 ) -> Result<acp::PromptResponse> {
     let run = async {
         let parts = convert(server, session, items, &guard.state.cancel).await?;
-        run_prompt(server, session, &guard.state, parts).await
+        run_prompt(server, session, &guard.state, parts, is_meta).await
     };
     drive(session, &guard.state, rpc_cancel, session_cancel, run).await
 }
@@ -532,12 +535,14 @@ pub(crate) async fn run_prompt(
     session: &Session,
     state: &TurnState,
     mut parts: Vec<ContentPart>,
+    is_meta: bool,
 ) -> Result<acp::PromptResponse> {
     if state.cancel.is_cancelled() {
         return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
     }
     let first_text = parts
         .first()
+        .filter(|_| !is_meta)
         .and_then(|part| match part {
             ContentPart::Text(text) => Some(text.text.trim_start()),
             _ => None,
@@ -583,22 +588,28 @@ pub(crate) async fn run_prompt(
         return Err(acp::Error::auth_required());
     }
     let before = session.kit.leaf_id();
-    let (stop, result) = if compact {
-        let result = session.kit.compact().await.map(|_| Vec::new());
-        (StopReason::Stop, result)
+    let (stop, failed_turn) = if compact {
+        (StopReason::Stop, session.kit.compact().await.is_err())
     } else {
-        let result = session.kit.prompt_parts(parts.clone()).await;
-        let stop = result
-            .as_ref()
-            .ok()
-            .and_then(|messages| {
-                messages.iter().rev().find_map(|message| match message {
-                    AgentMessage::Llm(Message::Assistant(message)) => Some(message.stop_reason),
-                    _ => None,
-                })
-            })
-            .unwrap_or(StopReason::Stop);
-        (stop, result)
+        let stream = if is_meta {
+            session.kit.prompt_meta_parts_stream(parts.clone())
+        } else {
+            session.kit.prompt_parts_stream(parts.clone())
+        };
+        let mut stop = StopReason::Stop;
+        let mut failed_turn = stream.is_err();
+        if let Ok(mut stream) = stream {
+            while let Some(event) = stream.next().await {
+                match event {
+                    KitEvent::Agent(AgentEvent::TurnEnd { message, .. }) => {
+                        stop = message.stop_reason
+                    }
+                    KitEvent::Error(_) => failed_turn = true,
+                    _ => {}
+                }
+            }
+        }
+        (stop, failed_turn)
     };
 
     let entries = branch(session.kit.entries());
@@ -619,7 +630,8 @@ pub(crate) async fn run_prompt(
 
     let meta = session.metadata();
     if (!compact || compacted) && latest.clone().next().is_some() {
-        let title = if meta.title.is_none() && !compact && !state.cancel.is_cancelled() {
+        let title = if meta.title.is_none() && !is_meta && !compact && !state.cancel.is_cancelled()
+        {
             let plain = visible_text(&parts);
             let line = plain.split_whitespace().collect::<Vec<_>>().join(" ");
             (!line.is_empty()).then(|| line.chars().take(60).collect::<String>())
@@ -687,7 +699,7 @@ pub(crate) async fn run_prompt(
 
     let reason = if state.cancel.is_cancelled() || stop == StopReason::Aborted {
         acp::StopReason::Cancelled
-    } else if result.is_err() || stop == StopReason::Error {
+    } else if failed_turn || stop == StopReason::Error {
         return Err(failed("The model could not complete the request."));
     } else if stop == StopReason::Length {
         acp::StopReason::MaxTokens
@@ -745,7 +757,7 @@ pub(crate) async fn replay(session: &Session, cancel: &CancelToken) -> Result<()
         match entry.payload {
             SessionEntryPayload::Message {
                 message: AgentMessage::Llm(Message::User(user)),
-            } => {
+            } if !user.is_meta => {
                 for part in &user.content {
                     bridge.update(acp::SessionUpdate::UserMessageChunk(
                         acp::ContentChunk::new(content_block(part)),

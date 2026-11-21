@@ -21,8 +21,7 @@ use pikra_kit::{
 };
 use pikra_session::{
     CompactionConfig, CompactionResult, JsonlSessionStore, MemorySessionStore, SessionConfig,
-    SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
-    context_block_to_agent_message,
+    SessionEntry, SessionEvent, SessionManager, SessionStore, prepare_flushed_prompt,
 };
 use serde_json::Map;
 use std::ffi::{CString, c_char, c_void};
@@ -396,11 +395,12 @@ impl FfiSession {
             });
         }
 
-        let user_msg = AgentMessage::Llm(Message::User(UserMessage {
-            id: req.id,
-            content: req.content,
-            timestamp: now_ms(),
-        }));
+        let user_msg = Message::User(
+            UserMessage::parts(req.content, now_ms())
+                .with_id(req.id)
+                .with_meta(req.is_meta),
+        )
+        .into();
 
         let (prompt_messages, flushed_count, flushed_events) =
             match self.prepare_turn_prompt_messages(user_msg) {
@@ -431,6 +431,7 @@ impl FfiSession {
             }
 
             if prompt_cancel.is_cancelled() || this.is_closed() {
+                this.restore_persisted_messages();
                 emit(&FfiEvent::TurnEnded {
                     stop_reason: StopReason::Aborted,
                     user_message_kept: false,
@@ -615,6 +616,10 @@ impl FfiSession {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
 
+            if (flushed_count > 0 && !user_message_kept) || persist_err.is_some() {
+                this.restore_persisted_messages();
+            }
+
             // Run auto-compaction if needed, not cancelled, and persistence succeeded.
             if persist_err.is_none() && !prompt_cancel.is_cancelled() && !this.is_closed() {
                 let _ = this
@@ -664,46 +669,61 @@ impl FfiSession {
                 let skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
                 let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());
                 let content = match &user_msg {
-                    AgentMessage::Llm(Message::User(user)) => Some(user.content.as_slice()),
+                    AgentMessage::Llm(Message::User(user)) if !user.is_meta => {
+                        Some(user.content.as_slice())
+                    }
                     _ => None,
                 };
                 known.flush_for_prompt(&mut session, &skills, content)
             } else {
                 session.flush_pending_context()
             }
-            .map_err(|e| format!("failed to flush pending context: {e}"))?
         };
-
-        let mut prompt_messages = Vec::with_capacity(flushed.len() + 1);
-        let mut events = Vec::with_capacity(flushed.len());
-        for entry in &flushed {
-            if let SessionEntryPayload::ContextBlock { name, text } = &entry.payload {
-                prompt_messages.push(context_block_to_agent_message(name, text, entry.timestamp));
-                events.push(SessionEvent::ContextAppended {
-                    name: name.clone(),
-                    text: text.clone(),
-                });
+        match flushed {
+            Ok(flushed) => Ok(prepare_flushed_prompt(flushed, user_msg)),
+            Err(err) => {
+                self.restore_persisted_messages();
+                Err(format!("failed to flush pending context: {err}"))
             }
         }
-        let flushed_count = prompt_messages.len();
-        prompt_messages.push(user_msg);
-        Ok((prompt_messages, flushed_count, events))
     }
 
-    pub(crate) fn steer(&self, id: String, text: String) -> bool {
+    fn restore_persisted_messages(&self) {
+        let reconstructed = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reconstruct_context();
+        let _ = self.agent.replace_messages(reconstructed.messages);
+    }
+
+    pub(crate) fn steer(&self, id: String, text: String, is_meta: bool) -> bool {
         let state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed || (state.active.is_none() && !self.agent.is_running()) {
             return false;
         }
-        self.agent.steer(id, text);
+        if is_meta {
+            self.agent.steer_meta(id, text);
+        } else {
+            self.agent.steer(id, text);
+        }
         true
     }
 
-    pub(crate) fn follow_up(&self, id: String, text: String) -> Result<(), (PikraStatus, String)> {
+    pub(crate) fn follow_up(
+        &self,
+        id: String,
+        text: String,
+        is_meta: bool,
+    ) -> Result<(), (PikraStatus, String)> {
         if self.is_closed() {
             return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
         }
-        self.agent.follow_up(id, text);
+        if is_meta {
+            self.agent.follow_up_meta(id, text);
+        } else {
+            self.agent.follow_up(id, text);
+        }
         Ok(())
     }
 
@@ -782,14 +802,26 @@ impl FfiSession {
         Ok(changed)
     }
 
-    pub(crate) fn append_context(&self, text: String) -> Result<(), (PikraStatus, String)> {
+    pub(crate) fn append_named_context(
+        &self,
+        name: String,
+        text: String,
+    ) -> Result<(), (PikraStatus, String)> {
+        self.queue_context(|session| session.append_named_context(name, text))
+    }
+
+    pub(crate) fn append_meta(&self, text: String) -> Result<(), (PikraStatus, String)> {
+        self.queue_context(|session| session.append_meta(text))
+    }
+
+    fn queue_context(
+        &self,
+        append: impl FnOnce(&mut SessionManager),
+    ) -> Result<(), (PikraStatus, String)> {
         if self.is_closed() {
             return Err((PikraStatus::ErrClosed, "session is closed".to_string()));
         }
-        self.session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_context(text);
+        append(&mut self.session.lock().unwrap_or_else(|e| e.into_inner()));
         Ok(())
     }
 

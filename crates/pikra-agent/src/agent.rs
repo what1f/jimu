@@ -591,6 +591,20 @@ impl Agent {
             .clone()
     }
 
+    /// Return the transcript for display.
+    pub fn visible_messages(&self) -> Vec<AgentMessage> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .messages
+            .iter()
+            .filter(|message| {
+                !matches!(message, AgentMessage::Llm(Message::System(_))) && !message.is_meta()
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn is_running(&self) -> bool {
         self.inner
             .lock()
@@ -736,35 +750,51 @@ impl Agent {
     // ---- Steering & Follow-Up Queues (Always Thread-Safe) ----
 
     pub fn steer(&self, id: impl Into<String>, text: impl Into<String>) {
-        self.queues
-            .steering
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .enqueue(QueuedInput::text(id, text));
+        self.enqueue_steer(QueuedInput::new(id, text));
     }
 
     pub fn steer_with_parts(&self, id: impl Into<String>, content: Vec<ContentPart>) {
+        self.enqueue_steer(QueuedInput::from_parts(id, content));
+    }
+
+    pub fn steer_meta(&self, id: impl Into<String>, text: impl Into<String>) {
+        self.enqueue_steer(QueuedInput::meta(id, text));
+    }
+
+    pub fn steer_meta_parts(&self, id: impl Into<String>, content: Vec<ContentPart>) {
+        self.enqueue_steer(QueuedInput::meta_parts(id, content));
+    }
+
+    fn enqueue_steer(&self, input: QueuedInput) {
         self.queues
             .steering
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .enqueue(QueuedInput::from_parts(id, content));
+            .enqueue(input);
     }
 
     pub fn follow_up(&self, id: impl Into<String>, text: impl Into<String>) {
-        self.queues
-            .follow_up
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .enqueue(QueuedInput::text(id, text));
+        self.enqueue_follow_up(QueuedInput::new(id, text));
     }
 
     pub fn follow_up_with_parts(&self, id: impl Into<String>, content: Vec<ContentPart>) {
+        self.enqueue_follow_up(QueuedInput::from_parts(id, content));
+    }
+
+    pub fn follow_up_meta(&self, id: impl Into<String>, text: impl Into<String>) {
+        self.enqueue_follow_up(QueuedInput::meta(id, text));
+    }
+
+    pub fn follow_up_meta_parts(&self, id: impl Into<String>, content: Vec<ContentPart>) {
+        self.enqueue_follow_up(QueuedInput::meta_parts(id, content));
+    }
+
+    fn enqueue_follow_up(&self, input: QueuedInput) {
         self.queues
             .follow_up
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .enqueue(QueuedInput::from_parts(id, content));
+            .enqueue(input);
     }
 
     pub fn set_steering_mode(&self, mode: QueueMode) {
@@ -909,12 +939,24 @@ impl Agent {
         &self,
         content: Vec<ContentPart>,
     ) -> Result<Vec<AgentMessage>, AgentError> {
-        let msg = AgentMessage::Llm(Message::User(UserMessage {
-            id: None,
-            content,
-            timestamp: now_ms(),
-        }));
-        self.prompt_messages(vec![msg]).await
+        let msg = Message::User(UserMessage::parts(content, now_ms()));
+        self.prompt_messages(vec![msg.into()]).await
+    }
+
+    pub async fn prompt_meta(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<Vec<AgentMessage>, AgentError> {
+        let msg = Message::User(UserMessage::meta_text(text, now_ms()));
+        self.prompt_messages(vec![msg.into()]).await
+    }
+
+    pub async fn prompt_meta_parts(
+        &self,
+        content: Vec<ContentPart>,
+    ) -> Result<Vec<AgentMessage>, AgentError> {
+        let msg = Message::User(UserMessage::meta_parts(content, now_ms()));
+        self.prompt_messages(vec![msg.into()]).await
     }
 
     /// Run one or more custom/LLM messages as a prompt to completion.
@@ -943,6 +985,14 @@ impl Agent {
     ) -> Result<AgentEventStream<'_>, AgentError> {
         let msg = AgentMessage::Llm(Message::User(UserMessage::text(text, now_ms())));
         self.prompt_messages_stream(vec![msg])
+    }
+
+    pub fn prompt_meta_stream(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<AgentEventStream<'_>, AgentError> {
+        let msg = Message::User(UserMessage::meta_text(text, now_ms()));
+        self.prompt_messages_stream(vec![msg.into()])
     }
 
     /// Run one or more messages as a [`Stream`] of [`AgentEvent`]s.

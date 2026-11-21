@@ -211,6 +211,53 @@ func testModel(
 
 @Suite("PikraKit End-to-End Tests")
 struct PikraKitE2ETests {
+    @Test
+    func metaInputsReachModelAndMarkSessionEntriesWithoutSteeringEvent() async throws {
+        let requested = Signal()
+        let allowReply = Signal()
+        let http = MockSSEClient(handlers: [
+            { _, _ in
+                await requested.fire()
+                await allowReply.wait()
+                return MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "First reply"))
+            },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "After steer")) },
+        ])
+        let agent = try await PikraAgent.open(configuration: PikraConfiguration(
+            model: testModel(), systemPrompt: "Base", httpClient: http
+        ))
+        try await agent.appendContext("named context", name: "fixture")
+        try await agent.appendMeta("raw context")
+        let stream = try await agent.prompt("hidden prompt", isMeta: true)
+        await requested.wait()
+        #expect(await agent.steer(text: "hidden steer", id: "meta-steer", isMeta: true))
+        await allowReply.fire()
+
+        let events = try await collectEvents(stream)
+        #expect(!events.contains { if case .steered = $0 { true } else { false } })
+        #expect(events.last == .turnEnded(stopReason: .stop, userMessageKept: true, errorMessage: nil))
+        let entries = try await agent.entries()
+        let context = try #require(entries.first { $0.type == "context_block" && $0.raw["name"]?.stringValue == "fixture" })
+        #expect(context.isMeta)
+        let users = entries.filter { $0.raw["message"]?["role"]?.stringValue == "user" }
+        #expect(users.count == 3)
+        #expect(users.allSatisfy { $0.isMeta })
+        #expect(entries.contains { $0.raw["message"]?["role"]?.stringValue == "assistant" && !$0.isMeta })
+
+        let requests = await http.recordedRequests()
+        #expect(requests.count == 2)
+        for request in requests {
+            let body = String(decoding: request.body, as: UTF8.self)
+            #expect(!body.contains("isMeta") && !body.contains("is_meta"))
+        }
+        let final = try #require(requests.last)
+        let body = String(decoding: final.body, as: UTF8.self)
+        for text in ["named context", "raw context", "hidden prompt", "hidden steer"] {
+            #expect(body.contains(text))
+        }
+        await agent.close()
+    }
+
 
     @Test("1. Multi-turn streaming, cache prefix stability, deferred tools, approval, codemode exec, JS extension & auto-compaction")
     func multiTurnFullStackE2E() async throws {

@@ -1173,3 +1173,95 @@ fn staged_tool_document_writes_commit_atomically_and_never_orphan_on_crash_or_er
         "parking tool must commit staged document writes atomically with ParkState"
     );
 }
+
+#[test]
+fn durable_meta_survives_restart_and_preserves_context_deduplication() {
+    block_on(async {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.sqlite");
+        let store = Arc::new(SqliteDurableStore::open(&path).unwrap());
+        let http = Arc::new(FauxTransport::new());
+        http.enqueue_sse(sse_text_response("meta", "Acknowledged", 40, 4));
+        let engine = DurableEngine::new(store.clone(), provider_for(http.clone()));
+        engine
+            .create_conversation("meta", test_model(128_000, 4_096), "Base")
+            .unwrap();
+        assert!(
+            engine
+                .set_context("meta", "env", "active env")
+                .await
+                .unwrap()
+        );
+        let head = store
+            .load_entries("meta")
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            !engine
+                .set_context("meta", "env", "active env")
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.load_entries("meta").unwrap().last().unwrap().id, head);
+        engine
+            .append_context("meta", "env", "one-off env")
+            .await
+            .unwrap();
+        engine
+            .append_meta("meta", "raw durable context")
+            .await
+            .unwrap();
+        engine
+            .submit_meta("meta", "first", "hidden durable prompt")
+            .await
+            .unwrap();
+        drop(engine);
+        drop(store);
+
+        let store = Arc::new(SqliteDurableStore::open(&path).unwrap());
+        let engine = DurableEngine::new(store, provider_for(http.clone()));
+        engine
+            .submit_meta("meta", "first", "ignore this retry")
+            .await
+            .unwrap();
+        assert!(
+            !engine
+                .set_context("meta", "env", "active env")
+                .await
+                .unwrap()
+        );
+        let context = engine.reconstruct_context("meta").unwrap();
+        let messages: Vec<_> = context
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                pikra_agent::AgentMessage::Llm(Message::User(user)) => Some(user),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages.len(), 4);
+        assert!(messages.iter().all(|user| user.is_meta));
+        assert_eq!(http.request_count(), 1);
+        let request = &http.requests()[0].body_json;
+        let input = request["input"].as_array().unwrap();
+        let users: Vec<_> = input
+            .iter()
+            .filter(|item| item["role"] == "user")
+            .map(|item| item["content"][0]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            users,
+            [
+                "<system-reminder name=\"env\">\nactive env\n</system-reminder>",
+                "<system-reminder name=\"env\">\none-off env\n</system-reminder>",
+                "raw durable context",
+                "hidden durable prompt",
+            ]
+        );
+        let body = request.to_string();
+        assert!(!body.contains("is_meta") && !body.contains("isMeta"));
+    });
+}

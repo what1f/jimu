@@ -58,6 +58,17 @@ pub enum AgentMessage {
     },
 }
 
+impl AgentMessage {
+    /// Whether the message is hidden from the user-facing transcript.
+    pub fn is_meta(&self) -> bool {
+        match self {
+            Self::Llm(Message::User(user)) => user.is_meta,
+            Self::Custom { display, .. } => !display,
+            _ => false,
+        }
+    }
+}
+
 impl From<Message> for AgentMessage {
     fn from(m: Message) -> Self {
         Self::Llm(m)

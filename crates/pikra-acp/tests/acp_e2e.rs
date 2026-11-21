@@ -921,3 +921,205 @@ done
     assert!(requests[3].to_string().contains("keep the tool outcome"));
     assert!(requests[4].to_string().contains("Start from idle"));
 }
+
+#[tokio::test]
+async fn acp_replays_visible_turns_and_sends_hidden_history_to_the_model() {
+    use futures_util::StreamExt;
+    use pikra_ai::{ApiKind, Client as ModelClient, Model};
+    use pikra_kit::{BackgroundNotification, KitEvent, KitSession, KitSessionConfig};
+    use pikra_session::JsonlSessionStore;
+    use pikra_testkit::FauxTransport;
+
+    let model = ModelFixture::start(vec![
+        tool(
+            "meta-gate",
+            "write",
+            json!({"path":"meta-fixture.txt","content":"fixture"}),
+        ),
+        text("Hidden reply"),
+        text("Visible reply"),
+        text("After load"),
+    ])
+    .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let cwd = workspace.path();
+    std::fs::write(cwd.join("AGENTS.md"), "ACP project context").unwrap();
+    let created_id = Arc::new(Mutex::new(None));
+    Client
+        .v1()
+        .on_receive_request(
+            async move |req: RequestPermissionRequest, reply, cx: ConnectionTo<Agent>| {
+                let connection = cx.clone();
+                cx.spawn(async move {
+                    let steer = agent_client_protocol::UntypedMessage::new(
+                        "_session/steering",
+                        json!({
+                            "sessionId":req.session_id,
+                            "prompt":[{"type":"text","text":"Hidden ACP steer"}],
+                            "_meta":{"is_meta":true,"steering":{"idleBehavior":"promptRequired"}}
+                        }),
+                    )?;
+                    let response: Value = connection.send_request(steer).block_task().await?;
+                    assert_eq!(response["outcome"], "injected");
+                    reply.respond(approved())
+                })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            async |notification: SessionNotification, _| {
+                assert!(!matches!(
+                    notification.update,
+                    SessionUpdate::UserMessageChunk(_)
+                ));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            model.agent(home.path(), false),
+            async |cx: ConnectionTo<Agent>| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let id = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let request = PromptRequest::new(id.clone(), vec!["/plan hidden ACP text".into()])
+                    .meta(serde_json::from_value::<Meta>(json!({"isMeta":true})).unwrap());
+                assert_eq!(
+                    cx.send_request(request).block_task().await?.stop_reason,
+                    StopReason::EndTurn
+                );
+                let listed = cx
+                    .send_request(ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                assert!(listed.sessions[0].title.is_none());
+                assert_eq!(
+                    ask(&cx, &id, "Visible ACP input").await?.stop_reason,
+                    StopReason::EndTurn
+                );
+                *created_id.lock().unwrap() = Some(id);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let id = created_id.lock().unwrap().take().unwrap();
+
+    // A host can write a background turn into the same journal before ACP loads it.
+    let http = Arc::new(FauxTransport::new());
+    http.enqueue_sse([
+        r#"data: {"id":"background","choices":[{"index":0,"delta":{"content":"Background reply"},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+    ].map(|line| format!("{line}\n\n")));
+    let journal = home
+        .path()
+        .join("acp/sessions")
+        .join(format!("{}.jsonl", id.0));
+    let session = KitSession::new(
+        Arc::new(ModelClient::new(http)),
+        KitSessionConfig::new(Model {
+            id: "gpt-5.4".into(),
+            name: "Fixture".into(),
+            provider: "openai".into(),
+            api: ApiKind::OpenaiCompletions,
+            base_url: model.url.clone(),
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            supports_images: false,
+            supports_reasoning: false,
+            cost: Default::default(),
+            headers: Vec::new(),
+            compat: None,
+        })
+        .with_store(Arc::new(JsonlSessionStore::new(journal))),
+    )
+    .unwrap();
+    session.background_sender().send(BackgroundNotification {
+        source_id: "fixture".into(),
+        kind: "monitor".into(),
+        summary: "Background context".into(),
+        xml_payload: "<monitor_event>ACP background context</monitor_event>".into(),
+        timestamp_ms: 1,
+    });
+    let mut turn = session.run_background_turn().unwrap().unwrap();
+    while let Some(event) = turn.next().await {
+        assert!(!matches!(event, KitEvent::Error(_)), "{event:?}");
+    }
+    drop(turn);
+    drop(session);
+
+    let updates = Updates::default();
+    Client
+        .v1()
+        .on_receive_notification(
+            {
+                let updates = updates.clone();
+                async move |notification: SessionNotification, _| {
+                    updates.lock().unwrap().push(notification);
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            model.agent(home.path(), false),
+            async |cx: ConnectionTo<Agent>| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                cx.send_request(LoadSessionRequest::new(id.clone(), cwd))
+                    .block_task()
+                    .await?;
+                let replayed = updates
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|notification| {
+                        Some(match &notification.update {
+                            SessionUpdate::UserMessageChunk(chunk) => {
+                                ("user", chunk.content.clone())
+                            }
+                            SessionUpdate::AgentMessageChunk(chunk) => {
+                                ("assistant", chunk.content.clone())
+                            }
+                            _ => return None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    replayed,
+                    [
+                        ("assistant", "Hidden reply".into()),
+                        ("user", "Visible ACP input".into()),
+                        ("assistant", "Visible reply".into()),
+                        ("assistant", "Background reply".into()),
+                    ]
+                );
+                assert_eq!(
+                    ask(&cx, &id, "Check history").await?.stop_reason,
+                    StopReason::EndTurn
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let requests = model.finish().await;
+    let first = requests[0].to_string();
+    assert!(first.contains("ACP project context"));
+    assert!(first.contains("/plan hidden ACP text"));
+    assert!(requests[1].to_string().contains("Hidden ACP steer"));
+    let last = requests.last().unwrap().to_string();
+    assert!(last.contains("ACP background context"));
+    assert!(last.contains("/plan hidden ACP text"));
+    for req in requests {
+        let body = req.to_string();
+        assert!(!body.contains("is_meta") && !body.contains("isMeta"));
+    }
+}

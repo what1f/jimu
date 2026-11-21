@@ -228,6 +228,7 @@ fn base64_image_exclusion_and_compaction_threshold_math() {
     // 2MB base64 screenshot must count as fixed 1,200 tokens, NOT 500,000 tokens.
     let two_mb_base64 = "A".repeat(2 * 1024 * 1024);
     let messages = vec![AgentMessage::Llm(Message::User(UserMessage {
+        is_meta: false,
         id: None,
         content: vec![
             ContentPart::Text(TextContent::plain("Analyze this screenshot")),

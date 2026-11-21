@@ -21,4 +21,5 @@ pub use types::{
     CURRENT_SESSION_VERSION, CompactionCheckpoint, ReconstructedContext, SessionEntry,
     SessionEntryPayload, SessionEvent, SessionHeader, SessionTreeNode, baseline_to_system_message,
     compaction_summary_to_agent_message, context_block_to_agent_message, format_context_block,
+    prepare_flushed_prompt,
 };

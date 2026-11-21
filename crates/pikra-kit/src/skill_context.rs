@@ -25,9 +25,11 @@ impl SkillContextState {
     pub fn from_branch(session: &SessionManager) -> Self {
         let branch = session.active_branch();
         let previous_catalog = branch.iter().rev().find_map(|entry| match &entry.payload {
-            SessionEntryPayload::ContextBlock { name, text } if name == SKILLS_CONTEXT_NAME => {
-                Some(text)
-            }
+            SessionEntryPayload::ContextBlock {
+                name,
+                text,
+                ephemeral: false,
+            } if name == SKILLS_CONTEXT_NAME => Some(text),
             _ => None,
         });
         let entries = branch
@@ -41,7 +43,11 @@ impl SkillContextState {
                 }
                 SessionEntryPayload::Compaction { .. } => Some(None),
                 // Older sessions put the whole catalog in the named context block.
-                SessionEntryPayload::ContextBlock { name, text } if name == SKILLS_CONTEXT_NAME => {
+                SessionEntryPayload::ContextBlock {
+                    name,
+                    text,
+                    ephemeral: false,
+                } if name == SKILLS_CONTEXT_NAME => {
                     let skills = text
                         .split("<skill>")
                         .skip(1)

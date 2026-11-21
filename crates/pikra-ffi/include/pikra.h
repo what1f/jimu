@@ -242,10 +242,25 @@ bool pikra_session_steer(
     const char *text
 );
 
+bool pikra_session_steer_ex(
+    PikraSession *session,
+    const char *id,
+    const char *text,
+    bool is_meta
+);
+
 PikraStatus pikra_session_follow_up(
     PikraSession *session,
     const char *id,
     const char *text,
+    char **out_error
+);
+
+PikraStatus pikra_session_follow_up_ex(
+    PikraSession *session,
+    const char *id,
+    const char *text,
+    bool is_meta,
     char **out_error
 );
 
@@ -264,6 +279,19 @@ PikraStatus pikra_session_set_context(
 );
 
 PikraStatus pikra_session_append_context(
+    PikraSession *session,
+    const char *text,
+    char **out_error
+);
+
+PikraStatus pikra_session_append_named_context(
+    PikraSession *session,
+    const char *name,
+    const char *text,
+    char **out_error
+);
+
+PikraStatus pikra_session_append_meta(
     PikraSession *session,
     const char *text,
     char **out_error

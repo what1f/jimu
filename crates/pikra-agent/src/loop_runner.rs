@@ -25,15 +25,21 @@ pub struct QueuedInput {
     pub id: String,
     pub text: String,
     pub content: Vec<ContentPart>,
+    pub is_meta: bool,
 }
 
 impl QueuedInput {
+    pub fn new(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::text(id, text)
+    }
+
     pub fn text(id: impl Into<String>, text: impl Into<String>) -> Self {
         let text = text.into();
         Self {
             id: id.into(),
             content: vec![ContentPart::Text(TextContent::plain(text.clone()))],
             text,
+            is_meta: false,
         }
     }
 
@@ -50,13 +56,28 @@ impl QueuedInput {
             id: id.into(),
             text,
             content,
+            is_meta: false,
         }
+    }
+
+    pub fn meta(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::text(id, text).with_meta(true)
+    }
+
+    pub fn meta_parts(id: impl Into<String>, content: Vec<ContentPart>) -> Self {
+        Self::from_parts(id, content).with_meta(true)
+    }
+
+    pub fn with_meta(mut self, is_meta: bool) -> Self {
+        self.is_meta = is_meta;
+        self
     }
 
     pub(crate) fn into_agent_message(self) -> AgentMessage {
         AgentMessage::Llm(Message::User(UserMessage {
             id: Some(self.id),
             content: self.content,
+            is_meta: self.is_meta,
             timestamp: now_ms(),
         }))
     }
@@ -280,10 +301,12 @@ pub(crate) async fn agent_loop_with_queues(
 
             // Admit steering messages (emit Steered before MessageStart/MessageEnd)
             for steer in std::mem::take(&mut pending_steers) {
-                emit(AgentEvent::Steered {
-                    id: steer.id.clone(),
-                    text: steer.text.clone(),
-                });
+                if !steer.is_meta {
+                    emit(AgentEvent::Steered {
+                        id: steer.id.clone(),
+                        text: steer.text.clone(),
+                    });
+                }
                 let msg = steer.into_agent_message();
                 current_messages.push(msg.clone());
                 new_messages.push(msg.clone());

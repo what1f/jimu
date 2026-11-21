@@ -283,6 +283,25 @@ impl DurableEngine {
         )
     }
 
+    fn acquire_lease(&self, conversation_id: &str) -> Result<ConversationLeaseGuard, DurableError> {
+        self.try_acquire_lease(conversation_id)?
+            .map_err(|(lease_owner, lease_expires_at_ms)| DurableError::Busy {
+                conversation_id: conversation_id.to_string(),
+                lease_owner,
+                lease_expires_at_ms,
+            })
+    }
+
+    fn require_no_checkpoint(&self, conversation_id: &str) -> Result<(), DurableError> {
+        if let Some(active_cp) = self.store.get_checkpoint(conversation_id)? {
+            return Err(DurableError::ConversationBusy {
+                conversation_id: conversation_id.to_string(),
+                active_submission_id: active_cp.submission_id().to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn conversation_mutex(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
         let mut map = self.conv_locks.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(
@@ -433,6 +452,107 @@ impl DurableEngine {
         Ok(manager.reconstruct_context())
     }
 
+    /// Set a named context block on an idle conversation if its active value changed.
+    pub async fn set_context(
+        &self,
+        conversation_id: &str,
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<bool, DurableError> {
+        let name = name.into();
+        let text = text.into();
+        Ok(self
+            .append_idle_entry(conversation_id, |conv, _| {
+                let entries = self.store.load_entries(conversation_id)?;
+                let manager = open_session_view(
+                    conv,
+                    entries,
+                    self.tool_definitions(),
+                    self.config.compaction.clone(),
+                    self.config.compaction_strategy.clone(),
+                )?;
+                let context = manager.reconstruct_context();
+                Ok(
+                    (context.visible_context_blocks.get(&name) != Some(&text)).then_some(
+                        SessionEntryPayload::ContextBlock {
+                            name,
+                            text,
+                            ephemeral: false,
+                        },
+                    ),
+                )
+            })
+            .await?
+            .is_some())
+    }
+
+    /// Append a one-off named context block to an idle conversation.
+    pub async fn append_context(
+        &self,
+        conversation_id: &str,
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<SessionEntry, DurableError> {
+        self.append_idle_entry(conversation_id, |_, _| {
+            Ok(Some(SessionEntryPayload::ContextBlock {
+                name: name.into(),
+                text: text.into(),
+                ephemeral: true,
+            }))
+        })
+        .await
+        .map(|entry| entry.expect("append_context always supplies a payload"))
+    }
+
+    /// Append a raw meta message to an idle conversation.
+    pub async fn append_meta(
+        &self,
+        conversation_id: &str,
+        text: impl Into<String>,
+    ) -> Result<SessionEntry, DurableError> {
+        self.append_idle_entry(conversation_id, |_, now| {
+            Ok(Some(SessionEntryPayload::Message {
+                message: Message::User(UserMessage::meta_text(text, now)).into(),
+            }))
+        })
+        .await
+        .map(|entry| entry.expect("append_meta always supplies a payload"))
+    }
+
+    async fn append_idle_entry(
+        &self,
+        conversation_id: &str,
+        payload: impl FnOnce(
+            &ConversationRecord,
+            u64,
+        ) -> Result<Option<SessionEntryPayload>, DurableError>,
+    ) -> Result<Option<SessionEntry>, DurableError> {
+        let conv_mutex = self.conversation_mutex(conversation_id);
+        let _conv_guard = conv_mutex.lock().await;
+
+        let _ = self.require_conversation(conversation_id)?;
+        let mut lease = self.acquire_lease(conversation_id)?;
+        self.require_no_checkpoint(conversation_id)?;
+
+        let conv = self.require_conversation(conversation_id)?;
+        let now = self.clock.now_ms();
+        let Some(payload) = payload(&conv, now)? else {
+            return Ok(None);
+        };
+        let entry = SessionEntry {
+            id: Uuid::now_v7().to_string(),
+            parent_id: conv.head_entry_id.clone(),
+            timestamp: now,
+            payload,
+        };
+        let mut batch = CommitBatch::new(conversation_id, now);
+        batch.expected_head_entry_id = Some(conv.head_entry_id);
+        batch.require_no_checkpoint = true;
+        batch.append_entries.push(entry.clone());
+        lease.commit(batch, true)?;
+        Ok(Some(entry))
+    }
+
     /// Idempotently deliver an external signal to a conversation.
     pub fn deliver_signal(
         &self,
@@ -568,6 +688,40 @@ impl DurableEngine {
         prompt: impl Into<String>,
         cancel: CancelToken,
     ) -> Result<RunOutcome, DurableError> {
+        self.submit_user(conversation_id, submission_id, prompt, false, cancel)
+            .await
+    }
+
+    /// Submit a hidden user prompt idempotently and drive the durable turn loop.
+    pub async fn submit_meta(
+        &self,
+        conversation_id: &str,
+        submission_id: &str,
+        prompt: impl Into<String>,
+    ) -> Result<RunOutcome, DurableError> {
+        self.submit_meta_with_cancel(conversation_id, submission_id, prompt, CancelToken::new())
+            .await
+    }
+
+    pub async fn submit_meta_with_cancel(
+        &self,
+        conversation_id: &str,
+        submission_id: &str,
+        prompt: impl Into<String>,
+        cancel: CancelToken,
+    ) -> Result<RunOutcome, DurableError> {
+        self.submit_user(conversation_id, submission_id, prompt, true, cancel)
+            .await
+    }
+
+    async fn submit_user(
+        &self,
+        conversation_id: &str,
+        submission_id: &str,
+        prompt: impl Into<String>,
+        is_meta: bool,
+        cancel: CancelToken,
+    ) -> Result<RunOutcome, DurableError> {
         let conv_mutex = self.conversation_mutex(conversation_id);
         let _conv_guard = conv_mutex.lock().await;
 
@@ -580,16 +734,7 @@ impl DurableEngine {
             return Ok(settled);
         }
 
-        let mut lease = match self.try_acquire_lease(conversation_id)? {
-            Ok(lease) => lease,
-            Err((lease_owner, lease_expires_at_ms)) => {
-                return Err(DurableError::Busy {
-                    conversation_id: conversation_id.to_string(),
-                    lease_owner,
-                    lease_expires_at_ms,
-                });
-            }
-        };
+        let mut lease = self.acquire_lease(conversation_id)?;
 
         // Re-check submission under the exclusive store lease to prevent TOCTOU races.
         if let Some(existing) = self.store.get_submission(conversation_id, submission_id)? {
@@ -601,12 +746,7 @@ impl DurableEngine {
                 .await;
         }
 
-        if let Some(active_cp) = self.store.get_checkpoint(conversation_id)? {
-            return Err(DurableError::ConversationBusy {
-                conversation_id: conversation_id.to_string(),
-                active_submission_id: active_cp.submission_id().to_string(),
-            });
-        }
+        self.require_no_checkpoint(conversation_id)?;
 
         let conv = self.require_conversation(conversation_id)?;
         let now = self.clock.now_ms();
@@ -615,7 +755,7 @@ impl DurableEngine {
             parent_id: conv.head_entry_id.clone(),
             timestamp: now,
             payload: SessionEntryPayload::Message {
-                message: AgentMessage::Llm(Message::User(UserMessage::text(prompt, now))),
+                message: Message::User(UserMessage::text(prompt, now).with_meta(is_meta)).into(),
             },
         };
         let submission = SubmissionRecord {

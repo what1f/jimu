@@ -50,12 +50,14 @@ pub(crate) fn convert_to_llm_with_overrides(
                 id,
                 content,
                 include_in_llm: true,
+                display,
                 timestamp,
                 ..
             } => {
                 llm_messages.push(Message::User(UserMessage {
                     id: id.clone(),
                     content: content.clone(),
+                    is_meta: !display,
                     timestamp: *timestamp,
                 }));
             }

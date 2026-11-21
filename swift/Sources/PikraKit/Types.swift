@@ -617,6 +617,22 @@ public struct PikraSessionEntry: Sendable, Equatable {
     public let type: String
     public let raw: JSONValue
 
+    /// Whether this entry is hidden from the user-facing transcript.
+    public var isMeta: Bool {
+        switch type {
+        case "context_block", "compaction":
+            return true
+        case "message":
+            let message = raw["message"]
+            if message?["kind"]?.stringValue == "custom" {
+                return message?["display"]?.boolValue == false
+            }
+            return message?["is_meta"]?.boolValue == true
+        default:
+            return false
+        }
+    }
+
     init(raw: JSONValue) throws {
         guard case .object(let dict) = raw,
               let id = dict["id"]?.stringValue,

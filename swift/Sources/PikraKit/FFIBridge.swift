@@ -175,6 +175,7 @@ struct WireSessionConfig: Encodable {
 struct WirePromptRequest: Encodable {
     let id: String?
     let content: [PikraContentPart]
+    let isMeta: Bool
 }
 
 struct WireHttpRequestHead: Decodable {

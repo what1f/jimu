@@ -54,7 +54,12 @@ pub enum SessionEntryPayload {
     /// Conversation message (`User`, `Assistant`, `ToolResult`, or `AgentMessage::Custom`).
     Message { message: AgentMessage },
     /// Named context block rendered into the LLM transcript as `<system-reminder name="...">`.
-    ContextBlock { name: String, text: String },
+    ContextBlock {
+        name: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ephemeral: bool,
+    },
     /// Model switch recorded on the active branch.
     ModelChange { provider: String, model_id: String },
     /// Reasoning / fast-mode change recorded on the active branch.
@@ -145,7 +150,7 @@ pub fn format_context_block(name: &str, text: &str) -> String {
 
 /// Render a `ContextBlock` entry as a user message for the LLM transcript.
 pub fn context_block_to_agent_message(name: &str, text: &str, timestamp: u64) -> AgentMessage {
-    AgentMessage::Llm(Message::User(UserMessage::text(
+    AgentMessage::Llm(Message::User(UserMessage::meta_text(
         format_context_block(name, text),
         timestamp,
     )))
@@ -153,7 +158,7 @@ pub fn context_block_to_agent_message(name: &str, text: &str, timestamp: u64) ->
 
 /// Render a `Compaction` summary checkpoint as a user message for the LLM transcript.
 pub fn compaction_summary_to_agent_message(summary: &str, timestamp: u64) -> AgentMessage {
-    AgentMessage::Llm(Message::User(UserMessage::text(
+    AgentMessage::Llm(Message::User(UserMessage::meta_text(
         format!(
             "<compaction-summary>\nThe following is a checkpoint summary of earlier turns in this conversation:\n\n{summary}\n</compaction-summary>"
         ),
@@ -174,4 +179,30 @@ pub fn baseline_to_system_message(
         tools_removed: Vec::new(),
         timestamp,
     }))
+}
+
+/// Convert entries returned by `SessionManager::flush_pending_context` to prompt messages and events.
+pub fn prepare_flushed_prompt(
+    flushed: Vec<SessionEntry>,
+    user: AgentMessage,
+) -> (Vec<AgentMessage>, usize, Vec<SessionEvent>) {
+    let mut messages = Vec::with_capacity(flushed.len() + 1);
+    let mut events = Vec::new();
+    for entry in flushed {
+        match entry.payload {
+            SessionEntryPayload::ContextBlock { name, text, .. } => {
+                messages.push(context_block_to_agent_message(
+                    &name,
+                    &text,
+                    entry.timestamp,
+                ));
+                events.push(SessionEvent::ContextAppended { name, text });
+            }
+            SessionEntryPayload::Message { message } => messages.push(message),
+            _ => {}
+        }
+    }
+    let count = messages.len();
+    messages.push(user);
+    (messages, count, events)
 }

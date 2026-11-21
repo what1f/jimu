@@ -107,21 +107,34 @@ public actor PikraAgent {
     /// Sends a text prompt and returns a real-time `AsyncThrowingStream` of `PikraEvent`s.
     public func prompt(
         _ text: String,
-        id: String = UUID().uuidString
+        id: String? = nil,
+        isMeta: Bool = false
     ) async throws -> AsyncThrowingStream<PikraEvent, any Error> {
-        try await prompt([.text(text)], id: id)
+        try await prompt([PikraContentPart.text(text)], id: id, isMeta: isMeta)
     }
 
     /// Sends a multimodal prompt (text and/or images) and returns a real-time stream of `PikraEvent`s.
     public func prompt(
         _ content: [PikraPromptContent],
-        id: String = UUID().uuidString
+        id: String? = nil,
+        isMeta: Bool = false
+    ) async throws -> AsyncThrowingStream<PikraEvent, any Error> {
+        try await prompt(content.map { $0.toWirePart() }, id: id, isMeta: isMeta)
+    }
+
+    /// Sends content parts already encoded for transport. Prefer the existing prompt content
+    /// overload for untyped array literals, which may include images supplied as Data.
+    @_disfavoredOverload
+    public func prompt(
+        _ content: [PikraContentPart],
+        id: String? = nil,
+        isMeta: Bool = false
     ) async throws -> AsyncThrowingStream<PikraEvent, any Error> {
         let session = try requireSession()
         guard !content.isEmpty else {
             throw PikraError.invalidArgument("Prompt content must not be empty")
         }
-        let wirePrompt = WirePromptRequest(id: id, content: content.map { $0.toWirePart() })
+        let wirePrompt = WirePromptRequest(id: id, content: content, isMeta: isMeta)
         let promptJSON = try encodeJSONString(wirePrompt)
 
         var capturedContinuation: AsyncThrowingStream<PikraEvent, any Error>.Continuation?
@@ -160,22 +173,22 @@ public actor PikraAgent {
 
     /// Queues a mid-turn steering message. Returns `true` if accepted by an active turn, `false` if idle.
     @discardableResult
-    public func steer(text: String, id: String = UUID().uuidString) -> Bool {
+    public func steer(text: String, id: String = UUID().uuidString, isMeta: Bool = false) -> Bool {
         guard !isClosed, let session = handleBox.session else { return false }
         return id.withCString { idC in
             text.withCString { textC in
-                pikra_session_steer(session, idC, textC)
+                pikra_session_steer_ex(session, idC, textC, isMeta)
             }
         }
     }
 
     /// Queues a follow-up user message to execute after the current turn settles.
-    public func followUp(text: String, id: String = UUID().uuidString) throws {
+    public func followUp(text: String, id: String = UUID().uuidString, isMeta: Bool = false) throws {
         let session = try requireSession()
         var errorPtr: UnsafeMutablePointer<CChar>?
         let status = id.withCString { idC in
             text.withCString { textC in
-                pikra_session_follow_up(session, idC, textC, &errorPtr)
+                pikra_session_follow_up_ex(session, idC, textC, isMeta, &errorPtr)
             }
         }
         if status != PIKRA_OK {
@@ -214,11 +227,25 @@ public actor PikraAgent {
     }
 
     /// Queues a one-off `<system-reminder>` context block for the next turn.
-    public func appendContext(_ text: String) throws {
+    public func appendContext(_ text: String, name: String = "context") throws {
+        let session = try requireSession()
+        var errorPtr: UnsafeMutablePointer<CChar>?
+        let status = name.withCString { nameC in
+            text.withCString { textC in
+                pikra_session_append_named_context(session, nameC, textC, &errorPtr)
+            }
+        }
+        if status != PIKRA_OK {
+            throw mapStatusError(status, message: takeOwnedCString(errorPtr))
+        }
+    }
+
+    /// Queues a hidden user message for the next turn.
+    public func appendMeta(_ text: String) throws {
         let session = try requireSession()
         var errorPtr: UnsafeMutablePointer<CChar>?
         let status = text.withCString { textC in
-            pikra_session_append_context(session, textC, &errorPtr)
+            pikra_session_append_meta(session, textC, &errorPtr)
         }
         if status != PIKRA_OK {
             throw mapStatusError(status, message: takeOwnedCString(errorPtr))

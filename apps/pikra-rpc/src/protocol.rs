@@ -33,6 +33,8 @@ impl From<RpcImageInput> for ImageContent {
 pub enum RpcCommand {
     Prompt {
         message: String,
+        #[serde(default, alias = "isMeta")]
+        is_meta: bool,
         #[serde(default)]
         images: Option<Vec<RpcImageInput>>,
         #[serde(default, alias = "streamingBehavior")]
@@ -40,11 +42,15 @@ pub enum RpcCommand {
     },
     Steer {
         message: String,
+        #[serde(default, alias = "isMeta")]
+        is_meta: bool,
         #[serde(default)]
         images: Option<Vec<RpcImageInput>>,
     },
     FollowUp {
         message: String,
+        #[serde(default, alias = "isMeta")]
+        is_meta: bool,
         #[serde(default)]
         images: Option<Vec<RpcImageInput>>,
     },
@@ -80,6 +86,16 @@ pub enum RpcCommand {
         name: String,
         text: String,
     },
+    AppendContext {
+        #[serde(default)]
+        name: Option<String>,
+        text: String,
+    },
+    AppendMeta {
+        text: String,
+        #[serde(default)]
+        images: Option<Vec<RpcImageInput>>,
+    },
     Compact {
         #[serde(default, alias = "customInstructions")]
         custom_instructions: Option<String>,
@@ -112,7 +128,10 @@ pub enum RpcCommand {
         since: Option<String>,
     },
     GetTree,
-    GetMessages,
+    GetMessages {
+        #[serde(default, alias = "includeMeta")]
+        include_meta: Option<bool>,
+    },
     GetLastAssistantText,
     ReloadExtensions,
 }
@@ -131,6 +150,8 @@ impl RpcCommand {
             Self::SetThinkingLevel { .. } => "set_thinking_level",
             Self::SetFast { .. } => "set_fast",
             Self::SetContext { .. } => "set_context",
+            Self::AppendContext { .. } => "append_context",
+            Self::AppendMeta { .. } => "append_meta",
             Self::Compact { .. } => "compact",
             Self::SetAutoCompaction { .. } => "set_auto_compaction",
             Self::SetSteeringMode { .. } => "set_steering_mode",
@@ -140,7 +161,7 @@ impl RpcCommand {
             Self::Fork { .. } => "fork",
             Self::GetEntries { .. } => "get_entries",
             Self::GetTree => "get_tree",
-            Self::GetMessages => "get_messages",
+            Self::GetMessages { .. } => "get_messages",
             Self::GetLastAssistantText => "get_last_assistant_text",
             Self::ReloadExtensions => "reload_extensions",
         }
