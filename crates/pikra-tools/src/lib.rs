@@ -42,13 +42,15 @@ pub use events::{
     WakeOutcome, format_background_events_xml,
 };
 #[cfg(all(feature = "shell", not(target_os = "ios")))]
-pub use exec_session::{ExecCommandTool, ProcessSessionManager, WriteStdinTool};
+pub use exec_session::{
+    ExecCommandTool, ProcessSessionManager, RunningProcessInfo, WriteStdinTool,
+};
 #[cfg(feature = "search")]
 pub use find::FindTool;
 #[cfg(feature = "search")]
 pub use grep::GrepTool;
 #[cfg(all(feature = "monitor", not(target_os = "ios")))]
-pub use monitor::{MonitorConfig, MonitorManager, MonitorTool};
+pub use monitor::{MonitorConfig, MonitorManager, MonitorTool, RunningMonitorInfo};
 pub use override_spec::{
     DescriptionOverride, OverriddenTool, ToolDefinitionOverride, wrap_tool_with_override,
 };

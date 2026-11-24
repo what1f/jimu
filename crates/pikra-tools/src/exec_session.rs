@@ -127,6 +127,15 @@ fn format_signal_notice(_status: Option<ExitStatus>) -> String {
 
 /// Owns running commands and a bounded set of completed background sessions
 /// whose final output can still be collected. Clones share the same sessions.
+/// Read-only summary of an active command session managed by [`ProcessSessionManager`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningProcessInfo {
+    pub id: u32,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub backgrounded: bool,
+}
+
 #[derive(Clone)]
 pub struct ProcessSessionManager(Arc<SessionManagerInner>);
 
@@ -193,6 +202,40 @@ impl ProcessSessionManager {
         }))
     }
 
+    /// List currently running command sessions in ascending ID order.
+    pub fn list_running(&self) -> Vec<RunningProcessInfo> {
+        let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = sessions
+            .active
+            .values()
+            .filter_map(|session| {
+                let state = session.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.exit.is_none().then(|| RunningProcessInfo {
+                    id: session.id,
+                    command: session.command.clone(),
+                    cwd: session.cwd.clone(),
+                    backgrounded: state.backgrounded,
+                })
+            })
+            .collect();
+        out.sort_by_key(|info| info.id);
+        out
+    }
+
+    /// Request termination of a running command session by ID. Returns `true` if found.
+    pub fn kill(&self, id: u32) -> bool {
+        let session = {
+            let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.active.get(&id).cloned()
+        };
+        if let Some(session) = session {
+            session.control.stop();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Stop and reap the managed commands. This manager will reject new commands.
     pub async fn shutdown(&self) {
         let sessions: Vec<_> = {
@@ -235,6 +278,7 @@ impl ProcessSessionManager {
         let max_lines = self.0.workspace.max_output_lines;
         let session = Arc::new(Session {
             id,
+            command: command.clone(),
             cwd,
             control: child.control.clone(),
             input: AsyncMutex::new(input),
@@ -348,6 +392,7 @@ impl Drop for SessionManagerInner {
 
 struct Session {
     id: u32,
+    command: String,
     cwd: PathBuf,
     control: Arc<ProcessControl>,
     input: AsyncMutex<Option<ProcessInput>>,

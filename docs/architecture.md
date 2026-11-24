@@ -45,8 +45,8 @@ flowchart TD
     subgraph Entry["接入入口层"]
         Swift["swift/PikraKit (Swift 6 Actor SDK)"]
         FFI["pikra-ffi (C-ABI 静态库桥接，零 reqwest/rustls)"]
-        ACP["pikra-acp (Agent Client Protocol 适配器与 CLI)"]
-        RPC["apps/pikra-rpc (pikra CLI & stdio JSONL RPC)"]
+        TUI["pikra-tui (框架中立双屏 TUI + 可选 pikra 原生适配器)"]
+        CLI["apps/pikra (统一无头二进制 pikra · JSONL RPC · ACP v1 · one-shot)"]
     end
 
     subgraph Runtime["会话组装与扩展层"]
@@ -69,12 +69,10 @@ flowchart TD
     FFI --> Kit
     FFI --> Tools
     FFI --> JS
-    ACP --> Kit
-    ACP --> Tools
-    ACP --> HTTP
-    RPC --> Kit
-    RPC --> Tools
-    RPC --> HTTP
+    TUI -.->|"可选 pikra feature"| Kit
+    CLI --> Kit
+    CLI --> Tools
+    CLI --> HTTP
 
     Kit --> Session
     Kit --> CodeMode
@@ -91,6 +89,8 @@ flowchart TD
 
 ---
 
+`pikra-tui` 默认零 `pikra-*` 依赖，由四层组成。`engine` 提供主题、流式 Markdown、输入器和终端原语。`harness` 定义 `TuiHarness` 及其可选能力。`ui` 渲染对话滚屏、输入框和弹窗。`app` 管理鼠标和键盘输入、全屏与行内切换、终端恢复及 OSC 7501 状态。启用 `feature = "pikra"` 后激活 `pikra_tui::pikra` 原生直连 `KitSession`（零 ACP 序列化）。iOS 与 Swift FFI 保持完全隔离。
+
 ## 3. 四大关键架构机制
 
 ### 3.1 双轨网络抽象（`HttpTransport`）
@@ -103,7 +103,7 @@ flowchart TD
 1. **常驻与延迟严格分池**：顶层 `tools` 数组在会话建立时锁定顺序；外部 MCP 工具或超预算工具自动进入 `DeferredToolRegistry`，通过常驻的 `tool_search`（BM25 分词相关性排序）按需拉取参数定义，通过 `call_tool` 执行（事件流自动透出内部真实工具名供 UI 展示）或在 `exec`（QuickJS 沙盒）中批量编排。
 2. **无品牌硬编码的 `AGENTS.md` 与 Skills 多级发现**：
    - 库层只内置中立规范（`.agents/skills`、`~/.agents`、`AGENTS.override.md` > `AGENTS.md`），零 `.pikra` 写死路径，所有自定义目录、回溯边界（`ProjectRoot` 停 `.git` / `FilesystemRoot` 爬到 `/` / `CurrentDirOnly`）与指令体积上限（默认指令 `32 KiB` 可设 `None`）均交由宿主覆盖；多份正文完全一致的 `AGENTS.md` 自动去重不重复加载；所有可见 Skills 全量渲染进 `<available_skills>`（不截断、不做路径别名压缩）。
-   - **首轮与压缩后保真，中途只发增删 Diff**：`AGENTS.md` 走具名上下文块，压缩后自动保留防遗忘；会话运行中若新增或删除 Skill，只在末尾追加 `# Skills changed` 增量块，修改已有 `SKILL.md` 正文静默不刷屏。
+   - **首轮与压缩后保真，中途自动热加载且只发增删 Diff**：`AGENTS.md` 走具名上下文块，压缩后自动保留防遗忘；`Skills` 默认在每轮对话前自动重扫并在桌面端通过可选跨平台 `SkillWatcher` 实时监听（兼容软链与尚未创建的 Skill 目录），会话运行中若新增、删除、移动或重指向软链 Skill，只在末尾追加 `# Skills changed` 增量块，原地修改已有 `SKILL.md` 正文静默不刷屏。
 3. **压缩复用父前缀**：自动压缩摘要请求直接复用上一轮完整消息与工具前缀，仅在尾部追加摘要指令，最大化命中缓存读取。
 
 ### 3.3 前后台统一终端、`Monitor` 事件唤醒与 `Sleep`
@@ -119,4 +119,4 @@ flowchart TD
 ### 3.5 通用隐藏上下文原语（`is_meta` / `isMeta`）
 宿主在注入系统提醒、后台事件唤醒或中途协议纠偏时，无需靠正则过滤 `<system-reminder>` 标签：
 - **底层统一标记**：`UserMessage` 原生携带 `is_meta: bool`（Swift / JSON 兼容 `isMeta`），向模型发请求时完全等同于标准 `user` 消息（不向任何上游模型 API 泄露额外字段，100% 保持缓存前缀字节一致），而对 UI 历史与实时事件天然区分用户发言与系统注入。
-- **全时机覆盖**：所有 `<system-reminder>`（`set_context` / `append_context` / `append_named_context`）、无标签隐藏块（`append_meta`）、自动压缩摘要、后台 `Monitor` 唤醒轮次、独立触发的隐藏轮次（`prompt_meta` / `submit_meta`）以及运行中隐藏插话（`steer_meta` / `follow_up_meta`，不触发面向用户的 `Steered` 气泡事件）均统一标记 `is_meta: true`，`visible_messages()` 与 `pikra-acp` 历史回放自动过滤。
+- **全时机覆盖**：所有 `<system-reminder>`（`set_context` / `append_context` / `append_named_context`）、无标签隐藏块（`append_meta`）、自动压缩摘要、后台 `Monitor` 唤醒轮次、独立触发的隐藏轮次（`prompt_meta` / `submit_meta`）以及运行中隐藏插话（`steer_meta` / `follow_up_meta`，不触发面向用户的 `Steered` 气泡事件）均统一标记 `is_meta: true`，`visible_messages()` 与 ACP 历史回放自动过滤。

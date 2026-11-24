@@ -40,6 +40,56 @@ fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+fn push_user_content(out: &mut Vec<Value>, content: Value) {
+    if let Some(Value::Object(last_msg)) = out.last_mut()
+        && last_msg.get("role").and_then(Value::as_str) == Some("user")
+    {
+        match (last_msg.get_mut("content"), content) {
+            (Some(Value::String(existing)), Value::String(next)) => {
+                if !existing.is_empty() && !next.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&next);
+                return;
+            }
+            (Some(Value::Array(existing)), Value::Array(next)) => {
+                existing.extend(next);
+                return;
+            }
+            (Some(Value::Array(existing)), Value::String(next)) => {
+                if !next.is_empty() {
+                    existing.push(json!({ "type": "text", "text": next }));
+                }
+                return;
+            }
+            (Some(slot @ Value::String(_)), Value::Array(next)) => {
+                let prev = match std::mem::replace(slot, Value::Null) {
+                    Value::String(s) => s,
+                    _ => String::new(),
+                };
+                let mut merged = Vec::with_capacity(next.len() + 1);
+                if !prev.is_empty() {
+                    merged.push(json!({ "type": "text", "text": prev }));
+                }
+                merged.extend(next);
+                *slot = Value::Array(merged);
+                return;
+            }
+            (_, other) => {
+                out.push(json!({
+                    "role": "user",
+                    "content": other,
+                }));
+                return;
+            }
+        }
+    }
+    out.push(json!({
+        "role": "user",
+        "content": content,
+    }));
+}
+
 fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) -> Vec<Value> {
     let transformed = transform_messages(messages, model, |id, _, _| {
         normalize_tool_call_id_openai_completions(id)
@@ -75,10 +125,7 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !joined.is_empty() {
-                        out.push(json!({
-                            "role": "user",
-                            "content": joined,
-                        }));
+                        push_user_content(&mut out, Value::String(joined));
                     }
                 } else {
                     let mut parts = Vec::new();
@@ -99,10 +146,7 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                         }
                     }
                     if !parts.is_empty() {
-                        out.push(json!({
-                            "role": "user",
-                            "content": parts,
-                        }));
+                        push_user_content(&mut out, Value::Array(parts));
                     }
                 }
                 i += 1;
@@ -206,10 +250,7 @@ fn convert_messages(model: &Model, system_prompt: &str, messages: &[Message]) ->
                         "text": "Attached image(s) from tool result:",
                     }));
                     user_blocks.extend(batch_images);
-                    out.push(json!({
-                        "role": "user",
-                        "content": user_blocks,
-                    }));
+                    push_user_content(&mut out, Value::Array(user_blocks));
                 }
             }
         }

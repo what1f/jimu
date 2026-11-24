@@ -1,6 +1,6 @@
 # Pikra
 
-用 Rust 构建的超轻量、模块化、Prompt Cache 友好的无头（Headless）Agent 运行时引擎，内置单源可裁剪的产品级工具箱、可扩展 Skills 与 BM25 动态工具网关，原生提供 **Rust Crates**、零外部依赖的 **Swift 6 SDK (`PikraKit`)**、标准 **ACP 编辑器协议 (`pikra-acp`)** 与跨语言 **JSONL RPC (`pikra --mode rpc`)**。
+用 Rust 构建的超轻量、模块化、Prompt Cache 友好的无头（Headless）Agent 运行时引擎，内置单源可裁剪的产品级工具箱、可扩展 Skills 与 BM25 动态工具网关，原生提供 **Rust Crates**、零外部依赖的 **Swift 6 SDK (`PikraKit`)**，以及合并 **ACP 编辑器协议 (`pikra acp`)** 与跨语言 **JSONL RPC (`pikra --mode rpc`)** 的单一无头二进制 `pikra`。
 
 ---
 
@@ -41,6 +41,6 @@ cargo test --workspace --all-features
 ./swift/scripts/build-xcframework.sh --all-platforms --zip
 swift test --package-path swift
 
-# 3. 构建独立 ACP 适配器与 CLI / RPC 二进制
-cargo build --release -p pikra-acp -p pikra-rpc
+# 3. 构建统一无头 CLI 二进制（内置 RPC + ACP + one-shot，零 TUI 依赖）
+cargo build --release -p pikra
 ```

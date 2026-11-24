@@ -1,6 +1,7 @@
 use crate::compaction::{
     CompactionConfig, CompactionInput, CompactionOutput, CompactionResult, CompactionStrategy,
-    ContextTokenEstimate, DefaultCompactionStrategy, cap_summary_length, estimate_context_tokens,
+    ContextTokenEstimate, ContextUsage, DefaultCompactionStrategy, cap_summary_length,
+    compaction_threshold, effective_reserve_tokens, estimate_context_tokens,
     select_first_kept_entry_id, should_compact,
 };
 use crate::error::SessionError;
@@ -649,6 +650,36 @@ impl SessionManager {
     pub fn estimate_tokens(&self) -> ContextTokenEstimate {
         let ctx = self.reconstruct_context();
         estimate_context_tokens(&ctx.messages)
+    }
+
+    /// Snapshot current context-window utilization for `model`.
+    ///
+    /// Returns `None` when `model.context_window == 0`.
+    pub fn context_usage(&self, model: &Model) -> Option<ContextUsage> {
+        if model.context_window == 0 {
+            return None;
+        }
+        let ctx = self.reconstruct_context();
+        let est = estimate_context_tokens(&ctx.messages);
+        let tokens = if ctx.latest_compaction.is_some() && est.reported_tokens == 0 {
+            None
+        } else if est.reported_tokens > 0 || !ctx.messages.is_empty() {
+            Some(est.total_tokens)
+        } else {
+            Some(0)
+        };
+        let percent = tokens.map(|t| (t as f64 / f64::from(model.context_window)) * 100.0);
+        let threshold = self.compaction_config.enabled.then(|| {
+            let reserve = effective_reserve_tokens(model, &self.compaction_config);
+            compaction_threshold(model.context_window, reserve)
+        });
+        Some(ContextUsage {
+            tokens,
+            estimated_tokens: est.total_tokens,
+            context_window: model.context_window,
+            percent,
+            compaction_threshold: threshold,
+        })
     }
 
     /// Returns `true` when auto-compaction should run for `model`.

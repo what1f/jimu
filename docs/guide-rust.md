@@ -12,6 +12,7 @@ Pikra 各 Crate 严格解耦，不要引入不需要的上层包：
 | :--- | :--- | :--- |
 | **只需要统一调各家大模型流式 API** | `pikra-ai` + `pikra-http` | 统一 OpenAI Responses / Codex / Completions / Anthropic / Gemini 流式事件与计费，无会话状态 |
 | **自己管存储与多 Agent 调度（如 Meerkat）** | `pikra-kit` + `pikra-tools` + `pikra-http` | **最常用推荐组合**：开箱具备会话树、自动压缩、可扩展 Skills、BM25 延迟工具网关、MCP 与内置工作区工具 |
+| **嵌入交互式终端** | `pikra-tui` + `pikra-kit` | Inline 主屏与 Fullscreen 副屏共用原生会话、工具卡片和审批 |
 | **完全自建上下文管线，只要纯内存回合循环** | `pikra-agent` + `pikra-ai` | 纯内存状态机 + 并发工具执行 + `steer` 插话 + Middleware 切面 |
 | **没有外部调度器，单进程需防崩溃重复执行工具** | 在上面基础上加 `pikra-durable` | 内嵌 SQLite WAL 事务级 Checkpoint、会话租约隔离与工具幂等恢复 |
 
@@ -181,7 +182,7 @@ let skill_cfg = SkillDiscoveryConfig {
 };
 ```
 
-- **保前缀缓存 + 压缩防遗忘**：`AGENTS.md` 通过具名上下文块注入，首轮进入缓存前缀，触发自动压缩（Compaction）后原样保留不会丢失；`Skills` 中途热更新调用 `session.reload_skills()` 只在末尾追加 `# Skills changed` 增删增量，修改正文不刷屏。
+- **保前缀缓存 + 自动热加载 + 压缩防遗忘**：`AGENTS.md` 通过具名上下文块注入，首轮进入缓存前缀，触发自动压缩（Compaction）后原样保留不会丢失；`Skills` 默认在每轮 `prompt` 前自动重扫（可通过 `with_auto_reload_skills(false)` 关闭），增删、移动或软链重定向时只在末尾追加 `# Skills changed` 增量，原地修改正文静默不刷屏；桌面端如需在空闲时实时刷新 UI（如 `/` 命令列表），可调用 `let _watcher = session.watch_skills(|catalog| { ... })?;`（基于 `watch` feature，自动监听尚不存在的祖先目录与防环软链，Drop 即停止）。
 
 ### 5.2 延迟加载海量工具与 MCP
 - 固定高频工具用 `KitToolSpec::resident(tool)`；
@@ -216,3 +217,23 @@ let chat_history = session.visible_messages();
 不要为了加审批或打码去重写工具实现，直接挂载 `AgentMiddleware`：
 - `before_tool_call`：拦截敏感工具（如 `exec_command` / `write` / `apply_patch`）弹出用户确认，拒绝时设 `block: true` 返回原因，也可通过 `args_override` 改写参数。
 - `after_tool_call`：统一扫描工具输出文本，对注入过的 API Key / 凭证做打码脱敏，或将超长输出落盘截断。
+
+## 7. Rust 原生终端入口
+
+将现有 `KitSession` 包装为 `PikraHarness` 交给 `TuiApp`（需启用 `pikra-tui` 的 `pikra` feature；不启用时 `pikra-tui` 零 `pikra-*` 依赖，可直接对接其他自定义 Harness）：
+
+```rust
+use pikra_kit::KitSession;
+use pikra_tui::{
+    app::{TuiApp, TuiAppConfig},
+    pikra::PikraHarness,
+};
+use std::{io, sync::Arc};
+
+async fn run_terminal(session: Arc<KitSession>) -> io::Result<()> {
+    let harness = Arc::new(PikraHarness::new(session));
+    TuiApp::new(harness, TuiAppConfig::default()).run().await
+}
+```
+
+按需勾选 Feature、自定义 Harness 接入、6 套明暗主题、审批弹窗与工具卡片定制见 [Rust 终端界面](guide-tui.md)。

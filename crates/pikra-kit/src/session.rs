@@ -16,7 +16,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use pikra_agent::{
     Agent, AgentConfig, AgentEvent, AgentMessage, AgentMiddleware, AgentTool, ApiKeyResolver,
-    QueueMode, ToolExecutionMode,
+    QueueMode, QueuedInputSummary, ToolExecutionMode,
 };
 use pikra_ai::{
     CacheRetention, CancelToken, ContentPart, Message, Model, SimpleStreamOptions, StopReason,
@@ -24,9 +24,9 @@ use pikra_ai::{
 };
 use pikra_codemode::CodemodeSandboxOptions;
 use pikra_session::{
-    CompactionConfig, CompactionResult, CompactionStrategy, MemorySessionStore, SessionConfig,
-    SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore, SessionTreeNode,
-    baseline_to_system_message, prepare_flushed_prompt,
+    CompactionConfig, CompactionResult, CompactionStrategy, ContextUsage, MemorySessionStore,
+    SessionConfig, SessionEntry, SessionEntryPayload, SessionEvent, SessionManager, SessionStore,
+    SessionTreeNode, baseline_to_system_message, prepare_flushed_prompt,
 };
 use serde_json::{Map, Value};
 use std::marker::PhantomData;
@@ -103,6 +103,8 @@ pub struct KitSessionConfig {
     pub fast: bool,
     pub skill_roots: Vec<PathBuf>,
     pub skill_discovery: SkillDiscoveryConfig,
+    /// Re-scan configured skill roots automatically before each turn (default: `true`).
+    pub auto_reload_skills: bool,
     pub instruction_discovery: Option<InstructionDiscoveryConfig>,
     /// Resident schema budget for automatic placement. Explicit resident tools are pinned.
     /// When omitted, tools explicitly marked Auto use an 8 KiB budget.
@@ -145,6 +147,7 @@ impl KitSessionConfig {
             fast: false,
             skill_roots: Vec::new(),
             skill_discovery: SkillDiscoveryConfig::default(),
+            auto_reload_skills: true,
             instruction_discovery: None,
             auto_defer_threshold_bytes: None,
             pause_background_on_error: true,
@@ -197,6 +200,11 @@ impl KitSessionConfig {
 
     pub fn with_skill_discovery(mut self, discovery: SkillDiscoveryConfig) -> Self {
         self.skill_discovery = discovery;
+        self
+    }
+
+    pub fn with_auto_reload_skills(mut self, enabled: bool) -> Self {
+        self.auto_reload_skills = enabled;
         self
     }
 
@@ -346,6 +354,7 @@ pub struct KitSession {
     deferred_registry: Arc<DeferredToolRegistry>,
     skills: Arc<Mutex<SkillCatalog>>,
     skill_discovery: SkillDiscoveryConfig,
+    auto_reload_skills: bool,
     known_skills: Arc<Mutex<SkillContextState>>,
     instructions: Mutex<InstructionContextState>,
     auto_defer_threshold_bytes: Option<usize>,
@@ -366,6 +375,7 @@ struct KitRuntime {
     deferred_registry: Arc<DeferredToolRegistry>,
     skills: Arc<Mutex<SkillCatalog>>,
     skill_discovery: SkillDiscoveryConfig,
+    auto_reload_skills: bool,
     known_skills: Arc<Mutex<SkillContextState>>,
     api_key: Option<String>,
     get_api_key: Option<ApiKeyResolver>,
@@ -538,6 +548,7 @@ impl KitSession {
             deferred_registry,
             skills,
             skill_discovery,
+            auto_reload_skills: config.auto_reload_skills,
             known_skills: Arc::new(Mutex::new(known_skills)),
             instructions: Mutex::new(instructions),
             auto_defer_threshold_bytes: config.auto_defer_threshold_bytes,
@@ -612,6 +623,25 @@ impl KitSession {
         self.inbox.is_active() || self.agent.is_running()
     }
 
+    /// Snapshot current context-window utilization against the active model.
+    pub fn context_usage(&self) -> Option<ContextUsage> {
+        let model = self.agent.model();
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .context_usage(&model)
+    }
+
+    /// Snapshot pending steering and follow-up inputs in FIFO order.
+    pub fn pending_inputs(&self) -> Vec<QueuedInputSummary> {
+        self.agent.pending_inputs()
+    }
+
+    /// Remove a pending steering or follow-up item by id.
+    pub fn remove_queued_input(&self, id: &str) -> bool {
+        self.agent.remove_queued_input(id)
+    }
+
     fn try_begin_activity(&self, activity: Activity) -> Result<ActivityGuard, KitError> {
         if self.agent.is_running() {
             return Err(KitError::Busy);
@@ -675,13 +705,39 @@ impl KitSession {
     }
 
     /// Re-scan configured skill roots. The next prompt delivers the net additions and removals.
-    /// Returns whether model-visible skill names changed.
+    /// Returns whether model-visible skills (including symlink target changes) changed.
     pub fn reload_skills(&self) -> bool {
         let mut skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
         let discovered = SkillCatalog::discover_with_config(&self.skill_discovery);
-        let changed = !skills.has_same_visible_names(&discovered);
+        let changed = !skills.has_same_visible_skills(&discovered);
         *skills = discovered;
         changed
+    }
+
+    /// Start watching configured skill roots and invoke `on_change` whenever the discovered
+    /// skill catalog metadata changes (additions, removals, moves, symlink retargets, or
+    /// description/visibility updates).
+    ///
+    /// Drop the returned [`crate::SkillWatcher`] to stop watching.
+    #[cfg(all(feature = "watch", not(any(target_arch = "wasm32", target_os = "ios"))))]
+    pub fn watch_skills(
+        &self,
+        on_change: impl Fn(SkillCatalog) + Send + Sync + 'static,
+    ) -> Result<crate::SkillWatcher, KitError> {
+        let skills = Arc::clone(&self.skills);
+        let discovery = self.skill_discovery.clone();
+        crate::SkillWatcher::start(discovery.clone(), move || {
+            let discovered = SkillCatalog::discover_with_config(&discovery);
+            let metadata_changed = {
+                let mut current = skills.lock().unwrap_or_else(|e| e.into_inner());
+                let changed = !current.has_same_catalog_metadata(&discovered);
+                *current = discovered.clone();
+                changed
+            };
+            if metadata_changed {
+                on_change(discovered);
+            }
+        })
     }
 
     pub fn instructions(&self) -> InstructionCatalog {
@@ -1198,6 +1254,7 @@ impl KitSession {
             deferred_registry: Arc::clone(&self.deferred_registry),
             skills: Arc::clone(&self.skills),
             skill_discovery: self.skill_discovery.clone(),
+            auto_reload_skills: self.auto_reload_skills,
             known_skills: Arc::clone(&self.known_skills),
             api_key: self.api_key.clone(),
             get_api_key: self.get_api_key.clone(),
@@ -1325,6 +1382,9 @@ impl KitRuntime {
         user_msg: AgentMessage,
         origin: KitTurnOrigin,
     ) -> Result<(Vec<AgentMessage>, usize, Vec<SessionEvent>), KitError> {
+        if self.auto_reload_skills {
+            self.reload_skills();
+        }
         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
         let skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
         let mut known = self.known_skills.lock().unwrap_or_else(|e| e.into_inner());

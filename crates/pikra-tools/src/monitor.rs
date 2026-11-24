@@ -49,6 +49,16 @@ impl Default for MonitorConfig {
     }
 }
 
+/// Read-only summary of an active background monitor managed by [`MonitorManager`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningMonitorInfo {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub started_at_ms: u64,
+    pub log_path: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct MonitorManager(Arc<MonitorManagerInner>);
 
@@ -129,6 +139,37 @@ impl MonitorManager {
             },
             monitors: Mutex::default(),
         }))
+    }
+
+    /// List currently active monitors.
+    pub fn list_running(&self) -> Vec<RunningMonitorInfo> {
+        let monitors = self.0.monitors.lock().unwrap_or_else(|e| e.into_inner());
+        monitors
+            .entries
+            .values()
+            .filter(|entry| entry.is_active())
+            .map(|entry| RunningMonitorInfo {
+                id: entry.info.id.clone(),
+                name: entry.info.name.clone(),
+                command: entry.info.command.clone(),
+                started_at_ms: entry.info.started_at_ms,
+                log_path: entry.info.log_path.clone(),
+            })
+            .collect()
+    }
+
+    /// Request termination of an active monitor by ID. Returns `true` if found.
+    pub fn kill(&self, id: &str) -> bool {
+        let control = {
+            let monitors = self.0.monitors.lock().unwrap_or_else(|e| e.into_inner());
+            monitors.entries.get(id).map(|entry| entry.control.clone())
+        };
+        if let Some(control) = control {
+            control.stop();
+            true
+        } else {
+            false
+        }
     }
 
     /// Stop and reap all monitors silently. This manager will reject new monitors.

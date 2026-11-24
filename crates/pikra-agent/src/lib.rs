@@ -6,7 +6,9 @@ mod error;
 mod loop_runner;
 mod tool;
 
-pub use agent::{Agent, AgentConfig, AgentEventStream, SubscriptionId};
+pub use agent::{
+    Agent, AgentConfig, AgentEventStream, QueuedInputKind, QueuedInputSummary, SubscriptionId,
+};
 pub use context::{ConvertToLlmFn, default_convert_to_llm};
 pub use error::AgentError;
 pub use loop_runner::{

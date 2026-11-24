@@ -8,6 +8,8 @@ mod instructions;
 pub mod mcp;
 mod session;
 mod skill_context;
+#[cfg(all(feature = "watch", not(any(target_arch = "wasm32", target_os = "ios"))))]
+mod skill_watcher;
 mod skills;
 mod wakeup;
 
@@ -27,11 +29,15 @@ pub use mcp::{
 };
 #[cfg(all(feature = "stdio", not(target_arch = "wasm32")))]
 pub use mcp::{StdioMcpConfig, StdioMcpTransport};
+pub use pikra_agent::{QueuedInputKind, QueuedInputSummary};
+pub use pikra_session::ContextUsage;
 pub use session::{
     KitEvent, KitEventStream, KitSession, KitSessionConfig, KitToolRegistrationMode, KitToolSpec,
     ToolSchemaBudget,
 };
 pub use skill_context::{SKILLS_CONTEXT_NAME, SkillContextState};
+#[cfg(all(feature = "watch", not(any(target_arch = "wasm32", target_os = "ios"))))]
+pub use skill_watcher::SkillWatcher;
 pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillDiscoveryConfig, SkillEnableRule, SkillSelector,
 };

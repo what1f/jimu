@@ -10,6 +10,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub file_path: PathBuf,
+    pub canonical_path: PathBuf,
     pub base_dir: PathBuf,
     pub disable_model_invocation: bool,
     pub revision: String,
@@ -71,7 +72,8 @@ impl Default for SkillDiscoveryConfig {
 }
 
 impl SkillDiscoveryConfig {
-    fn roots(&self) -> Vec<PathBuf> {
+    /// Resolve all configured roots in scope order: explicit, project, user, then bundled.
+    pub fn roots(&self) -> Vec<PathBuf> {
         let mut roots = self.extra_roots.clone();
         if let Some(cwd) = &self.cwd {
             for dir in
@@ -207,6 +209,78 @@ impl SkillCatalog {
         names(self) == names(other)
     }
 
+    /// Compare model-visible skills by `(name, file_path, canonical_path)`.
+    ///
+    /// Editing a skill file in place keeps both paths identical and returns `true`, while
+    /// adding, removing, moving, or retargeting a symlinked skill returns `false`.
+    pub fn has_same_visible_skills(&self, other: &Self) -> bool {
+        fn entries(catalog: &SkillCatalog) -> HashSet<(&str, &Path, &Path)> {
+            catalog
+                .visible()
+                .map(|skill| {
+                    (
+                        skill.name.as_str(),
+                        skill.file_path.as_path(),
+                        skill.canonical_path.as_path(),
+                    )
+                })
+                .collect()
+        }
+        entries(self) == entries(other)
+    }
+
+    /// Compare all discovered skills (including manual-only skills and descriptions) for UI refresh.
+    pub fn has_same_catalog_metadata(&self, other: &Self) -> bool {
+        fn entries(catalog: &SkillCatalog) -> Vec<(&str, &str, &Path, &Path, bool)> {
+            catalog
+                .skills
+                .iter()
+                .map(|skill| {
+                    (
+                        skill.name.as_str(),
+                        skill.description.as_str(),
+                        skill.file_path.as_path(),
+                        skill.canonical_path.as_path(),
+                        skill.disable_model_invocation,
+                    )
+                })
+                .collect()
+        }
+        entries(self) == entries(other)
+    }
+
+    /// Return whether `path` refers to a discovered skill file or a file inside a skill directory
+    /// (including symlinked skill directories and their canonical targets).
+    pub fn contains_path(&self, path: &Path) -> bool {
+        let resolved = fs::canonicalize(path).ok();
+        self.skills.iter().any(|skill| {
+            if path == skill.file_path
+                || resolved
+                    .as_deref()
+                    .is_some_and(|candidate| candidate == skill.canonical_path)
+            {
+                return true;
+            }
+            if !skill
+                .file_path
+                .file_name()
+                .is_some_and(|name| name == "SKILL.md")
+            {
+                return false;
+            }
+            if path.starts_with(&skill.base_dir) {
+                return true;
+            }
+            let Some(resolved) = resolved.as_deref() else {
+                return false;
+            };
+            skill
+                .canonical_path
+                .parent()
+                .is_some_and(|canonical_dir| resolved.starts_with(canonical_dir))
+        })
+    }
+
     pub(crate) fn visible(&self) -> impl Iterator<Item = &Skill> {
         self.skills
             .iter()
@@ -227,7 +301,9 @@ impl SkillCatalog {
         if visible.is_empty() {
             return None;
         }
-        let mut xml = String::from("<available_skills>\n");
+        let mut xml = String::from(
+            "When a task matches a skill below, read its SKILL.md file at <location> before proceeding.\n\n<available_skills>\n",
+        );
         for skill in visible {
             xml.push_str("  <skill>\n");
             xml.push_str(&format!("    <name>{}</name>\n", escape_xml(&skill.name)));
@@ -367,6 +443,7 @@ impl SkillScanner {
             name,
             description,
             file_path: path.to_path_buf(),
+            canonical_path: canonical,
             base_dir: base_dir.to_path_buf(),
             disable_model_invocation: parsed.disable_model_invocation
                 || disables_implicit_invocation(base_dir),

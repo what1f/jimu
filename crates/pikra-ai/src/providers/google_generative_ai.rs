@@ -34,6 +34,23 @@ fn convert_tools(tools: &[ToolDefinition]) -> Value {
     json!([{ "functionDeclarations": declarations }])
 }
 
+fn push_user_parts(contents: &mut Vec<Value>, parts: Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(Value::Object(last_msg)) = contents.last_mut()
+        && last_msg.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(Value::Array(existing)) = last_msg.get_mut("parts")
+    {
+        existing.extend(parts);
+        return;
+    }
+    contents.push(json!({
+        "role": "user",
+        "parts": parts,
+    }));
+}
+
 fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
     let transformed = transform_messages(messages, model, |id, _, _| {
         normalize_tool_call_id_anthropic(id)
@@ -64,12 +81,7 @@ fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
                         }
                     }
                 }
-                if !parts.is_empty() {
-                    contents.push(json!({
-                        "role": "user",
-                        "parts": parts,
-                    }));
-                }
+                push_user_parts(&mut contents, parts);
                 i += 1;
             }
             Message::Assistant(assistant) => {
@@ -198,10 +210,7 @@ fn convert_messages(model: &Model, messages: &[Message]) -> Vec<Value> {
                     i += 1;
                 }
 
-                contents.push(json!({
-                    "role": "user",
-                    "parts": fr_parts,
-                }));
+                push_user_parts(&mut contents, fr_parts);
             }
         }
     }

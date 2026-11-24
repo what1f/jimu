@@ -20,6 +20,8 @@ pikra --mode rpc \
   - `"type": "response"`：对应某条输入命令的同步确认或查询结果（原样回传 `"id"`、`"command"`、`"success"`、`"data"` / `"error"`）；
   - 流式会话事件：回合执行期间实时推送的 `agent_start`、`message_update`（含 `text_delta` / `thinking_delta` / `toolcall_delta`）、`tool_execution_start`、`tool_execution_end`、`agent_end`、`compaction_start` / `compaction_end` 等事件。
 - **单次命令行模式**：若只需跑一轮非交互任务，可直接用 `pikra ask "你的问题"`（失败或报错时向 `stderr` 输出原因并以非 0 状态码退出）。
+- **默认系统提示词与细粒度工具裁剪**：未传 `--system-prompt` 时默认注入简洁通用的系统提示词与 `<environment>`（工作目录与 OS）；支持通过 `--tools <csv>`（白名单）、`--disable-tools <csv>`（黑名单）或 `--no-tools` 精细控制启用的内置工具（可选名：`read`、`write`、`edit`、`apply_patch`、`find`、`grep`、`exec_command`、`write_stdin`、`monitor`、`sleep`、`web_fetch`）。
+- **Skills 自动热加载**：每轮 `prompt` 与 `pikra ask` 前自动重扫 Skills 目录（支持软链与 `$skill` 显式引用），中途增删、移动或软链重定向时自动追加 `# Skills changed` 增量而不破坏前缀缓存。
 - **网页访问**：RPC 会话中的 `web_fetch` 逐跳检查目标。符合公网域名规则的名称可解析到 `198.18.0.0/15` TUN Fake-IP。工具拦截该网段的 IP 字面量、本地地址和链路本地地址。
 
 ---

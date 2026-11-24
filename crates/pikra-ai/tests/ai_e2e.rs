@@ -1344,3 +1344,99 @@ fn model_defaults_and_context_window_max_tokens_clamping() {
         "unexpected clamped max_tokens={sent_max}"
     );
 }
+
+#[test]
+fn consecutive_user_and_tool_result_messages_merge_across_strict_providers() {
+    let assistant_call = Message::Assistant(AssistantMessage {
+        content: vec![AssistantBlock::ToolCall(ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: Map::new(),
+            item_id: None,
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        })],
+        api: ApiKind::AnthropicMessages,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        response_id: None,
+        thinking_level: None,
+        usage: Default::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        diagnostics: Vec::new(),
+        timestamp: 2,
+        duration_ms: None,
+    });
+    let tool_res = Message::ToolResult(ToolResultMessage {
+        tool_call_id: "call_1".into(),
+        tool_name: "read".into(),
+        content: vec![ContentPart::Text(TextContent::plain("file contents"))],
+        is_error: false,
+        timestamp: 3,
+    });
+    let ctx = TranscriptContext::new(
+        "sys",
+        Vec::new(),
+        vec![
+            Message::User(UserMessage::meta_text(
+                "<system-reminder>A</system-reminder>",
+                0,
+            )),
+            Message::User(UserMessage::text("hello", 1)),
+            assistant_call,
+            tool_res,
+            Message::User(UserMessage::meta_text(
+                "<system-reminder>B</system-reminder>",
+                4,
+            )),
+            Message::User(UserMessage::text("follow up", 5)),
+        ],
+    );
+    let opts = SimpleStreamOptions::default();
+
+    // Anthropic: user -> assistant -> user(tool_result + text + text)
+    let anth = anthropic_messages::build_request_body(&anthropic_model(), &ctx, &opts);
+    let anth_msgs = anth["messages"].as_array().unwrap();
+    assert_eq!(anth_msgs.len(), 3);
+    assert_eq!(anth_msgs[0]["role"], "user");
+    assert_eq!(anth_msgs[0]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(anth_msgs[1]["role"], "assistant");
+    assert_eq!(anth_msgs[2]["role"], "user");
+    let anth_tail = anth_msgs[2]["content"].as_array().unwrap();
+    assert_eq!(anth_tail.len(), 3);
+    assert_eq!(anth_tail[0]["type"], "tool_result");
+    assert_eq!(anth_tail[1]["text"], "<system-reminder>B</system-reminder>");
+    assert_eq!(anth_tail[2]["text"], "follow up");
+
+    // Google Gemini: user -> model -> user(functionResponse + text + text)
+    let goog = google_generative_ai::build_request_body(&google_model(), &ctx, &opts);
+    let goog_msgs = goog["contents"].as_array().unwrap();
+    assert_eq!(goog_msgs.len(), 3);
+    assert_eq!(goog_msgs[0]["role"], "user");
+    assert_eq!(goog_msgs[0]["parts"].as_array().unwrap().len(), 2);
+    assert_eq!(goog_msgs[1]["role"], "model");
+    assert_eq!(goog_msgs[2]["role"], "user");
+    let goog_tail = goog_msgs[2]["parts"].as_array().unwrap();
+    assert_eq!(goog_tail.len(), 3);
+    assert!(goog_tail[0].get("functionResponse").is_some());
+    assert_eq!(goog_tail[1]["text"], "<system-reminder>B</system-reminder>");
+    assert_eq!(goog_tail[2]["text"], "follow up");
+
+    // OpenAI Completions: system -> user(merged) -> assistant -> tool -> user(merged)
+    let oai = openai_completions::build_request_body(&openai_completions_model(), &ctx, &opts);
+    let oai_msgs = oai["messages"].as_array().unwrap();
+    assert_eq!(oai_msgs.len(), 5);
+    assert_eq!(oai_msgs[1]["role"], "user");
+    assert_eq!(
+        oai_msgs[1]["content"],
+        "<system-reminder>A</system-reminder>\n\nhello"
+    );
+    assert_eq!(oai_msgs[3]["role"], "tool");
+    assert_eq!(oai_msgs[4]["role"], "user");
+    assert_eq!(
+        oai_msgs[4]["content"],
+        "<system-reminder>B</system-reminder>\n\nfollow up"
+    );
+}

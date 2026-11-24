@@ -5,6 +5,7 @@ use pikra_ai::{
     AssistantBlock, BoxFuture, ContentPart, Message, Model, SimpleStreamOptions, StopReason,
     StreamProvider, TranscriptContext, Usage, UserMessage, complete,
 };
+use serde::{Deserialize, Serialize};
 
 /// Fixed token estimate per image content part (excludes raw base64 bytes).
 pub const IMAGE_TOKEN_ESTIMATE: u64 = 1_200;
@@ -249,6 +250,25 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextTokenEstimat
         trailing_tokens: estimated,
         last_usage_index: None,
     }
+}
+
+/// Snapshot of current context-window usage for UI meters and diagnostics.
+///
+/// Follows the post-compaction accuracy rule: after a compaction checkpoint, `tokens` and
+/// `percent` remain `None` until a subsequent assistant turn reports fresh provider usage,
+/// while `estimated_tokens` always reflects the local heuristic over the active branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    /// Exact provider-reported + trailing estimated tokens, or `None` when no post-compaction usage exists yet.
+    pub tokens: Option<u64>,
+    /// Local heuristic token estimate over the current reconstructed context.
+    pub estimated_tokens: u64,
+    /// Active model's context window in tokens.
+    pub context_window: u32,
+    /// `tokens / context_window * 100.0`, when `tokens` is known and `context_window > 0`.
+    pub percent: Option<f64>,
+    /// Effective auto-compaction trigger threshold, when auto-compaction is enabled.
+    pub compaction_threshold: Option<u64>,
 }
 
 /// Compute the effective output reserve tokens for a model and compaction config.

@@ -208,6 +208,23 @@ fn convert_tools(tools: &[ToolDefinition], cache_control: Option<&Value>) -> Vec
         .collect()
 }
 
+fn push_user_blocks(out: &mut Vec<Value>, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(Value::Object(last_msg)) = out.last_mut()
+        && last_msg.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(Value::Array(existing)) = last_msg.get_mut("content")
+    {
+        existing.extend(blocks);
+        return;
+    }
+    out.push(json!({
+        "role": "user",
+        "content": blocks,
+    }));
+}
+
 fn convert_messages(
     model: &Model,
     messages: &[Message],
@@ -236,12 +253,7 @@ fn convert_messages(
                         _ => {}
                     }
                 }
-                if !blocks.is_empty() {
-                    out.push(json!({
-                        "role": "user",
-                        "content": blocks,
-                    }));
-                }
+                push_user_blocks(&mut out, blocks);
                 i += 1;
             }
             Message::Assistant(assistant) => {
@@ -329,10 +341,7 @@ fn convert_messages(
                 }
 
                 tool_result_blocks.extend(trailing_error_image_blocks);
-                out.push(json!({
-                    "role": "user",
-                    "content": tool_result_blocks,
-                }));
+                push_user_blocks(&mut out, tool_result_blocks);
             }
         }
     }

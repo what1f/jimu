@@ -21,6 +21,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+/// Queue bucket for a pending user input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueuedInputKind {
+    Steering,
+    FollowUp,
+}
+
+/// Read-only summary of a pending steering or follow-up message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedInputSummary {
+    pub id: String,
+    pub kind: QueuedInputKind,
+    pub text: String,
+    pub is_meta: bool,
+}
+
 /// Identifier for an event subscription returned by [`Agent::subscribe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
@@ -857,6 +873,69 @@ impl Agent {
     pub fn clear_all_queues(&self) {
         self.clear_steering_queue();
         self.clear_follow_up_queue();
+    }
+
+    /// Snapshot pending steering and follow-up inputs in FIFO order (steering first).
+    pub fn pending_inputs(&self) -> Vec<QueuedInputSummary> {
+        let mut out = Vec::new();
+        {
+            let steering = self
+                .queues
+                .steering
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for item in &steering.items {
+                out.push(QueuedInputSummary {
+                    id: item.id.clone(),
+                    kind: QueuedInputKind::Steering,
+                    text: item.text.clone(),
+                    is_meta: item.is_meta,
+                });
+            }
+        }
+        {
+            let follow_up = self
+                .queues
+                .follow_up
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for item in &follow_up.items {
+                out.push(QueuedInputSummary {
+                    id: item.id.clone(),
+                    kind: QueuedInputKind::FollowUp,
+                    text: item.text.clone(),
+                    is_meta: item.is_meta,
+                });
+            }
+        }
+        out
+    }
+
+    /// Remove a pending steering or follow-up item by id. Returns `true` if found and removed.
+    pub fn remove_queued_input(&self, id: &str) -> bool {
+        {
+            let mut steering = self
+                .queues
+                .steering
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = steering.items.iter().position(|item| item.id == id) {
+                steering.items.remove(pos);
+                return true;
+            }
+        }
+        {
+            let mut follow_up = self
+                .queues
+                .follow_up
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = follow_up.items.iter().position(|item| item.id == id) {
+                follow_up.items.remove(pos);
+                return true;
+            }
+        }
+        false
     }
 
     // ---- Event Subscription ----

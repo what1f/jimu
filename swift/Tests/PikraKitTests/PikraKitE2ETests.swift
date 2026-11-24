@@ -988,7 +988,7 @@ struct PikraKitE2ETests {
         #expect(alphaEntry.disableModelInvocation == false)
         #expect(alphaEntry.revision.count == 16)
         #expect(hiddenEntry.disableModelInvocation == true)
-        #expect(discovered.prompt.hasPrefix("<available_skills>"))
+        #expect(discovered.prompt.contains("<available_skills>"))
         #expect(discovered.prompt.contains("<name>alpha</name>"))
         #expect(discovered.prompt.contains("<description>Alpha skill v1</description>"))
         #expect(!discovered.prompt.contains("<name>hidden</name>"))

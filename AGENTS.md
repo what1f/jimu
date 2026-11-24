@@ -10,8 +10,9 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
 - `docs/architecture.md`：整体分层拓扑、设计理念、为什么这么切边界、核心状态机与体积控制机制。
 - `docs/guide-rust.md`：Rust 进程内接入指南（按层选包、内置工具与覆盖、Skills、动态工具与 MCP、拦截钩子、`pikra-durable`）。
 - `docs/guide-swift.md`：Swift 6 `PikraKit`（macOS / iOS）接入指南（模型与订阅登录、按需工具裁剪、审批与脱敏、后台唤醒）。
-- `docs/guide-acp.md`：`pikra-acp` 标准 Agent Client Protocol（Zed / JetBrains / Neovim 等）接入指南。
-- `docs/guide-rpc.md`：`pikra --mode rpc` 跨语言子进程 JSONL 通信协议指南。
+- `docs/guide-tui.md`：Rust 终端宿主的双屏、工具卡片、审批和宿主扩展。
+- `docs/guide-acp.md`：`pikra acp`（`apps/pikra`）标准 Agent Client Protocol（Zed / JetBrains / Neovim 等）接入指南。
+- `docs/guide-rpc.md`：`pikra --mode rpc`（`apps/pikra`）跨语言子进程 JSONL 通信协议指南。
 
 ---
 
@@ -42,16 +43,17 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
 | :--- | :--- | :--- |
 | `pikra-schema` | JSON Schema 构建、三遍松散参数纠偏、内置 NFA `pattern` 校验 | **仅** `serde`、`serde_json`（严禁引 `regex`、`thiserror`） |
 | `pikra-ai` | 多模型流式线协议、跨模型消息 Handoff、Codex OAuth PKCE、`HttpTransport` 抽象 | **零** `tokio`、**零** `reqwest`、**零** TLS；100% 兼容 iOS / Wasm |
-| `pikra-http` | 基于 `reqwest` + `rustls`（含系统根证书）的流式传输实现 | 仅独立 Rust 宿主与 `pikra-rpc` 引用；**严禁**被 `pikra-ffi` 引用 |
+| `pikra-http` | 基于 `reqwest` + `rustls`（含系统根证书）的流式传输实现 | 仅独立 Rust 宿主与 `apps/pikra` 引用；**严禁**被 `pikra-ffi` 引用 |
 | `pikra-agent` | 纯内存回合循环、并发/串行工具调度、`steer`/`follow_up`/`abort`、5 阶段 Middleware | 零 `tokio`、零磁盘与子进程调用 |
 | `pikra-codemode` | 受限 QuickJS（`rquickjs` 纯解释模式，禁 JIT 满足 iOS App Store 合规）工具编排沙盒 | 零网络、零文件系统暴露，强制内存上限与执行超时 |
 | `pikra-session` | 追加式会话树（内存 / JSONL）、分支 `fork`、具名 `<system-reminder>` 去重、保前缀压缩 | 仅依赖 `pikra-agent` |
 | `pikra-durable` | 可选单机 SQLite WAL（`IMMEDIATE` + `synchronous=FULL`）事务级 Checkpoint、租约隔离与恢复 | 仅无外部调度器的嵌入式守护进程选用 |
 | `pikra-js` | QuickJS 动态扩展运行时（注册自定义工具与回合/工具级钩子，支持热重载） | 流式高频 `delta` 事件严禁跨 JS 边界 |
 | `pikra-tools` | 模块化内置工具箱（`fs`、`patch`、`search`、`shell`、`monitor`、`sleep`、`web-fetch` + Schema 覆盖） | 子进程工具（`exec_command`、`write_stdin`、`monitor`）必须用 `#[cfg(not(target_os = "ios"))]` 隔离，确保全仓库可通过 `aarch64-apple-ios` 编译 |
-| `pikra-kit` | 高阶无头会话组装（可扩展 `SkillCatalog` + 增量 Diff、BM25 `tool_search`、MCP、后台唤醒收件箱） | 默认关 `stdio` 时零 `tokio` |
-| `pikra-acp` | 标准 Agent Client Protocol（ACP v1 + 编辑器扩展）库与独立二进制 `pikra-acp` | `stdout` 仅输出 JSON-RPC 2.0 报文；**严禁**被 `pikra-ffi` 引用 |
-| `pikra-ffi` | C-ABI 桥接层（供 Swift `PikraKit` 等原生 SDK 链接） | **严禁**引入 `pikra-http` / `reqwest` / `rustls` / `pikra-acp` |
+| `pikra-kit` | 高阶无头会话组装（可扩展 `SkillCatalog` + 回合前自动刷新与可选跨平台 `SkillWatcher`、增量 Diff、BM25 `tool_search`、MCP、后台唤醒收件箱） | 默认关 `stdio` 时零 `tokio`；`watch` feature 仅在非 Wasm / 非 iOS 平台引入 `notify` |
+| `pikra-tui` | 源自 Grok Build 原版引擎的 Inline / Fullscreen 双屏终端 UI 框架（默认零 `pikra-*` 依赖，任意 Harness 可接入；可选 `pikra` feature 原生直连 `KitSession`） | 默认不含 `pikra-*` 依赖；重型媒体能力（`clipboard-image`/`inline-image`/`mermaid`）按 feature 可选；`syntect` 走纯 Rust `default-fancy`；隔离 iOS，严禁被 `pikra-ffi` 引用，在 `apps/pikra` 中仅允许通过可选 `tui` feature 引入 |
+| `pikra-ffi` | C-ABI 桥接层（供 Swift `PikraKit` 等原生 SDK 链接） | **严禁**引入 `pikra-http` / `reqwest` / `rustls` / `pikra-tui` |
+| `apps/pikra` (`pikra`) | 统一 CLI 与宿主入口（JSONL RPC、`pikra acp` / ACP v1、one-shot `ask`、可选 `tui` feature 交互界面 `pikra tui`、内置通用默认系统提示词与 `--tools`/`--disable-tools` 细粒度工具裁剪） | `stdout` 在 RPC/ACP 模式下仅输出协议 JSON 报文；`--no-default-features` 无头构建必须保持零 `pikra-tui` 依赖 |
 
 ---
 
@@ -64,12 +66,12 @@ Pikra 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 
    - 动态工具增减一律走延迟网关（`deferred_tools` 上下文块 + `tool_search` + `call_tool`），绝不改写顶层 `tools` 数组。
 2. **动态上下文与 Skills 增量更新**：
    - `set_context(name, text)` 同名同值严格去重，变化时只在两轮之间以 `<system-reminder>` 追加在对话末尾，绝不回改头部系统指令。
-   - **Skills 增量 Diff**：仅在新开会话和压缩后发送一次完整 `<available_skills>`（全量渲染所有可见 Skills，不做预算截断或路径别名压缩）；会话中途增删 Skill 只在末尾追加 `# Skills changed` 增删增量，单纯修改已有 `SKILL.md` 正文静默不刷屏（模型通过 `read` 直接读最新磁盘文件）。
+   - **Skills 增量 Diff 与自动热加载**：仅在新开会话和压缩后发送一次完整 `<available_skills>`（全量渲染所有可见 Skills，不做预算截断或路径别名压缩）；默认在每轮 `prompt` 前自动重扫 Skills（可由 `auto_reload_skills` 关闭），并在非 iOS / 非 Wasm 平台提供可选 `SkillWatcher` 实时感知目录变更（支持尚未创建的 root 祖先目录与防环软链）。会话中途增删、移动或重指向软链 Skill 只在末尾追加 `# Skills changed` 增量，单纯原地修改已有 `SKILL.md` 正文静默不刷屏（模型通过 `read` 直接读最新磁盘文件）。
 3. **压缩（Compaction）与 Token 估算**：
    - 自动压缩生成摘要时，原样复用父请求完整前缀并在末尾追加摘要指令，最大化命中服务端缓存读取。
    - Token 估算必须排除图片原始 base64 字节（单图按固定常量如 `1_200` tokens 计），输出预留上限封顶，防止 128k 输出上限模型过早触发压缩。
 4. **线协议与模型兼容硬约束**：
-   - **Anthropic Messages**：并行工具结果必须合并进同一条 `role: "user"` 消息；`is_error: true` 结果里的图片拆成后续独立图片块；Claude 4.7+/5.x 自动走 `adaptive` 思考模式，旧模型手动 `budget_tokens` 在 `max_tokens <= 1024` 时自动跳过思考块防 400 报错；保留根级 `$ref`/组合器工具 Schema。
+   - **Anthropic Messages / Google Gemini / OpenAI Completions**：相邻的 `role: "user"` 消息（如多条 `<system-reminder>`、用户发言、`tool_result`/`functionResponse` 后紧跟的提醒或插话）在传输序列化层自动合并为单条 `user` 消息，避免触发上游或兼容网关的 `roles must alternate` 400 报错；Anthropic `is_error: true` 结果里的图片拆成后续独立图片块；Claude 4.7+/5.x 自动走 `adaptive` 思考模式，旧模型手动 `budget_tokens` 在 `max_tokens <= 1024` 时自动跳过思考块防 400 报错；保留根级 `$ref`/组合器工具 Schema。
    - **OpenAI Responses / Completions**：同模型保留 `item_id` 与加密推理签名，跨模型切换时自动剥离私有签名降级为纯文本；Completions 工具结果中的图片拆为紧随的用户多模态消息块保留视觉上下文。
    - **助手正文纯净**：严禁往助手 `text` 块拼接长度截断等系统提示，截断一律通过 `StopReason::Length` 表达。
 5. **进程、安全与取消收尾**：

@@ -1,0 +1,67 @@
+// Adapted from the Grok Build pager (Apache-2.0). Copyright 2023-2026 SpaceXAI.
+
+//! Top bar component: renders cwd and git info.
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
+
+use std::path::Path;
+
+use crate::engine::render::line_utils::truncate_line;
+use crate::engine::theme::Theme;
+use crate::ui::views::git_info;
+use crate::ui::views::location::{location_parts, worktree_badge};
+
+pub fn render_top_bar(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    cwd: &Path,
+    announcement: Option<&super::WelcomeAnnouncement>,
+) {
+    let line = truncate_line(location_line(cwd, theme), area.width as usize);
+    let line_width = line.width() as u16;
+    buf.set_line(area.x, area.y, &line, line_width.min(area.width));
+
+    if let Some(a) = announcement
+        && let Some(text) = a.message.as_deref()
+        && area.height > 1
+    {
+        let text_style = Style::default().fg(theme.text_primary);
+        let line = Line::from(Span::styled(text, text_style));
+        Paragraph::new(line).render(
+            Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1),
+                ..area
+            },
+            buf,
+        );
+    }
+}
+
+/// Build the `{git branch} {worktree} {cwd}` line for the welcome top bar, reading the live process cwd.
+/// The caller width-truncates the returned line.
+pub(crate) fn location_line(cwd: &Path, theme: &Theme) -> Line<'static> {
+    let info_style = Style::default().fg(theme.gray);
+    let parts = location_parts(cwd);
+
+    let mut spans: Vec<Span> = Vec::new();
+    if let Some(branch) = parts.branch.as_deref() {
+        let icon = git_info::branch_icon();
+        let git_style = Style::default()
+            .fg(theme.text_primary)
+            .add_modifier(Modifier::DIM);
+        spans.push(Span::styled(format!("{icon} {branch}"), git_style));
+        spans.push(Span::styled(" ", info_style));
+    }
+    if parts.is_worktree {
+        spans.push(worktree_badge(theme));
+    }
+    let cwd_style = Style::default().fg(theme.gray_dim);
+    spans.push(Span::styled(parts.cwd_display, cwd_style));
+    Line::from(spans)
+}

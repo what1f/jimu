@@ -288,9 +288,14 @@ public actor PikraSkillCatalog {
         private func collectWatchTargets() -> Set<String> {
             let fm = FileManager.default
             var targets: Set<String> = []
+            var ancestry: Set<String> = []
 
             func scanDirectory(_ dirURL: URL, includeRootMarkdown: Bool) {
                 let dirPath = dirURL.standardizedFileURL.path
+                let canonicalPath = dirURL.resolvingSymlinksInPath().path
+                guard ancestry.insert(canonicalPath).inserted else { return }
+                defer { ancestry.remove(canonicalPath) }
+
                 targets.insert(dirPath)
 
                 guard let children = try? fm.contentsOfDirectory(atPath: dirPath) else {
@@ -328,11 +333,37 @@ public actor PikraSkillCatalog {
             for root in roots {
                 let rootPath = root.standardizedFileURL.path
                 var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: rootPath, isDirectory: &isDir) else { continue }
-                if isDir.boolValue {
-                    scanDirectory(root, includeRootMarkdown: true)
-                } else if rootPath.hasSuffix(".md") {
-                    targets.insert(rootPath)
+                if fm.fileExists(atPath: rootPath, isDirectory: &isDir) {
+                    if let attrs = try? fm.attributesOfItem(atPath: rootPath),
+                       (attrs[.type] as? FileAttributeType) == .typeSymbolicLink
+                    {
+                        let parentPath = root.standardizedFileURL.deletingLastPathComponent().path
+                        if fm.fileExists(atPath: parentPath) {
+                            targets.insert(parentPath)
+                        }
+                    }
+                    if isDir.boolValue {
+                        scanDirectory(root, includeRootMarkdown: true)
+                    } else if rootPath.hasSuffix(".md") {
+                        targets.insert(rootPath)
+                    }
+                } else {
+                    var ancestor = root.standardizedFileURL.deletingLastPathComponent()
+                    while true {
+                        let ancestorPath = ancestor.path
+                        var ancestorIsDir: ObjCBool = false
+                        if fm.fileExists(atPath: ancestorPath, isDirectory: &ancestorIsDir),
+                           ancestorIsDir.boolValue
+                        {
+                            targets.insert(ancestorPath)
+                            break
+                        }
+                        let parent = ancestor.deletingLastPathComponent()
+                        if parent.path == ancestorPath {
+                            break
+                        }
+                        ancestor = parent
+                    }
                 }
             }
             return targets

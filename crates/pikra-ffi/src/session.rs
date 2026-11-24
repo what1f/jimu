@@ -725,6 +725,10 @@ impl FfiSession {
         &self,
         user_msg: AgentMessage,
     ) -> Result<(Vec<AgentMessage>, usize, Vec<SessionEvent>), String> {
+        if let Some(config) = &self.skill_discovery {
+            let discovered = SkillCatalog::discover_with_config(config);
+            *self.skills.lock().unwrap_or_else(|e| e.into_inner()) = discovered;
+        }
         let flushed = {
             let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
             if self.skill_discovery.is_some() {
@@ -1293,7 +1297,7 @@ impl FfiSession {
         };
         let mut skills = self.skills.lock().unwrap_or_else(|e| e.into_inner());
         let discovered = SkillCatalog::discover_with_config(config);
-        let changed = !skills.has_same_visible_names(&discovered);
+        let changed = !skills.has_same_visible_skills(&discovered);
         *skills = discovered;
         Ok(changed)
     }

@@ -8,7 +8,7 @@ mod types;
 
 pub use compaction::{
     CompactionConfig, CompactionInput, CompactionOutput, CompactionResult, CompactionStrategy,
-    ContextTokenEstimate, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_SUMMARY_CHARS,
+    ContextTokenEstimate, ContextUsage, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_SUMMARY_CHARS,
     DefaultCompactionStrategy, IMAGE_TOKEN_ESTIMATE, MAX_AUTO_RESERVE_TOKENS,
     MIN_AUTO_RESERVE_TOKENS, cap_summary_length, compaction_threshold, effective_reserve_tokens,
     estimate_agent_message_tokens, estimate_content_parts_tokens, estimate_context_tokens,

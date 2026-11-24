@@ -1460,7 +1460,8 @@ fn scoped_skills_reload_reopen_and_compact_without_prefix_drift() {
         assert!(catalog.get("out-of-repo").is_none() && catalog.get("blocked").is_none());
         assert_eq!(catalog.get("a-build").unwrap().file_path, keep);
         let xml = catalog.format_for_context().unwrap();
-        assert!(xml.starts_with("<available_skills>\n"));
+        assert!(xml.contains("read its SKILL.md file at <location>"));
+        assert!(xml.contains("<available_skills>\n"));
         assert!(!xml.contains("<truncated") && !xml.contains("alias=\"r0\""));
         assert!(xml.contains(&format!("<location>{}</location>", keep.to_string_lossy())));
         assert!(xml.contains(&format!(
@@ -2024,5 +2025,113 @@ fn review_batch2_abort_unpolled_stream_steer_parts_skills_move_and_instructions(
         let mb = InstructionCatalog::discover(&icfg);
         assert!(mb.truncated());
         assert!(mb.entries().is_empty());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_auto_reload_symlink_retarget_and_watcher_deliver_changes() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let skills_root = workspace.join(".agents/skills");
+        let external_v1 = dir.path().join("external/linked-v1");
+        let external_v2 = dir.path().join("external/linked-v2");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join(".git"), "").unwrap();
+        fs::create_dir_all(&external_v1).unwrap();
+        fs::create_dir_all(&external_v2).unwrap();
+        fs::write(
+            external_v1.join("SKILL.md"),
+            "---\nname: linked\ndescription: Linked v1\n---\nInstructions v1\n",
+        )
+        .unwrap();
+        fs::write(
+            external_v2.join("SKILL.md"),
+            "---\nname: linked\ndescription: Linked v2\n---\nInstructions v2\n",
+        )
+        .unwrap();
+
+        let http = Arc::new(FauxTransport::new());
+        let provider = Arc::new(Client::new(http.clone()));
+        let config =
+            KitSessionConfig::new(test_model()).with_skill_discovery(SkillDiscoveryConfig {
+                cwd: Some(workspace.clone()),
+                include_user_skills: false,
+                ..Default::default()
+            });
+        // Start session BEFORE `.agents/skills` even exists.
+        let session = KitSession::new(provider, config).unwrap();
+        assert!(session.skills().skills().is_empty());
+
+        let (tx, rx) = mpsc::channel();
+        let _watcher = session
+            .watch_skills(move |catalog| {
+                let _ = tx.send(catalog);
+            })
+            .unwrap();
+
+        http.enqueue_sse(openai_sse_text("t1", "Turn 1 ok."));
+        session.prompt("Turn 1").await.unwrap();
+        assert!(!http.requests()[0].body_json.to_string().contains("linked"));
+
+        // Create `.agents/skills` and symlink an external skill into it.
+        fs::create_dir_all(&skills_root).unwrap();
+        let link_path = skills_root.join("linked");
+        symlink(&external_v1, &link_path).unwrap();
+
+        // Watcher must notice the newly created root & symlinked skill automatically.
+        let watched_catalog = loop {
+            let cat = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("SkillWatcher must emit when missing root and symlinked skill appear");
+            if cat.get("linked").is_some() {
+                break cat;
+            }
+        };
+        assert_eq!(
+            watched_catalog.get("linked").unwrap().description,
+            "Linked v1"
+        );
+        assert!(watched_catalog.contains_path(&link_path.join("SKILL.md")));
+
+        // Next turn picks up the skill automatically WITHOUT calling reload_skills().
+        http.enqueue_sse(openai_sse_text("t2", "Turn 2 ok."));
+        session.prompt("Turn 2").await.unwrap();
+        let req2 = http.requests()[1].body_json.to_string();
+        assert!(
+            req2.contains("# Skills changed") && req2.contains("Linked v1"),
+            "{req2}"
+        );
+
+        // Retarget the symlink in place from v1 -> v2; canonical_path change must emit a diff.
+        fs::remove_file(&link_path).unwrap();
+        symlink(&external_v2, &link_path).unwrap();
+        http.enqueue_sse(openai_sse_text("t3", "Turn 3 ok."));
+        session.prompt("Turn 3").await.unwrap();
+        let req3 = http.requests()[2].body_json.to_string();
+        assert!(
+            req3.contains("# Skills changed") && req3.contains("Linked v2"),
+            "{req3}"
+        );
+
+        // Editing the current target in place must NOT emit another `# Skills changed`.
+        fs::write(
+            external_v2.join("SKILL.md"),
+            "---\nname: linked\ndescription: Linked v2 edited\n---\nBody edited\n",
+        )
+        .unwrap();
+        http.enqueue_sse(openai_sse_text("t4", "Turn 4 ok."));
+        session.prompt("Turn 4").await.unwrap();
+        let req4 = http.requests()[3].body_json.to_string();
+        assert!(!req4.contains("Linked v2 edited"), "{req4}");
+        for pair in http.requests().windows(2) {
+            assert_prompt_prefix_identical(&pair[0], &pair[1]);
+        }
     });
 }

@@ -1,16 +1,23 @@
 use crate::skills::{SkillCatalog, escape_xml};
 use pikra_ai::ContentPart;
 use pikra_session::{SessionEntry, SessionEntryPayload, SessionError, SessionManager};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const SKILLS_CONTEXT_NAME: &str = "skills";
 const SKILL_STATE_ENTRY: &str = "kit.known_skills";
 
-/// Records which skills (`name -> location_path`) the active branch has already presented to the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KnownSkillLocation {
+    file_path: String,
+    canonical_path: String,
+}
+
+/// Records which skills (`name -> location`) the active branch has already presented to the model.
 #[derive(Default)]
 pub struct SkillContextState {
-    entries: Option<BTreeMap<String, String>>,
-    persisted_entries: Option<BTreeMap<String, String>>,
+    entries: Option<BTreeMap<String, KnownSkillLocation>>,
+    persisted_entries: Option<BTreeMap<String, KnownSkillLocation>>,
     pending_mention: Option<String>,
     has_named_context: bool,
 }
@@ -33,7 +40,7 @@ impl SkillContextState {
                 SessionEntryPayload::Custom { custom_type, data }
                     if custom_type == SKILL_STATE_ENTRY =>
                 {
-                    serde_json::from_value::<BTreeMap<String, String>>(data.clone())
+                    serde_json::from_value::<BTreeMap<String, KnownSkillLocation>>(data.clone())
                         .ok()
                         .map(Some)
                 }
@@ -120,13 +127,16 @@ impl SkillContextState {
     }
 }
 
-fn current_known_skills(catalog: &SkillCatalog) -> BTreeMap<String, String> {
+fn current_known_skills(catalog: &SkillCatalog) -> BTreeMap<String, KnownSkillLocation> {
     catalog
         .visible()
         .map(|skill| {
             (
                 skill.name.clone(),
-                skill.file_path.to_string_lossy().into_owned(),
+                KnownSkillLocation {
+                    file_path: skill.file_path.to_string_lossy().into_owned(),
+                    canonical_path: skill.canonical_path.to_string_lossy().into_owned(),
+                },
             )
         })
         .collect()
@@ -136,7 +146,7 @@ fn queue_skill_context(
     session: &mut SessionManager,
     catalog: &SkillCatalog,
     known: &mut SkillContextState,
-    current: &BTreeMap<String, String>,
+    current: &BTreeMap<String, KnownSkillLocation>,
 ) {
     if let Some(previous) = &known.entries {
         let removed: Vec<_> = previous
@@ -144,9 +154,10 @@ fn queue_skill_context(
             .filter(|name| !current.contains_key(*name))
             .collect();
         let is_added_or_moved = |skill: &crate::Skill| {
-            previous
-                .get(&skill.name)
-                .is_none_or(|prev_path| prev_path.as_str() != skill.file_path.to_string_lossy())
+            previous.get(&skill.name).is_none_or(|prev| {
+                prev.file_path.as_str() != skill.file_path.to_string_lossy()
+                    || prev.canonical_path.as_str() != skill.canonical_path.to_string_lossy()
+            })
         };
         let added = catalog.format_visible(is_added_or_moved);
         if added.is_some() || !removed.is_empty() {

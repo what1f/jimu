@@ -9,8 +9,9 @@ rust-version.workspace = true
 test = false
 
 [features]
-default = ["stdio"]
+default = ["stdio", "watch"]
 stdio = ["dep:tokio"]
+watch = ["dep:notify"]
 
 [dependencies]
 pikra-schema.workspace = true
@@ -32,6 +33,9 @@ uuid = { workspace = true, features = ["js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["process", "io-util", "sync", "rt"], optional = true }
+
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies]
+notify = { workspace = true, optional = true }
 
 [dev-dependencies]
 pikra-testkit.workspace = true
