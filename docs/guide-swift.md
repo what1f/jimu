@@ -1,25 +1,25 @@
-# Pikra Swift SDK (`PikraKit`) 接入指南
+# Jimu Swift SDK (`JimuKit`) 接入指南
 
-`PikraKit` 是面向 macOS 15+ 与 iOS 17+ 的零第三方依赖 Swift 6 原生 SDK（底层链接 `PikraCore.xcframework`）。网络直接复用系统无痕 `URLSession`，内置工具与 Skills/动态工具能力由跨平台 Rust 内核统一驱动。
+`JimuKit` 是面向 macOS 15+ 与 iOS 17+ 的零第三方依赖 Swift 6 原生 SDK（底层链接 `JimuCore.xcframework`）。网络直接复用系统无痕 `URLSession`，内置工具与 Skills/动态工具能力由跨平台 Rust 内核统一驱动。
 
 ---
 
 ## 1. 引入依赖
 
 ### 本地路径引入（Monorepo / 开发联调）
-先在 Pikra 仓库构建多平台静态库框架：
+先在 Jimu 仓库构建多平台静态库框架：
 ```bash
 ./swift/scripts/build-xcframework.sh --all-platforms --zip
 ```
 在你的 `Package.swift` 中引入：
 ```swift
 dependencies: [
-    .package(path: "../pikra/swift"),
+    .package(path: "../jimu/swift"),
 ],
 targets: [
     .target(
         name: "MyAppAgent",
-        dependencies: [.product(name: "PikraKit", package: "PikraKit")]
+        dependencies: [.product(name: "JimuKit", package: "JimuKit")]
     ),
 ]
 ```
@@ -30,9 +30,9 @@ targets: [
 
 ```swift
 import Foundation
-import PikraKit
+import JimuKit
 
-let model = PikraModel(
+let model = JimuModel(
     id: "claude-sonnet-5-5",
     provider: "anthropic",
     api: .anthropicMessages,
@@ -43,15 +43,15 @@ let model = PikraModel(
     supportsReasoning: true
 )
 
-let env = try PikraWorkspaceEnvironment(workspace: workspaceURL)
+let env = try JimuWorkspaceEnvironment(workspace: workspaceURL)
 let tools = [
-    try PikraBuiltinTools.read(env),
-    try PikraBuiltinTools.edit(env),
-    try PikraBuiltinTools.grep(env),
-    try PikraBuiltinTools.webFetch(env),
+    try JimuBuiltinTools.read(env),
+    try JimuBuiltinTools.edit(env),
+    try JimuBuiltinTools.grep(env),
+    try JimuBuiltinTools.webFetch(env),
 ]
 
-var config = PikraConfiguration(
+var config = JimuConfiguration(
     model: model,
     systemPrompt: "You are a helpful macOS assistant.",
     tools: tools,
@@ -64,7 +64,7 @@ config.authorizeRequest = { req in
     req.setValue("Bearer \(apiKeyFromKeychain())", forHTTPHeaderField: "Authorization")
 }
 
-let agent = try await PikraAgent.open(configuration: config)
+let agent = try await JimuAgent.open(configuration: config)
 let stream = try await agent.prompt("帮我看看当前目录有哪些 Swift 文件")
 
 for try await event in stream {
@@ -82,26 +82,26 @@ for try await event in stream {
 ```
 
 ### ChatGPT / Codex 订阅账号登录（OAuth PKCE）
-无需手工管理 Token 刷新，直接使用内置 `PikraCodexOAuth` 与 `PikraCodexSubscription`（支持多账号并发隔离，自动防旧账号刷新覆盖新账号凭证）：
+无需手工管理 Token 刷新，直接使用内置 `JimuCodexOAuth` 与 `JimuCodexSubscription`（支持多账号并发隔离，自动防旧账号刷新覆盖新账号凭证）：
 - 生成 PKCE 授权链接并在回调后换取凭证；
-- 将 `PikraCodexSubscription` 挂入 `PikraConfiguration`，使用 `.openaiCodexResponses` 协议即可直连订阅模型。
+- 将 `JimuCodexSubscription` 挂入 `JimuConfiguration`，使用 `.openaiCodexResponses` 协议即可直连订阅模型。
 
 ---
 
 ## 3. 选用内置工具与编写 Swift 自定义工具
 
 ### 3.1 按需挂载内置工作区工具（自动死代码裁剪）
-内置工具底层全部由 Rust `pikra-tools` 单一实现驱动，每个工具对应独立的构造入口：
+内置工具底层全部由 Rust `jimu-tools` 单一实现驱动，每个工具对应独立的构造入口：
 - **打包自动瘦身**：Xcode Release 编译默认开启 `-dead_strip`，你的代码里没引用的重型工具（如内嵌 `ripgrep` 的 `grep` 或内嵌 Defuddle HTML 解析器的 `webFetch`）会在最终打 `.app` 包时被链接器整块剔除。
 - **平台边界**：`read`、`write`、`edit`、`applyPatch`、`find`、`grep`、`sleep`、`webFetch` 在 **macOS 与 iOS 全可用**；涉及子进程的 `execCommandOneShot` / `execCommand` / `writeStdin` / `monitor` 仅在 **macOS** 可用（iOS 编译期自动隔离）。
 - **定制描述与 Schema**：每个内置工具均支持传入覆盖配置（改工具名、替换/追加描述文案、隐藏特定可选参数并固定默认值）。
 - **网页访问**：`webFetch` 默认访问公网地址，支持符合公网域名规则的名称解析到 `198.18.0.0/15` TUN Fake-IP。工具逐跳检查重定向并拦截本地和链路本地地址。`URLSession` 使用系统解析与代理配置。
 
 ### 3.2 用 Swift 闭包注册宿主专属工具
-涉及 macOS / iOS 系统原生 API（如读取日历、控制窗口、剪贴板）的工具，直接用 `PikraTool` 编写，可自由选择设为常驻（`deferred: false`）或延迟加载（`deferred: true`）：
+涉及 macOS / iOS 系统原生 API（如读取日历、控制窗口、剪贴板）的工具，直接用 `JimuTool` 编写，可自由选择设为常驻（`deferred: false`）或延迟加载（`deferred: true`）：
 
 ```swift
-let clipboardTool = PikraTool(
+let clipboardTool = JimuTool(
     name: "read_clipboard",
     description: "Read plain text from the macOS system pasteboard.",
     parameters: [
@@ -115,7 +115,7 @@ let clipboardTool = PikraTool(
 ```
 
 ### 3.3 权限审批弹窗与输出脱敏
-通过 `PikraToolApproval`（或执行前后拦截回调）集中处理高危操作确认与密钥脱敏，无需自己重包工具逻辑：
+通过 `JimuToolApproval`（或执行前后拦截回调）集中处理高危操作确认与密钥脱敏，无需自己重包工具逻辑：
 - 只读工具（`read` / `find` / `grep`）可直接放行；
 - 写入与终端工具（`write` / `edit` / `applyPatch` / `execCommand`）在执行前挂起等待用户在 UI 审批卡片点击允许或拒绝；用户取消回复时审批等待会自动响应 Swift Concurrency `CancellationError` 立即退出。
 
@@ -125,8 +125,8 @@ let clipboardTool = PikraTool(
 
 1. **`AGENTS.md` 规则与 Skills 目录配置**：
    - 库层零品牌目录硬编码：默认只识别跨生态 `.agents/skills` 与 `~/.agents`，宿主通过 `userDirs` / `projectSkillDirs` 挂载自有目录（如 `~/.dora`、`.dora/skills`）；自动化测试中可将 `includeUserInstructions` / `includeUserSkills` 设为 `false` 隔离本机全局目录。
-   - 共用 `PikraWalkBoundary`（`.projectRoot` 停在 `.git` 根、`.filesystemRoot` 一路爬到 `/`、`.currentDirOnly` 仅当前目录）；`PikraInstructionDiscovery.Configuration` 默认开启相同正文自动去重与 `32 KiB` 可调上限（传 `nil` 不限上限）。
-   - Skills 在每轮 `prompt` 前自动重扫并只追加 `# Skills changed` 增删/软链重定向增量（原地修改正文不刷屏，不破坏前缀缓存）；空闲态监听目录变更可用 `PikraSkillCatalog`（已支持防循环软链与尚未创建的根目录祖先监听），`AGENTS.md` 或需要手动强制刷新时可调用 `reloadInstructions()` / `reloadSkills()`。
+   - 共用 `JimuWalkBoundary`（`.projectRoot` 停在 `.git` 根、`.filesystemRoot` 一路爬到 `/`、`.currentDirOnly` 仅当前目录）；`JimuInstructionDiscovery.Configuration` 默认开启相同正文自动去重与 `32 KiB` 可调上限（传 `nil` 不限上限）。
+   - Skills 默认在每轮 `prompt` 前自动重扫（`JimuConfiguration.autoReloadSkills`，默认 `true`，可设为 `false` 关闭）并只追加 `# Skills changed` 增删/软链重定向增量（原地修改正文不刷屏，不破坏前缀缓存）；空闲态监听目录变更可用 `JimuSkillCatalog`（已支持防循环软链与尚未创建的根目录祖先监听），`AGENTS.md` 或关闭自动重扫后需要手动刷新时可调用 `reloadInstructions()` / `reloadSkills()`。
 2. **MCP 与海量工具热更新**：
    - 会话运行期增删外部 MCP 工具调用 `upsertTools` / `removeTools`（仅操作延迟工具池，保证顶层常驻工具字节不变）。
 3. **隐藏系统上下文（`isMeta`）、中途插话与生命周期**：

@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pikra-schema",
-    "crates/pikra-ai",
-    "crates/pikra-http",
-    "crates/pikra-agent",
-    "crates/pikra-codemode",
-    "crates/pikra-session",
-    "crates/pikra-durable",
-    "crates/pikra-js",
-    "crates/pikra-tools",
-    "crates/pikra-kit",
-    "crates/pikra-ffi",
-    "crates/pikra-testkit",
-    "crates/pikra-tui",
-    "apps/pikra",
+    "crates/jimu-schema",
+    "crates/jimu-ai",
+    "crates/jimu-http",
+    "crates/jimu-agent",
+    "crates/jimu-codemode",
+    "crates/jimu-session",
+    "crates/jimu-durable",
+    "crates/jimu-js",
+    "crates/jimu-tools",
+    "crates/jimu-kit",
+    "crates/jimu-ffi",
+    "crates/jimu-testkit",
+    "crates/jimu-tui",
+    "apps/jimu",
 ]
 
 [workspace.package]
@@ -22,7 +22,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.96"
-repository = "https://github.com/what1f/pikra"
+repository = "https://github.com/what1f/jimu"
 
 [profile.dev]
 debug = "line-tables-only"
@@ -41,19 +41,19 @@ strip = "symbols"
 strip = "none"
 
 [workspace.dependencies]
-pikra-schema = { path = "crates/pikra-schema" }
-pikra-ai = { path = "crates/pikra-ai" }
-pikra-http = { path = "crates/pikra-http" }
-pikra-agent = { path = "crates/pikra-agent" }
-pikra-codemode = { path = "crates/pikra-codemode" }
-pikra-session = { path = "crates/pikra-session" }
-pikra-durable = { path = "crates/pikra-durable" }
-pikra-js = { path = "crates/pikra-js" }
-pikra-tools = { path = "crates/pikra-tools" }
-pikra-kit = { path = "crates/pikra-kit", default-features = false }
-pikra-ffi = { path = "crates/pikra-ffi" }
-pikra-testkit = { path = "crates/pikra-testkit" }
-pikra-tui = { path = "crates/pikra-tui", default-features = false }
+jimu-schema = { path = "crates/jimu-schema" }
+jimu-ai = { path = "crates/jimu-ai" }
+jimu-http = { path = "crates/jimu-http" }
+jimu-agent = { path = "crates/jimu-agent" }
+jimu-codemode = { path = "crates/jimu-codemode" }
+jimu-session = { path = "crates/jimu-session" }
+jimu-durable = { path = "crates/jimu-durable" }
+jimu-js = { path = "crates/jimu-js" }
+jimu-tools = { path = "crates/jimu-tools" }
+jimu-kit = { path = "crates/jimu-kit", default-features = false }
+jimu-ffi = { path = "crates/jimu-ffi" }
+jimu-testkit = { path = "crates/jimu-testkit" }
+jimu-tui = { path = "crates/jimu-tui", default-features = false }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm", "unstable-widget-ref", "unstable-backend-writer", "scrolling-regions"] }
 ratatui-core = "0.1"
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }

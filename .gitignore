@@ -1,6 +1,6 @@
 /target
 /.build
-/.pikra-wt
+/.jimu-wt
 **/*.rs.bk
 .DS_Store
 .env

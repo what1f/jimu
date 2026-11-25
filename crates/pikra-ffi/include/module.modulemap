@@ -1,4 +1,0 @@
-module CPikra {
-    header "pikra.h"
-    export *
-}

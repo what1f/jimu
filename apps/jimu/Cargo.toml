@@ -1,0 +1,57 @@
+[package]
+name = "jimu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "jimu"
+path = "src/lib.rs"
+test = false
+
+[[bin]]
+name = "jimu"
+path = "src/main.rs"
+test = false
+
+[features]
+default = ["tui"]
+tui = ["dep:jimu-tui"]
+
+[dependencies]
+agent-client-protocol-schema.workspace = true
+jimu-schema.workspace = true
+jimu-ai.workspace = true
+jimu-http.workspace = true
+jimu-agent.workspace = true
+jimu-session.workspace = true
+jimu-codemode.workspace = true
+jimu-js.workspace = true
+jimu-tools.workspace = true
+jimu-kit = { workspace = true, features = ["stdio", "watch"] }
+jimu-tui = { workspace = true, features = [
+    "jimu",
+    "syntax",
+    "system-appearance",
+    "history-search",
+    "scrolling-regions",
+    "clipboard-image",
+    "inline-image",
+    "mermaid",
+], optional = true }
+base64.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The reference SDK revision uses schema 1.21.0. The published 5.4.0 pins 1.19.0.
+agent-client-protocol = { version = "5.4.0", git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "d9d2caea5247ee0350d98b9ef08cba5e5712754d", default-features = false, features = ["process", "stdio", "unstable"] }
+jimu-testkit.workspace = true
+tokio-util = { version = "0.7", features = ["compat"] }

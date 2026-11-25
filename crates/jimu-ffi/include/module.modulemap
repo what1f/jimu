@@ -1,0 +1,4 @@
+module CJimu {
+    header "jimu.h"
+    export *
+}

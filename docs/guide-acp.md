@@ -1,6 +1,6 @@
-# Pikra ACP（Agent Client Protocol）接入指南
+# Jimu ACP（Agent Client Protocol）接入指南
 
-`pikra acp`（等价于 `pikra --mode acp`，由统一无头包 `apps/pikra` 提供）是 Pikra 官方的 **Agent Client Protocol（ACP v1 + 编辑器增强扩展）** 入口，可直接接入 **Zed**、**JetBrains 全家桶**、**Neovim（CodeCompanion / Avante）**、**Emacs（agent-shell）**、**Toad** 等所有兼容 ACP 的编辑器与客户端。
+`jimu acp`（由统一 CLI 包 `apps/jimu` 提供，无头部署可用 `--no-default-features` 零 TUI 依赖构建）是 Jimu 官方的 **Agent Client Protocol（ACP v1 + 编辑器增强扩展）** 入口，可直接接入 **Zed**、**JetBrains 全家桶**、**Neovim（CodeCompanion / Avante）**、**Emacs（agent-shell）**、**Toad** 等所有兼容 ACP 的编辑器与客户端。
 
 ---
 
@@ -9,8 +9,8 @@
 在仓库根目录编译统一无头二进制（内置 RPC 与 ACP，零 TUI 依赖）：
 
 ```bash
-cargo build --release -p pikra
-# 产物位于 ./target/release/pikra
+cargo build --release -p jimu
+# 产物位于 ./target/release/jimu
 ```
 
 ### 认证方式（任选其一）
@@ -19,19 +19,17 @@ cargo build --release -p pikra
    按优先级自动识别 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）、`DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY`。
 2. **ChatGPT / Codex 订阅账号登录（OAuth PKCE）**：
    ```bash
-   pikra login
+   jimu login
    ```
-   登录凭证以 `0600` 权限保存在 `~/.pikra/auth.json`（若本机已通过 Codex CLI 登录过 `~/.codex/auth.json`，也会自动只读复用并在刷新时写入 `~/.pikra/auth.json`）。也可以直接在编辑器面板点击登录按钮触发内置终端登录流程。
-3. **自定义服务商与模型矩阵（`~/.pikra/acp/providers.json`）**：
-   支持覆写内置服务商或新增自定义服务商，按模型声明显示名、上下文窗口（`context_window`）、最大输出（`max_output_tokens`）、图片支持（`supports_images`）与可选思考档位（`thinking_levels`，支持 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`）：
+   登录凭证以 `0600` 权限保存在 `~/.jimu/auth.json`（若本机已通过 Codex CLI 登录过 `~/.codex/auth.json`，也会自动只读复用并在刷新时写入 `~/.jimu/auth.json`）。也可以直接在编辑器面板点击登录按钮触发内置终端登录流程。
+3. **全局服务商与模型配置（`~/.jimu/providers.json`，与 TUI / RPC / `-p` 全模式共享）**：
+   内置预设仅提供接入方式（`api`、`base_url`、`env`）而不再硬编码过时模型列表。通过 `~/.jimu/providers.json` 覆写或禁用内置预设（`api` / `base_url` 均可选，例如 `{"openai": {"disabled": true}}`）、新增自定义服务商，并按模型声明显示名、上下文窗口（`context_window`）、最大输出（`max_output_tokens`）、图片支持（`supports_images`）与可选思考档位（`thinking_levels`）。所有模式的会话文件统一保存在 `~/.jimu/sessions/` 下：
    ```json
    {
+     "openai": { "disabled": true },
      "deepseek": {
-       "api": "openai-responses",
-       "base_url": "https://api.deepseek.com/v1",
        "models": [
-         { "id": "deepseek-flash", "name": "DeepSeek Flash", "context_window": 1000000, "max_output_tokens": 384000, "supports_images": true, "thinking_levels": ["low", "high", "max"] },
-         { "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "context_window": 1000000, "max_output_tokens": 384000, "supports_images": true, "thinking_levels": ["low", "high", "max"] }
+         { "id": "deepseek-chat", "name": "DeepSeek Chat", "context_window": 128000, "max_output_tokens": 8192, "supports_images": false, "thinking_levels": ["low", "high", "max"] }
        ]
      }
    }
@@ -46,8 +44,8 @@ cargo build --release -p pikra
 ```json
 {
   "agent_servers": {
-    "Pikra": {
-      "command": "/path/to/pikra/target/release/pikra",
+    "Jimu": {
+      "command": "/path/to/jimu/target/release/jimu",
       "args": ["acp"],
       "env": {
         "ANTHROPIC_API_KEY": "sk-ant-..."
@@ -57,15 +55,15 @@ cargo build --release -p pikra
 }
 ```
 
-> 若已运行 `pikra login` 登录 ChatGPT/Codex 订阅或在系统环境配好了密钥，`env` 可留空 `{}`；进入会话后可直接在 Zed 顶部下拉框切换 **模型（Model）**、**思考强度（Thought Level）**、**极速模式（Fast）** 与 **权限模式（Mode）**。
+> 若已运行 `jimu login` 登录 ChatGPT/Codex 订阅或在系统环境配好了密钥，`env` 可留空 `{}`；进入会话后可直接在 Zed 顶部下拉框切换 **模型（Model）**、**思考强度（Thought Level）**、**极速模式（Fast）** 与 **权限模式（Mode）**。
 
 ### 2.2 JetBrains IDEs（`~/.jetbrains/acp.json`）
 
 ```json
 {
   "agent_servers": {
-    "Pikra": {
-      "command": "/path/to/pikra/target/release/pikra",
+    "Jimu": {
+      "command": "/path/to/jimu/target/release/jimu",
       "args": ["acp", "--thinking", "high"],
       "env": {}
     }
@@ -79,13 +77,13 @@ cargo build --release -p pikra
 require("codecompanion").setup({
   adapters = {
     acp = {
-      pikra = function()
+      jimu = function()
         return require("codecompanion.adapters").extend("claude_code", {
-          name = "pikra",
-          formatted_name = "Pikra",
+          name = "jimu",
+          formatted_name = "Jimu",
           commands = {
             default = {
-              "/path/to/pikra/target/release/pikra",
+              "/path/to/jimu/target/release/jimu",
               "acp",
             },
           },
@@ -103,22 +101,22 @@ require("codecompanion").setup({
 | 能力域 | 具体支持表现 |
 | :--- | :--- |
 | **编辑器未保存缓冲区与内联 Diff** | 当客户端声明 `fs.readTextFile` / `fs.writeTextFile` 时，`read` 直接读取编辑器当前未保存内容（若编辑器因工作区限制拒读已发现的外部或软链 Skill 目录文件，则自动安全回退至本地读取），`write` / `edit` / `apply_patch` 在审批前与完成后均输出标准 `Diff` 与行号定位 `ToolCallLocation`，在 IDE 内直接渲染双栏或行内对比 |
-| **IDE 内嵌实时终端** | 当客户端声明 `terminal` 能力时，终端命令自动通过 `terminal/create` 在编辑器面板内嵌实时输出流，并在取消或超时时自动 `terminal/kill` + `terminal/release`；无此能力的客户端自动无缝回退至 Pikra 本地终端引擎 |
+| **IDE 内嵌实时终端** | 当客户端声明 `terminal` 能力时，终端命令自动通过 `terminal/create` 在编辑器面板内嵌实时输出流，并在取消或超时时自动 `terminal/kill` + `terminal/release`；无此能力的客户端自动无缝回退至 Jimu 本地终端引擎 |
 | **四档权限模式与交互审批** | 内置 `default`（读写与命令走 `session/request_permission` 弹窗，支持单次允许 / 本会话始终允许 / 拒绝）、`acceptEdits`（工作区内改文件自动放行，跑命令弹窗确认）、`plan`（只读探索出方案，拦截写操作）与 `bypassPermissions`（全自动放行） |
 | **网页访问** | 公网地址直接访问，含解析到 TUN Fake-IP 的公网域名。本地地址通过 `session/request_permission` 审批，记住的许可按协议、主机和端口生效。`bypassPermissions` 直接许可本地来源。公网链接重定向到本地地址、跳转到其他本地来源、以及任何链路本地地址都会被拦截。本地主机名可使用剔除 IPv6 链路本地地址后剩余的地址 |
 | **会话全生命周期持久化** | 完整实现 `session/new`、`session/load`（严格按序回放历史消息、思考、工具卡片与压缩记录）、`session/resume`（免回放秒连）、`session/list`（按工作目录筛选与游标分页）、`session/fork`、`session/delete`、`session/archive`、`session/set_title`（首轮自动生成会话标题） |
 | **流中插话（`_session/steering`）与随时取消** | 兼容 `codex-acp` / `claude-agent-acp` 的 `_session/steering` 扩展（运行中实时注入指令，空闲时支持 `promptRequired`，携带 `"isMeta": true` 时作为仅模型可见的隐藏提醒注入且不在 `session/load` 回放用户气泡）；收到 `session/cancel` 立即中断流式生成、在途终端与审批等待并返回 `cancelled` |
-| **动态面板配置、MCP 与斜杠命令** | 原生暴露模型、思考档位、`fast` 模式与权限模式选择器；自动挂载客户端传入的 `mcpServers`（`stdio` + `http`）；自动将 `/compact`、`/plan`、`/reload-skills` 及项目 `.agents/skills` / `.pikra/skills` 注册为编辑器 `/` 快捷命令，并通过跨平台目录监听与回合前自动刷新实时热更新 `/` 命令列表与 `# Skills changed` 增量（兼容软链与中途新建的 Skills 目录） |
-| **可配置 `AGENTS.md`、工具裁剪与默认系统提示词** | 默认加载 `~/.agents` 与工作区层级的 `AGENTS.override.md` / `AGENTS.md`（自动兼容客户端传入的 `additionalDirectories` 并对完全一致的正文自动去重）；未传 `--system-prompt` 时自动附带简洁通用的默认系统提示词与 `<environment>`（工作目录/OS）；支持 `--tools <names>`、`--disable-tools <names>`、`--no-tools`、`--permission-mode <mode>`、`--walk-boundary <project-root\|filesystem-root\|cwd-only>`、`--instruction-max-bytes <bytes\|none>`、`--instruction-file <path>`、`--no-user-instructions`、`--no-instructions`、`--pikra-home <dir>` 按需定制 |
+| **动态面板配置、MCP 与斜杠命令** | 原生暴露模型、思考档位、`fast` 模式与权限模式选择器；统一复用共享宿主 MCP 管线，自动合并 `~/.jimu/settings.json` 中的 `mcp_servers`、CLI `--mcp-config`/`--mcp-server` 与编辑器传入的 `mcpServers`（`stdio` + `http`，同名以编辑器传入覆盖）；自动将 `/compact`、`/plan`、`/reload-skills` 及项目 `.agents/skills` / `.jimu/skills` 注册为编辑器 `/` 快捷命令，并通过跨平台目录监听与回合前自动刷新实时热更新 `/` 命令列表与 `# Skills changed` 增量（兼容软链与中途新建的 Skills 目录） |
+| **可配置 `AGENTS.md`、工具裁剪与默认系统提示词** | 默认加载 `~/.agents` 与工作区层级的 `AGENTS.override.md` / `AGENTS.md`（自动兼容客户端传入的 `additionalDirectories` 并对完全一致的正文自动去重）；未传 `--system-prompt` 时自动附带简洁通用的默认系统提示词与 `<environment>`（工作目录/OS）；支持 `--tools <names>`、`--disable-tools <names>`、`--no-tools`、`--permission-mode <mode>`、`--walk-boundary <project-root\|filesystem-root\|cwd-only>`、`--instruction-max-bytes <bytes\|none>`、`--instruction-file <path>`、`--no-user-instructions`、`--no-instructions`、`--jimu-home <dir>` 按需定制 |
 
 ---
 
 ## 4. 在 Rust 宿主中直接作为库嵌入
 
-除了独立子进程运行，`pikra::acp` 也可在任意异步管道（如内存双工流、WebSocket 桥接或测试桩）上直接运行：
+除了独立子进程运行，`jimu::acp` 也可在任意异步管道（如内存双工流、WebSocket 桥接或测试桩）上直接运行：
 
 ```rust
-use pikra::acp::{AcpConfig, AcpServer, serve_io};
+use jimu::acp::{AcpConfig, AcpServer, serve_io};
 use std::sync::Arc;
 
 pub async fn serve_custom_stream<R, W>(reader: R, writer: W) -> Result<(), String>

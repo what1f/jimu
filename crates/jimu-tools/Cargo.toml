@@ -1,0 +1,61 @@
+[package]
+name = "jimu-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+test = false
+
+[features]
+default = ["fs", "patch", "search", "shell", "monitor", "sleep", "web-fetch"]
+fs = ["dep:tempfile", "dep:base64", "dep:libc"]
+patch = ["fs"]
+search = ["dep:ignore", "dep:grep-searcher", "dep:grep-regex", "dep:grep-matcher", "dep:globset", "dep:libc"]
+sleep = ["dep:tokio"]
+shell = ["sleep", "dep:libc", "tokio/process", "tokio/io-util", "tokio/fs", "tokio/net"]
+monitor = ["shell"]
+web-fetch = [
+    "dep:tokio",
+    "tokio/net",
+    "dep:futures-core",
+    "dep:futures-util",
+    "dep:thiserror",
+    "dep:base64",
+    "dep:chrono",
+    "dep:ego-tree",
+    "dep:scraper",
+    "dep:url",
+]
+
+[dependencies]
+jimu-schema.workspace = true
+jimu-ai.workspace = true
+jimu-agent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+ignore = { version = "0.4", optional = true }
+grep-searcher = { version = "0.1", optional = true }
+grep-regex = { version = "0.1", optional = true }
+grep-matcher = { version = "0.1", optional = true }
+globset = { version = "0.4", optional = true }
+tokio = { version = "1.54", features = ["rt", "macros", "sync", "time"], optional = true }
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+ego-tree = { workspace = true, optional = true }
+scraper = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+jimu-testkit.workspace = true
+futures-util.workspace = true
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }

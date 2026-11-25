@@ -1,0 +1,27 @@
+[package]
+name = "jimu-durable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embedded single-node transactional durable execution engine with SQLite WAL storage, crash recovery, signals, timers, and CAS documents"
+
+[lib]
+test = false
+
+[dependencies]
+jimu-schema.workspace = true
+jimu-ai.workspace = true
+jimu-agent.workspace = true
+jimu-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+jimu-testkit.workspace = true
+futures-executor.workspace = true
+tempfile.workspace = true

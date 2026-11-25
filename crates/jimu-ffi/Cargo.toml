@@ -1,0 +1,34 @@
+[package]
+name = "jimu-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["lib", "staticlib"]
+test = false
+
+[dependencies]
+jimu-schema.workspace = true
+jimu-ai.workspace = true
+jimu-agent.workspace = true
+jimu-session.workspace = true
+jimu-codemode.workspace = true
+jimu-js.workspace = true
+jimu-kit.workspace = true
+jimu-tools = { path = "../jimu-tools", default-features = false, features = ["fs", "patch", "search", "sleep", "web-fetch"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+futures-channel.workspace = true
+futures-executor.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+rquickjs = { workspace = true, features = ["bindgen"] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+jimu-tools = { path = "../jimu-tools", default-features = false, features = ["shell", "monitor"] }

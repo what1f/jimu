@@ -2,32 +2,32 @@
 import PackageDescription
 
 let package = Package(
-    name: "PikraKit",
+    name: "JimuKit",
     platforms: [
         .macOS(.v15),
         .iOS(.v17),
     ],
     products: [
         .library(
-            name: "PikraKit",
-            targets: ["PikraKit"]
+            name: "JimuKit",
+            targets: ["JimuKit"]
         ),
     ],
     targets: [
         .binaryTarget(
-            name: "CPikra",
-            path: "Artifacts/PikraCore.xcframework"
+            name: "CJimu",
+            path: "Artifacts/JimuCore.xcframework"
         ),
         .target(
-            name: "PikraKit",
-            dependencies: ["CPikra"],
+            name: "JimuKit",
+            dependencies: ["CJimu"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]
         ),
         .testTarget(
-            name: "PikraKitTests",
-            dependencies: ["PikraKit"],
+            name: "JimuKitTests",
+            dependencies: ["JimuKit"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
             ]

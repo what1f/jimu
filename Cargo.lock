@@ -1967,6 +1967,307 @@ dependencies = [
 ]
 
 [[package]]
+name = "jimu"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "agent-client-protocol-schema",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-codemode",
+ "jimu-http",
+ "jimu-js",
+ "jimu-kit",
+ "jimu-schema",
+ "jimu-session",
+ "jimu-testkit",
+ "jimu-tools",
+ "jimu-tui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "jimu-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "jimu-ai",
+ "jimu-schema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "jimu-ai"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "getrandom 0.4.3",
+ "jimu-schema",
+ "jimu-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "jimu-codemode"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "jimu-schema",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "jimu-durable"
+version = "0.1.0"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-schema",
+ "jimu-session",
+ "jimu-testkit",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "jimu-ffi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-codemode",
+ "jimu-js",
+ "jimu-kit",
+ "jimu-schema",
+ "jimu-session",
+ "jimu-tools",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "jimu-http"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "jimu-ai",
+ "reqwest",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "jimu-js"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-schema",
+ "jimu-testkit",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "jimu-kit"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-codemode",
+ "jimu-schema",
+ "jimu-session",
+ "jimu-testkit",
+ "notify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "jimu-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jimu-session"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-schema",
+ "jimu-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "jimu-testkit"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jimu-tools"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "ego-tree",
+ "futures-core",
+ "futures-util",
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-schema",
+ "jimu-testkit",
+ "libc",
+ "scraper",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "jimu-tui"
+version = "0.1.0"
+dependencies = [
+ "anstyle",
+ "anstyle-lossy",
+ "anstyle-parse",
+ "anstyle-syntect",
+ "base64 0.22.1",
+ "chrono",
+ "crossterm",
+ "dark-light",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "html-escape",
+ "image",
+ "indexmap 2.14.2",
+ "jimu-agent",
+ "jimu-ai",
+ "jimu-http",
+ "jimu-kit",
+ "jimu-session",
+ "jimu-testkit",
+ "jimu-tools",
+ "libc",
+ "linkify",
+ "pulldown-cmark",
+ "ratatui",
+ "ratatui-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "similar",
+ "strum 0.27.2",
+ "supports-color",
+ "syntect",
+ "textwrap",
+ "thiserror 2.0.21",
+ "tokio",
+ "tui-scrollbar",
+ "two-face",
+ "unicode-bidi",
+ "unicode-bidi-mirroring",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "url",
+ "vte",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2461,307 +2762,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
-]
-
-[[package]]
-name = "pikra"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "agent-client-protocol-schema",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "pikra-agent",
- "pikra-ai",
- "pikra-codemode",
- "pikra-http",
- "pikra-js",
- "pikra-kit",
- "pikra-schema",
- "pikra-session",
- "pikra-testkit",
- "pikra-tools",
- "pikra-tui",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "pikra-agent"
-version = "0.1.0"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "pikra-ai",
- "pikra-schema",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "pikra-ai"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "getrandom 0.4.3",
- "pikra-schema",
- "pikra-testkit",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "pikra-codemode"
-version = "0.1.0"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "pikra-schema",
- "rquickjs",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "pikra-durable"
-version = "0.1.0"
-dependencies = [
- "futures-executor",
- "futures-util",
- "pikra-agent",
- "pikra-ai",
- "pikra-schema",
- "pikra-session",
- "pikra-testkit",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "pikra-ffi"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "pikra-agent",
- "pikra-ai",
- "pikra-codemode",
- "pikra-js",
- "pikra-kit",
- "pikra-schema",
- "pikra-session",
- "pikra-tools",
- "rquickjs",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "pikra-http"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures-core",
- "futures-util",
- "pikra-ai",
- "reqwest",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "pikra-js"
-version = "0.1.0"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "pikra-agent",
- "pikra-ai",
- "pikra-schema",
- "pikra-testkit",
- "rquickjs",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "pikra-kit"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "notify",
- "pikra-agent",
- "pikra-ai",
- "pikra-codemode",
- "pikra-schema",
- "pikra-session",
- "pikra-testkit",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "pikra-schema"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pikra-session"
-version = "0.1.0"
-dependencies = [
- "futures-core",
- "futures-executor",
- "futures-util",
- "pikra-agent",
- "pikra-ai",
- "pikra-schema",
- "pikra-testkit",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "pikra-testkit"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures-channel",
- "futures-core",
- "futures-util",
- "pikra-agent",
- "pikra-ai",
- "pikra-schema",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pikra-tools"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "ego-tree",
- "futures-core",
- "futures-util",
- "globset",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "libc",
- "pikra-agent",
- "pikra-ai",
- "pikra-schema",
- "pikra-testkit",
- "scraper",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "pikra-tui"
-version = "0.1.0"
-dependencies = [
- "anstyle",
- "anstyle-lossy",
- "anstyle-parse",
- "anstyle-syntect",
- "base64 0.22.1",
- "chrono",
- "crossterm",
- "dark-light",
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-util",
- "html-escape",
- "image",
- "indexmap 2.14.2",
- "libc",
- "linkify",
- "pikra-agent",
- "pikra-ai",
- "pikra-http",
- "pikra-kit",
- "pikra-session",
- "pikra-testkit",
- "pikra-tools",
- "pulldown-cmark",
- "ratatui",
- "ratatui-core",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "shellexpand",
- "similar",
- "strum 0.27.2",
- "supports-color",
- "syntect",
- "textwrap",
- "thiserror 2.0.21",
- "tokio",
- "tui-scrollbar",
- "two-face",
- "unicode-bidi",
- "unicode-bidi-mirroring",
- "unicode-segmentation",
- "unicode-width 0.2.0",
- "url",
- "vte",
 ]
 
 [[package]]

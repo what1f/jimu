@@ -1,0 +1,18 @@
+[package]
+name = "jimu-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+test = false
+
+[dependencies]
+jimu-ai.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

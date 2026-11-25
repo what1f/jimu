@@ -1,20 +1,20 @@
-# Pikra Rust 接入指南
+# Jimu Rust 接入指南
 
-本文说明如何在 Rust 项目（如桌面守护进程、服务端、CLI 或多 Agent 宿主如 Meerkat）中按需嵌入 Pikra。
+本文说明如何在 Rust 项目（如桌面守护进程、服务端、CLI 或多 Agent 宿主如 Meerkat）中按需嵌入 Jimu。
 
 ---
 
 ## 1. 按场景选对接入层
 
-Pikra 各 Crate 严格解耦，不要引入不需要的上层包：
+Jimu 各 Crate 严格解耦，不要引入不需要的上层包：
 
 | 你的使用场景 | 推荐引入的包 | 说明 |
 | :--- | :--- | :--- |
-| **只需要统一调各家大模型流式 API** | `pikra-ai` + `pikra-http` | 统一 OpenAI Responses / Codex / Completions / Anthropic / Gemini 流式事件与计费，无会话状态 |
-| **自己管存储与多 Agent 调度（如 Meerkat）** | `pikra-kit` + `pikra-tools` + `pikra-http` | **最常用推荐组合**：开箱具备会话树、自动压缩、可扩展 Skills、BM25 延迟工具网关、MCP 与内置工作区工具 |
-| **嵌入交互式终端** | `pikra-tui` + `pikra-kit` | Inline 主屏与 Fullscreen 副屏共用原生会话、工具卡片和审批 |
-| **完全自建上下文管线，只要纯内存回合循环** | `pikra-agent` + `pikra-ai` | 纯内存状态机 + 并发工具执行 + `steer` 插话 + Middleware 切面 |
-| **没有外部调度器，单进程需防崩溃重复执行工具** | 在上面基础上加 `pikra-durable` | 内嵌 SQLite WAL 事务级 Checkpoint、会话租约隔离与工具幂等恢复 |
+| **只需要统一调各家大模型流式 API** | `jimu-ai` + `jimu-http` | 统一 OpenAI Responses / Codex / Completions / Anthropic / Gemini 流式事件与计费，无会话状态 |
+| **自己管存储与多 Agent 调度（如 Meerkat）** | `jimu-kit` + `jimu-tools` + `jimu-http` | **最常用推荐组合**：开箱具备会话树、自动压缩、可扩展 Skills、BM25 延迟工具网关、MCP 与内置工作区工具 |
+| **嵌入交互式终端** | `jimu-tui` + `jimu-kit` | Inline 主屏与 Fullscreen 副屏共用原生会话、工具卡片和审批 |
+| **完全自建上下文管线，只要纯内存回合循环** | `jimu-agent` + `jimu-ai` | 纯内存状态机 + 并发工具执行 + `steer` 插话 + Middleware 切面 |
+| **没有外部调度器，单进程需防崩溃重复执行工具** | 在上面基础上加 `jimu-durable` | 内嵌 SQLite WAL 事务级 Checkpoint、会话租约隔离与工具幂等恢复 |
 
 ---
 
@@ -24,21 +24,21 @@ Pikra 各 Crate 严格解耦，不要引入不需要的上层包：
 
 ```toml
 [dependencies]
-pikra-ai = { path = "../pikra/crates/pikra-ai" }
-pikra-http = { path = "../pikra/crates/pikra-http" }
-pikra-kit = { path = "../pikra/crates/pikra-kit" }
-pikra-tools = { path = "../pikra/crates/pikra-tools", default-features = false, features = ["fs", "patch", "search", "shell", "monitor", "sleep", "web-fetch"] }
+jimu-ai = { path = "../jimu/crates/jimu-ai" }
+jimu-http = { path = "../jimu/crates/jimu-http" }
+jimu-kit = { path = "../jimu/crates/jimu-kit" }
+jimu-tools = { path = "../jimu/crates/jimu-tools", default-features = false, features = ["fs", "patch", "search", "shell", "monitor", "sleep", "web-fetch"] }
 ```
 
 创建带持久化、内置工具与流式输出的会话：
 
 ```rust
 use futures_util::StreamExt;
-use pikra_ai::{ApiKind, Client, Model, ThinkingLevel};
-use pikra_http::ReqwestTransport;
-use pikra_kit::{KitEvent, KitSession, KitSessionConfig, KitToolSpec};
-use pikra_session::JsonlSessionStore;
-use pikra_tools::{BuiltinToolKind, BuiltinToolSet, WorkspaceTools, WorkspaceToolsConfig};
+use jimu_ai::{ApiKind, Client, Model, ThinkingLevel};
+use jimu_http::ReqwestTransport;
+use jimu_kit::{KitEvent, KitSession, KitSessionConfig, KitToolSpec};
+use jimu_session::JsonlSessionStore;
+use jimu_tools::{BuiltinToolKind, BuiltinToolSet, WorkspaceTools, WorkspaceToolsConfig};
 use std::sync::Arc;
 
 pub async fn run_example(workspace: &std::path::Path, api_key: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -61,7 +61,7 @@ pub async fn run_example(workspace: &std::path::Path, api_key: String) -> Result
 
     // 3. 配置模型与会话（JSONL 追加式落盘）
     let model = Model::new("deepseek-flash", "deepseek", ApiKind::OpenaiCompletions, "https://api.deepseek.com/v1");
-    let store = Arc::new(JsonlSessionStore::open(workspace.join(".pikra/session.jsonl"))?);
+    let store = Arc::new(JsonlSessionStore::open(workspace.join(".jimu/session.jsonl"))?);
 
     let mut cfg = KitSessionConfig::new(model)
         .with_system_prompt("You are a concise engineering assistant.")
@@ -98,7 +98,7 @@ pub async fn run_example(workspace: &std::path::Path, api_key: String) -> Result
 做具体产品时，往往需要针对产品场景改写内置工具提示词、改工具名，或屏蔽某些可选参数并注入固定默认值：
 
 ```rust
-use pikra_tools::{BuiltinToolKind, DescriptionOverride, ToolDefinitionOverride, WorkspaceToolsConfig};
+use jimu_tools::{BuiltinToolKind, DescriptionOverride, ToolDefinitionOverride, WorkspaceToolsConfig};
 use serde_json::{Map, json};
 
 let tools_cfg = WorkspaceToolsConfig::new(workspace).with_tool_override(
@@ -117,8 +117,8 @@ let tools_cfg = WorkspaceToolsConfig::new(workspace).with_tool_override(
 
 ### 3.2 用闭包快速编写宿主自定义工具
 ```rust
-use pikra_agent::{AgentToolResult, ClosureTool};
-use pikra_schema::{obj_schema, str_schema, with_description};
+use jimu_agent::{AgentToolResult, ClosureTool};
+use jimu_schema::{obj_schema, str_schema, with_description};
 
 let custom_tool = Arc::new(ClosureTool::parallel(
     "get_ticket",
@@ -135,7 +135,7 @@ let custom_tool = Arc::new(ClosureTool::parallel(
 
 ## 4. 前后台交互终端、`Monitor` 与后台事件唤醒
 
-当启用 `exec_command` / `write_stdin`、`monitor` 和 `sleep` 时，推荐将 `pikra-tools` 的后台事件回调接到 `KitSession` 的后台唤醒收件箱：
+当启用 `exec_command` / `write_stdin`、`monitor` 和 `sleep` 时，推荐将 `jimu-tools` 的后台事件回调接到 `KitSession` 的后台唤醒收件箱：
 
 1. **短命令与长驻进程合一（`exec_command` + `write_stdin`）**：
    - 命令在 `yield_time_ms`（默认 10s）内退出时直接返回完整结果；
@@ -150,10 +150,10 @@ let custom_tool = Arc::new(ClosureTool::parallel(
 ## 5. 可配置 `AGENTS.md` 规则发现、Skills 与动态工具加载
 
 ### 5.1 配置多层级 `AGENTS.md` 规则与 Skill 目录策略
-Pikra 作为无头引擎**绝不在库层写死任何特定品牌目录（如 `.pikra`）**：默认只识别跨生态中立目录（`.agents/skills`、`~/.agents`），所有回溯边界、候选文件名、自定义目录与字节上限均支持「默认值优先 + 全项覆盖」：
+Jimu 作为无头引擎**绝不在库层写死任何特定品牌目录（如 `.jimu`）**：默认只识别跨生态中立目录（`.agents/skills`、`~/.agents`），所有回溯边界、候选文件名、自定义目录与字节上限均支持「默认值优先 + 全项覆盖」：
 
 ```rust
-use pikra_kit::{
+use jimu_kit::{
     InstructionDiscoveryConfig, SkillDiscoveryConfig, SkillEnableRule, SkillSelector, WalkBoundary,
 };
 
@@ -208,7 +208,7 @@ session.follow_up_meta("post-check", "Verify formatting before finishing.");
 // 4. UI 渲染过滤：messages() 保留完整消息（含 user.is_meta == true），visible_messages() 仅返回用户可见对话
 let chat_history = session.visible_messages();
 ```
-- `pikra-durable` 同样提供事务级 `engine.set_context(...)`、`engine.append_meta(...)` 与 `engine.submit_meta(...)`。
+- `jimu-durable` 同样提供事务级 `engine.set_context(...)`、`engine.append_meta(...)` 与 `engine.submit_meta(...)`。
 
 ---
 
@@ -220,18 +220,18 @@ let chat_history = session.visible_messages();
 
 ## 7. Rust 原生终端入口
 
-将现有 `KitSession` 包装为 `PikraHarness` 交给 `TuiApp`（需启用 `pikra-tui` 的 `pikra` feature；不启用时 `pikra-tui` 零 `pikra-*` 依赖，可直接对接其他自定义 Harness）：
+将现有 `KitSession` 包装为 `JimuHarness` 交给 `TuiApp`（需启用 `jimu-tui` 的 `jimu` feature；不启用时 `jimu-tui` 零 `jimu-*` 依赖，可直接对接其他自定义 Harness）：
 
 ```rust
-use pikra_kit::KitSession;
-use pikra_tui::{
+use jimu_kit::KitSession;
+use jimu_tui::{
     app::{TuiApp, TuiAppConfig},
-    pikra::PikraHarness,
+    jimu::JimuHarness,
 };
 use std::{io, sync::Arc};
 
 async fn run_terminal(session: Arc<KitSession>) -> io::Result<()> {
-    let harness = Arc::new(PikraHarness::new(session));
+    let harness = Arc::new(JimuHarness::new(session));
     TuiApp::new(harness, TuiAppConfig::default()).run().await
 }
 ```
