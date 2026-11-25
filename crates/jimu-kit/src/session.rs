@@ -2118,7 +2118,9 @@ impl KitRuntime {
 
         self.deferred_registry.clear_seen_schemas();
         self.agent.replace_messages(reconstructed.messages)?;
-        self.reload_skills();
+        if self.auto_reload_skills {
+            self.reload_skills();
+        }
         self.known_skills
             .lock()
             .unwrap_or_else(|e| e.into_inner())

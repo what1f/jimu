@@ -1683,11 +1683,13 @@ struct JimuKitE2ETests {
         })
         await autoAgent.close()
 
-        // 2. autoReloadSkills == false skips per-turn rescan until reloadSkills() is explicitly called.
+        // 2. autoReloadSkills == false skips per-turn and post-compaction rescan until reloadSkills() is explicitly called.
         let manualMock = MockSSEClient(handlers: [
             { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "m1")) },
             { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "m2")) },
             { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "m3")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Compacted summary")) },
+            { _, _ in MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "m4")) },
         ])
         let manualAgent = try await JimuAgent.open(
             configuration: JimuConfiguration(
@@ -1696,6 +1698,7 @@ struct JimuKitE2ETests {
                 skillRoots: [skillRoot],
                 autoReloadSkills: false,
                 enableDeferredGateway: false,
+                compaction: JimuCompactionConfig(enabled: true, reserveTokens: 200, keepRecentTokens: 0),
                 httpClient: manualMock
             )
         )
@@ -1714,6 +1717,75 @@ struct JimuKitE2ETests {
             }
             return false
         })
+
+        // Add delta on disk before compaction; compaction must NOT silently rescan when autoReloadSkills == false.
+        try writeSkill("delta")
+        #expect(try await manualAgent.compact() != nil)
+        _ = try await collectEvents(try await manualAgent.prompt("turn 4"))
+        let postCompactBody = String(
+            decoding: try #require(await manualMock.recordedRequests().last).body,
+            as: UTF8.self
+        )
+        #expect(postCompactBody.contains("<available_skills>") && postCompactBody.contains("<name>gamma</name>"))
+        #expect(!postCompactBody.contains("<name>delta</name>"))
         await manualAgent.close()
+    }
+
+    @Test("steer is rejected during auto-compaction and does not duplicate on next turn E2E")
+    func steerRejectedDuringAutoCompactionE2E() async throws {
+        let compactionEntered = Signal()
+        let compactionRelease = Signal()
+        let followupText = "Followup sent during auto compaction"
+
+        let mockClient = MockSSEClient(handlers: [
+            // Turn 1: high prompt token usage triggers auto-compaction immediately after assistant finishes.
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Turn 1 reply", promptTokens: 1_450))
+            },
+            // Auto-compaction summary request: pause deterministically until test invokes steer().
+            { _, _ in
+                await compactionEntered.fire()
+                await compactionRelease.wait()
+                return MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Summary of turn 1"))
+            },
+            // Turn 2: host sends the rejected message as a normal next turn.
+            { _, _ in
+                MockSSEClient.sseResponse(chunks: MockSSEClient.textChunks(text: "Turn 2 reply"))
+            },
+        ])
+
+        let agent = try await JimuAgent.open(
+            configuration: JimuConfiguration(
+                model: testModel(contextWindow: 1_500, maxOutputTokens: 200),
+                systemPrompt: "Compaction steer test",
+                enableDeferredGateway: false,
+                compaction: JimuCompactionConfig(enabled: true, reserveTokens: 200, keepRecentTokens: 0),
+                httpClient: mockClient
+            )
+        )
+
+        let t1Stream = try await agent.prompt("Start turn 1")
+        let t1Task = Task { try await collectEvents(t1Stream) }
+
+        await compactionEntered.wait()
+        let accepted = await agent.steer(text: followupText)
+        #expect(accepted == false)
+        await compactionRelease.fire()
+
+        let t1Events = try await t1Task.value
+        #expect(t1Events.contains { if case .compactionStarted = $0 { return true }; return false })
+        #expect(t1Events.contains { if case .compactionEnded = $0 { return true }; return false })
+        #expect(!t1Events.contains { if case .steered = $0 { return true }; return false })
+
+        let t2Events = try await collectEvents(try await agent.prompt(followupText))
+        #expect(t2Events.last == .turnEnded(stopReason: .stop, userMessageKept: true, errorMessage: nil))
+
+        let requests = await mockClient.recordedRequests()
+        #expect(requests.count == 3)
+        let t2Body = String(decoding: requests[2].body, as: UTF8.self)
+        let occurrences = t2Body.components(separatedBy: followupText).count - 1
+        #expect(occurrences == 1)
+
+        await agent.close()
     }
 }

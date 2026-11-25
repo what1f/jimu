@@ -100,8 +100,19 @@ fn persisted_baseline_tool_names(store: &dyn SessionStore) -> Result<Option<Vec<
     Ok(None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveRunPhase {
+    /// `start_prompt` has reserved the session before `agent_stream` starts.
+    PreparingPrompt,
+    /// `agent_stream` is actively executing; `steer` is accepted while `agent.is_running()`.
+    Prompting,
+    /// Turn execution has finished (settling, auto-compacting, manual compaction, or cancelling).
+    Settling,
+}
+
 struct ActivePromptRun {
     cancel: CancelToken,
+    phase: ActiveRunPhase,
     idle_waiters: Vec<oneshot::Sender<()>>,
 }
 
@@ -418,6 +429,13 @@ impl FfiSession {
         Ok(())
     }
 
+    fn set_active_phase(&self, phase: ActiveRunPhase) {
+        let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = state.active.as_mut() {
+            active.phase = phase;
+        }
+    }
+
     fn finish_active_run(&self) -> Vec<oneshot::Sender<()>> {
         let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -452,6 +470,7 @@ impl FfiSession {
             }
             state.active = Some(ActivePromptRun {
                 cancel: prompt_cancel.clone(),
+                phase: ActiveRunPhase::PreparingPrompt,
                 idle_waiters: Vec::new(),
             });
         }
@@ -467,6 +486,8 @@ impl FfiSession {
             match self.prepare_turn_prompt_messages(user_msg) {
                 Ok(v) => v,
                 Err(err) => {
+                    self.set_active_phase(ActiveRunPhase::Settling);
+                    let _ = self.agent.drain_steering();
                     let waiters = self.finish_active_run();
                     for w in waiters {
                         let _ = w.send(());
@@ -492,6 +513,8 @@ impl FfiSession {
             }
 
             if prompt_cancel.is_cancelled() || this.is_closed() {
+                this.set_active_phase(ActiveRunPhase::Settling);
+                let _ = this.agent.drain_steering();
                 this.restore_persisted_messages();
                 emit(&FfiEvent::TurnEnded {
                     stop_reason: StopReason::Aborted,
@@ -510,6 +533,8 @@ impl FfiSession {
             let mut agent_stream = match stream_res {
                 Ok(s) => s,
                 Err(err) => {
+                    this.set_active_phase(ActiveRunPhase::Settling);
+                    let _ = this.agent.drain_steering();
                     let waiters = this.finish_active_run();
                     let err_c = CString::new(err.to_string()).ok();
                     on_done(
@@ -524,7 +549,10 @@ impl FfiSession {
                 }
             };
             if prompt_cancel.is_cancelled() || this.is_closed() {
+                this.set_active_phase(ActiveRunPhase::Settling);
                 this.agent.abort_now();
+            } else {
+                this.set_active_phase(ActiveRunPhase::Prompting);
             }
 
             let mut seen_ends = 0usize;
@@ -650,11 +678,16 @@ impl FfiSession {
                         user_message_kept: kept,
                         ..
                     } => {
+                        this.set_active_phase(ActiveRunPhase::Settling);
                         user_message_kept = *kept;
                     }
                     AgentEvent::AgentStart | AgentEvent::MessageStart { .. } => {}
                 }
             }
+
+            // Transition to Settling before draining/auto-compaction so mid-compaction `steer`
+            // calls are rejected instead of enqueued after the active turn has ended.
+            this.set_active_phase(ActiveRunPhase::Settling);
 
             if this.rollback_first_turn_on_failure && user_message_kept {
                 let mut session = this.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -669,8 +702,11 @@ impl FfiSession {
                 }
             }
 
-            // Ensure Agent's internal active_run is fully released before auto-compaction.
+            // Ensure Agent's internal active_run is fully released before auto-compaction,
+            // and clear any late unconsumed steer that raced with AgentEnd so it cannot leak
+            // into the next independent turn.
             this.agent.wait_for_idle().await;
+            let _ = this.agent.drain_steering();
 
             let persist_err = persistence_error
                 .lock()
@@ -766,7 +802,15 @@ impl FfiSession {
 
     pub(crate) fn steer(&self, id: String, text: String, is_meta: bool) -> bool {
         let state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed || (state.active.is_none() && !self.agent.is_running()) {
+        if state.closed {
+            return false;
+        }
+        let can_steer = match state.active.as_ref().map(|active| active.phase) {
+            Some(ActiveRunPhase::PreparingPrompt) => true,
+            Some(ActiveRunPhase::Prompting) => self.agent.is_running(),
+            Some(ActiveRunPhase::Settling) | None => false,
+        };
+        if !can_steer {
             return false;
         }
         if is_meta {
@@ -798,6 +842,7 @@ impl FfiSession {
         let waiter = {
             let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(active) = state.active.as_mut() {
+                active.phase = ActiveRunPhase::Settling;
                 active.cancel.cancel();
                 self.agent.abort_now();
                 let (tx, rx) = oneshot::channel();
@@ -821,6 +866,7 @@ impl FfiSession {
             let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
             state.closed = true;
             if let Some(active) = state.active.as_mut() {
+                active.phase = ActiveRunPhase::Settling;
                 active.cancel.cancel();
                 self.agent.abort_now();
                 let (tx, rx) = oneshot::channel();
@@ -842,7 +888,8 @@ impl FfiSession {
     pub(crate) fn cancel_for_destroy(&self) {
         let mut state = self.run_state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
-        if let Some(active) = state.active.as_ref() {
+        if let Some(active) = state.active.as_mut() {
+            active.phase = ActiveRunPhase::Settling;
             active.cancel.cancel();
         }
         drop(state);
@@ -1038,6 +1085,7 @@ impl FfiSession {
             }
             state.active = Some(ActivePromptRun {
                 cancel: cancel.clone(),
+                phase: ActiveRunPhase::Settling,
                 idle_waiters: Vec::new(),
             });
         }
@@ -1163,7 +1211,9 @@ impl FfiSession {
 
         self.deferred_registry.clear_seen_schemas();
         if self.skill_discovery.is_some() {
-            let _ = self.reload_skills();
+            if self.auto_reload_skills {
+                let _ = self.reload_skills();
+            }
             self.known_skills
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
