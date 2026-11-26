@@ -90,6 +90,8 @@ pub struct WelcomeRenderParams<'a> {
     pub cwd: &'a Path,
     pub prompt_info: PromptInfo<'a>,
     pub prompt_focus: WelcomePromptFocus,
+    pub prompt_prefix_override: Option<(&'static str, ratatui::style::Color)>,
+    pub prompt_accent_override: Option<ratatui::style::Color>,
     pub compact: bool,
     pub selected: Option<usize>,
     pub mouse_pos: Option<(u16, u16)>,
@@ -655,6 +657,8 @@ pub fn render_welcome(
         &p.prompt_info,
         p.compact,
         cfg.placeholder,
+        p.prompt_prefix_override,
+        p.prompt_accent_override,
     );
     result.prompt_rect = (!layout.prompt.is_empty()).then_some(layout.prompt);
     if !layout.has_hero_box() || cfg.footer_hint.is_some() {

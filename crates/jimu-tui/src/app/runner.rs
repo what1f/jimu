@@ -13,9 +13,9 @@ use crate::{
 use crossterm::{
     cursor::{SetCursorStyle, Show},
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, EventStream, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -73,7 +73,7 @@ impl TerminalGuard {
             enable_raw_mode()?;
         }
         TERMINAL.fetch_or(PASTE, Ordering::Release);
-        execute!(io::stdout(), EnableBracketedPaste)?;
+        execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         let context = terminal_context();
         if context.kitty_skip_reason().is_none()
             && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
@@ -113,6 +113,50 @@ impl TerminalGuard {
         }
         Ok(())
     }
+
+    /// Temporarily yield the terminal to an external fullscreen editor (`$VISUAL`/`$EDITOR`).
+    fn suspend(&mut self) -> io::Result<()> {
+        let mut out = io::stdout();
+        let state = TERMINAL.load(Ordering::Acquire);
+        let _ = execute!(out, EndSynchronizedUpdate);
+        if state & KEYS != 0 {
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+            TERMINAL.fetch_and(!KEYS, Ordering::Release);
+            set_pushed_kitty_flags(KeyboardEnhancementFlags::empty());
+        }
+        if state & ALT != 0 {
+            let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+            TERMINAL.fetch_and(!ALT, Ordering::Release);
+        }
+        if state & PASTE != 0 {
+            let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
+            TERMINAL.fetch_and(!PASTE, Ordering::Release);
+        }
+        let _ = execute!(
+            out,
+            SetDefaultCursor,
+            SetCursorStyle::DefaultUserShape,
+            Show
+        );
+        if state & RAW != 0 {
+            let _ = disable_raw_mode();
+            TERMINAL.fetch_and(!RAW, Ordering::Release);
+        }
+        out.flush()
+    }
+
+    /// Re-acquire terminal modes after an external editor exits.
+    fn resume(&mut self, alternate: bool) -> io::Result<()> {
+        if !crossterm::terminal::is_raw_mode_enabled()? {
+            TERMINAL.fetch_or(RAW, Ordering::Release);
+            enable_raw_mode()?;
+        }
+        let mut out = io::stdout();
+        TERMINAL.fetch_or(PASTE, Ordering::Release);
+        execute!(out, EnableBracketedPaste, EnableFocusChange)?;
+        self.set_alternate(&mut out, alternate)?;
+        out.flush()
+    }
 }
 
 impl Drop for TerminalGuard {
@@ -140,7 +184,7 @@ fn restore_terminal(state: u8) {
         let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
     }
     if state & PASTE != 0 {
-        let _ = execute!(out, DisableBracketedPaste);
+        let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
     }
     let _ = execute!(
         out,
@@ -216,7 +260,7 @@ impl TuiApp {
             },
         )?;
         let mut screen = Screen::default();
-        let (mut tx, ticks) = mpsc::channel(1);
+        let (mut tx, mut ticks) = mpsc::channel(1);
         // No async runtime dependency. Dropping the receiver wakes the producer on its next tick.
         thread::Builder::new()
             .name("tui-pulse".into())
@@ -228,13 +272,39 @@ impl TuiApp {
                     }
                 }
             })?;
-        let input = EventStream::new().map(|e| e.map(TuiInput::Terminal));
         let mut status = StatusOutput::new(&self, io::stdout(), true);
-        let result = self
-            .drive(input, ticks, &mut status, |app| {
-                screen.native(&mut term, app, &mut guard)
-            })
-            .await;
+        let mut events = self.harness.subscribe().fuse();
+        self.apply_startup_actions();
+        let result = loop {
+            let input = EventStream::new().map(|e| e.map(TuiInput::Terminal));
+            let res = self
+                .drive(&mut events, input, ticks.by_ref(), &mut status, |app| {
+                    screen.native(&mut term, app, &mut guard)
+                })
+                .await;
+            if let Some(draft) = self.pending_external_editor.take() {
+                if let Err(err) = res {
+                    break Err(err);
+                }
+                let edit_result = if let Some(runner) = self.config.external_editor.clone() {
+                    runner(&draft, self.config.directory.as_deref())
+                } else {
+                    let was_alt = guard.alternate();
+                    guard.suspend()?;
+                    let out = super::external_editor::run_external_editor(
+                        &draft,
+                        self.config.directory.as_deref(),
+                    );
+                    guard.resume(was_alt)?;
+                    let _ = term.clear();
+                    out
+                };
+                self.apply_external_editor_result(edit_result);
+                continue;
+            }
+            break res;
+        };
+        self.teardown().await;
         let clear = status.clear();
         let screen_clear = if guard.alternate() {
             Ok(())
@@ -266,28 +336,23 @@ impl TuiApp {
         let mut term = Terminal::new(backend)?;
         let mut screen = Screen::default();
         let mut status = StatusOutput::new(&self, writer, false);
+        let mut events = self.harness.subscribe().fuse();
+        self.apply_startup_actions();
         let result = self
             .drive(
+                &mut events,
                 input.map(Ok),
                 futures_util::stream::pending(),
                 &mut status,
                 |app| screen.backend(&mut term, app),
             )
             .await;
+        self.teardown().await;
         result.and(status.clear())?;
         Ok(term)
     }
 
-    async fn drive(
-        &mut self,
-        input: impl Stream<Item = io::Result<TuiInput>>,
-        ticks: impl Stream<Item = ()>,
-        status: &mut StatusOutput<impl Write>,
-        mut draw: impl FnMut(&mut Self) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let mut events = self.harness.subscribe().fuse();
-        let mut input = Box::pin(input.fuse());
-        let mut ticks = Box::pin(ticks.fuse());
+    fn apply_startup_actions(&mut self) {
         if self.config.open_resume_picker {
             self.config.open_resume_picker = false;
             if let Some(prompt) = self
@@ -308,18 +373,61 @@ impl TuiApp {
         {
             self.submit(crate::harness::UserInput::text(prompt), false);
         }
+    }
+
+    async fn teardown(&mut self) {
+        self.modals.clear();
+        self.controls.close();
+        while self.controls.try_recv().is_ok() {}
+        if let Some(cancel) = self.bash_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+            // Await the shell worker so the process group is killed and reaped before exit.
+            while let Some(outcome) = self.jobs.next().await {
+                if matches!(outcome, Outcome::ShellDone { .. }) {
+                    break;
+                }
+            }
+        }
+        if let Some(abort) = self.aborting.take() {
+            abort.await;
+        } else if self.running {
+            self.harness.abort().await;
+        }
+    }
+
+    async fn drive(
+        &mut self,
+        events: &mut futures_util::stream::Fuse<crate::harness::BoxEventStream>,
+        input: impl Stream<Item = io::Result<TuiInput>>,
+        ticks: impl Stream<Item = ()>,
+        status: &mut StatusOutput<impl Write>,
+        mut draw: impl FnMut(&mut Self) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut input = Box::pin(input.fuse());
+        let mut ticks = Box::pin(ticks.fuse());
         let mut dirty = true;
         let mut burst = false;
         status.emit(ProgramStatus::idle())?;
-        let result = 'drive: loop {
+        'drive: loop {
             self.modals.retain(|m| !m.cancelled());
             if let Err(e) = status.emit(self.program_status()) {
                 break Err(e);
             }
+            if !self.native
+                && let Some(draft) = self.pending_external_editor.take()
+            {
+                let res = if let Some(runner) = self.config.external_editor.clone() {
+                    runner(&draft, self.config.directory.as_deref())
+                } else {
+                    Err("External editor requires an interactive terminal".to_owned())
+                };
+                self.apply_external_editor_result(res);
+                dirty = true;
+            }
             if dirty && let Err(e) = draw(self) {
                 break Err(e);
             }
-            if self.quit {
+            if self.quit || (self.native && self.pending_external_editor.is_some()) {
                 break Ok(());
             }
             dirty = true;
@@ -396,16 +504,7 @@ impl TuiApp {
                     }
                 }
             }
-        };
-        self.modals.clear();
-        self.controls.close();
-        while self.controls.try_recv().is_ok() {}
-        if let Some(abort) = self.aborting.take() {
-            abort.await;
-        } else if self.running {
-            self.harness.abort().await;
         }
-        result
     }
     fn deliver_input(&mut self, input: TuiInput) {
         // A host future may enqueue a modal and return Pending during the same
@@ -443,6 +542,47 @@ impl TuiApp {
                     self.composer.set_text(&text);
                     self.refresh_completion();
                 }
+            }
+            Outcome::ShellDone { call_id, result } => {
+                self.bash_cancel = None;
+                if !self.running {
+                    self.status = ProgramStatus::idle();
+                }
+                let output = match result {
+                    Ok(res) => {
+                        let is_error = res.interrupted || res.exit_code.is_some_and(|c| c != 0);
+                        let mut text = res.output;
+                        if res.interrupted {
+                            if !text.is_empty() && !text.ends_with('\n') {
+                                text.push('\n');
+                            }
+                            text.push_str("[interrupted]");
+                        } else if let Some(code) = res.exit_code
+                            && code != 0
+                        {
+                            if !text.is_empty() && !text.ends_with('\n') {
+                                text.push('\n');
+                            }
+                            text.push_str(&format!("[exit {code}]"));
+                        }
+                        crate::harness::ToolOutput {
+                            text,
+                            is_error,
+                            ..Default::default()
+                        }
+                    }
+                    Err(err) => crate::harness::ToolOutput {
+                        text: err,
+                        is_error: true,
+                        ..Default::default()
+                    },
+                };
+                self.event(TuiEvent::ToolEnd {
+                    call_id,
+                    name: "bash".to_owned(),
+                    effective_name: Some("!".to_owned()),
+                    output,
+                });
             }
             Outcome::Done
             | Outcome::Result(Ok(()))

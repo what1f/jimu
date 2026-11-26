@@ -137,9 +137,19 @@ impl TuiApp {
             color: None,
             bold: false,
         }));
+        if self.prompt_stash.is_some() {
+            flags.push(PromptFlag {
+                text: self.config.labels.get("stashed"),
+                color: Some(theme.accent_plan),
+                bold: false,
+            });
+        }
         let prompt_info = PromptInfo {
             model_name: "",
             flags: &flags,
+            multiline: self.multiline_mode && !self.bash_mode,
+            multiline_label: (self.multiline_mode && !self.bash_mode)
+                .then_some(self.config.labels.get("multiline")),
             ..Default::default()
         };
         let mouse = self.modals.is_empty().then_some(self.mouse.pos).flatten();
@@ -205,6 +215,8 @@ impl TuiApp {
                 } else {
                     WelcomePromptFocus::Unfocused
                 },
+                prompt_prefix_override: self.bash_mode.then_some(("! ", self.theme.accent_running)),
+                prompt_accent_override: self.bash_mode.then_some(self.theme.accent_running),
                 compact: area.width < 67,
                 selected: if let Focus::Welcome(i) = self.focus {
                     Some(i)
@@ -523,11 +535,27 @@ impl TuiApp {
     }
 
     fn prompt_style(&self, area: Rect) -> PromptStyle {
-        PromptStyle {
-            focused: self.focus == Focus::Prompt && self.search.is_none() && self.modals.is_empty(),
-            compact: area.width < 67,
-            prefix_override: Some(("> ", self.theme.accent_user)),
-            ..Default::default()
+        if self.bash_mode {
+            PromptStyle {
+                focused: self.focus == Focus::Prompt
+                    && self.search.is_none()
+                    && self.modals.is_empty(),
+                compact: area.width < 67,
+                accent_color_override: Some(self.theme.accent_running),
+                border_color_override: Some(self.theme.accent_running),
+                prefix_override: Some(("! ", self.theme.accent_running)),
+                placeholder_when_focused: true,
+                ..Default::default()
+            }
+        } else {
+            PromptStyle {
+                focused: self.focus == Focus::Prompt
+                    && self.search.is_none()
+                    && self.modals.is_empty(),
+                compact: area.width < 67,
+                prefix_override: Some(("> ", self.theme.accent_user)),
+                ..Default::default()
+            }
         }
     }
 }

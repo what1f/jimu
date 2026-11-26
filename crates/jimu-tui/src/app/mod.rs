@@ -1,6 +1,8 @@
 //! Harness-independent terminal conversation host.
 mod commands;
 mod dialogs;
+mod external_editor;
+mod history_store;
 mod image_paste;
 mod input;
 mod mouse;
@@ -55,6 +57,11 @@ pub type ClipboardWriter = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync
 /// Host callback invoked with the active theme name whenever the user switches to a built-in or
 /// custom theme.
 pub type ThemeNameCallback = Arc<dyn Fn(&str) + Send + Sync>;
+/// Optional external editor hook invoked on `Ctrl+G` / `/edit` with the current draft and working
+/// directory. When unset, launches `$VISUAL` / `$EDITOR` / `vi` on a temporary `.md` file.
+pub type ExternalEditorRunner =
+    Arc<dyn Fn(&str, Option<&std::path::Path>) -> Result<String, String> + Send + Sync>;
+
 pub struct TuiAppConfig {
     pub screen_mode: ScreenMode,
     pub theme_kind: ThemeKind,
@@ -67,6 +74,13 @@ pub struct TuiAppConfig {
     /// Root for file completion. Defaults to the working directory. Set to None to disable it.
     pub directory: Option<PathBuf>,
     pub clipboard: Option<ClipboardWriter>,
+    /// Optional path to a JSONL file storing cross-session prompt history. Defaults to `None`
+    /// (in-memory session history only; library code never hardcodes a brand directory).
+    pub prompt_history_path: Option<PathBuf>,
+    /// Maximum number of deduplicated prompt history entries kept in memory. `None` for unlimited.
+    pub prompt_history_limit: Option<usize>,
+    /// Optional custom external editor runner for `Ctrl+G` / `/edit`.
+    pub external_editor: Option<ExternalEditorRunner>,
     /// Optional initial user message submitted automatically once the TUI starts.
     pub initial_prompt: Option<String>,
     /// Open the session picker modal immediately on startup (`-r` / `--resume`).
@@ -98,6 +112,9 @@ impl Default for TuiAppConfig {
             autocomplete: None,
             directory: std::env::current_dir().ok(),
             clipboard: None,
+            prompt_history_path: None,
+            prompt_history_limit: Some(1000),
+            external_editor: None,
             initial_prompt: None,
             open_resume_picker: false,
             initial_notices: vec![],
@@ -127,6 +144,10 @@ enum Outcome {
     Result(Result<(), String>),
     Session(Result<(), String>),
     Rewind(Result<crate::harness::RewindOutcome, String>),
+    ShellDone {
+        call_id: String,
+        result: Result<crate::harness::ShellCommandResult, String>,
+    },
 }
 /// Create the host, clone its controller for interactive extensions, then call run or run_on.
 pub struct TuiApp {
@@ -168,8 +189,28 @@ pub struct TuiApp {
     usage: UsageStats,
     context: Option<ContextMeterSnapshot>,
     queue: Vec<QueuedItem>,
-    #[cfg(feature = "history-search")]
-    prompts: Vec<crate::ui::views::history_search::HistoryEntry>,
+    /// Deduplicated prompt history ordered newest-first (index 0 is most recent).
+    prompts: Vec<String>,
+    /// Active Up/Down in-place history navigation index into `prompts`.
+    history_nav_index: Option<usize>,
+    /// Draft stashed when entering Up/Down history recall so stepping back down restores it.
+    history_nav_draft: Option<crate::ui::views::prompt_widget::StashedPrompt>,
+    /// Bash mode flag captured before entering history recall so stepping back down restores it.
+    history_nav_bash_mode: bool,
+    /// User-stashed draft (`Ctrl+S` / `Alt+S`), restored after the next send or on pop.
+    prompt_stash: Option<crate::ui::views::prompt_widget::StashedPrompt>,
+    /// Armed for one keypress right after `Ctrl+S` so immediate `Ctrl+Z` pops the stash back.
+    stash_undo_armed: bool,
+    /// Persistent multiline composer mode (`Enter` inserts newline, `Shift/Alt+Enter` sends).
+    multiline_mode: bool,
+    /// Quick local shell input mode (`!` on empty prompt).
+    bash_mode: bool,
+    /// Active cancellation flag for a running `!` shell command.
+    bash_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Pending external editor draft requested via `Ctrl+G` or `/edit`.
+    pending_external_editor: Option<String>,
+    /// Counter for generating unique local bash tool call IDs.
+    bash_serial: u64,
     generation: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,8 +265,17 @@ impl TuiApp {
             usage: Default::default(),
             context: None,
             queue: vec![],
-            #[cfg(feature = "history-search")]
             prompts: vec![],
+            history_nav_index: None,
+            history_nav_draft: None,
+            history_nav_bash_mode: false,
+            prompt_stash: None,
+            stash_undo_armed: false,
+            multiline_mode: false,
+            bash_mode: false,
+            bash_cancel: None,
+            pending_external_editor: None,
+            bash_serial: 0,
             generation: 0,
         };
         app.composer
@@ -274,19 +324,25 @@ impl TuiApp {
     }
     fn restore(&mut self) {
         let history = self.harness.initial_history();
-        #[cfg(feature = "history-search")]
-        {
-            self.prompts = history
-                .iter()
-                .filter_map(|h| {
-                    if let crate::harness::HistoryMessage::User { text, .. } = h {
-                        Some(crate::ui::views::history_search::HistoryEntry { text: text.clone() })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
+        let persisted = self
+            .config
+            .prompt_history_path
+            .as_deref()
+            .map(|path| history_store::load_newest_first(path, self.config.prompt_history_limit))
+            .unwrap_or_default();
+        let session_prompts = history.iter().filter_map(|h| {
+            if let crate::harness::HistoryMessage::User { text, .. } = h {
+                Some(text.clone())
+            } else {
+                None
+            }
+        });
+        self.prompts = history_store::merge_newest_first(
+            session_prompts,
+            persisted,
+            self.config.prompt_history_limit,
+        );
+        self.reset_history_nav();
         self.running = false;
         self.starting_turn = false;
         self.turn_error = None;
@@ -554,12 +610,115 @@ impl TuiApp {
         }
     }
     fn abort(&mut self) {
+        if let Some(cancel) = &self.bash_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if self.aborting.is_some() {
             return;
         }
         let h = self.harness.clone();
         self.aborting = Some(Box::pin(async move { h.abort().await }));
     }
+
+    pub(super) fn record_prompt_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let is_dup_latest = self.prompts.first().is_some_and(|first| first == text);
+        history_store::push_newest(
+            &mut self.prompts,
+            text.to_owned(),
+            self.config.prompt_history_limit,
+        );
+        if !is_dup_latest && let Some(path) = self.config.prompt_history_path.as_deref() {
+            history_store::append_entry(path, text);
+        }
+    }
+
+    #[cfg(feature = "history-search")]
+    pub(super) fn history_search_entries(
+        &self,
+    ) -> Vec<crate::ui::views::history_search::HistoryEntry> {
+        self.prompts
+            .iter()
+            .cloned()
+            .map(|text| crate::ui::views::history_search::HistoryEntry { text })
+            .collect()
+    }
+
+    pub(super) fn reset_history_nav(&mut self) {
+        self.history_nav_index = None;
+        self.history_nav_draft = None;
+        self.history_nav_bash_mode = false;
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        self.running || self.bash_cancel.is_some()
+    }
+
+    pub(super) fn request_external_editor(&mut self) {
+        self.composer.completion_dropdown_close();
+        #[cfg(feature = "history-search")]
+        if self.composer.history_search.is_active() {
+            self.composer.history_search.deactivate();
+        }
+        self.pending_external_editor = Some(self.composer.text().to_owned());
+    }
+
+    pub(super) fn apply_external_editor_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(edited) => {
+                self.reset_history_nav();
+                self.composer.set_text(&edited);
+                self.composer.set_cursor(edited.len());
+                self.refresh_completion();
+            }
+            Err(err) => self.show_toast(&err),
+        }
+    }
+
+    pub(super) fn run_bash_command(&mut self, command: String) {
+        let trimmed = command.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.bash_cancel.is_some() {
+            self.show_toast("A shell command is already running");
+            return;
+        }
+        if self.harness.capabilities().shell.is_none() {
+            self.show_toast("Local shell mode is unavailable");
+            return;
+        }
+        self.record_prompt_history(&format!("!{trimmed}"));
+        self.bash_serial = self.bash_serial.wrapping_add(1);
+        let call_id = format!("local-bash-{}", self.bash_serial);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.bash_cancel = Some(Arc::clone(&cancel));
+        self.status = ProgramStatus::working();
+        self.event(TuiEvent::ToolStart {
+            call_id: call_id.clone(),
+            name: "bash".to_owned(),
+            effective_name: Some("!".to_owned()),
+            args: serde_json::json!({ "command": trimmed }),
+        });
+        let h = self.harness.clone();
+        let cmd_for_job = trimmed.clone();
+        let id_for_job = call_id.clone();
+        self.jobs.push(Box::pin(async move {
+            let result = match h.capabilities().shell {
+                Some(shell) => shell.run_shell(cmd_for_job.clone(), cancel).await,
+                None => Err("Local shell mode is unavailable".to_owned()),
+            };
+            Outcome::ShellDone {
+                call_id: id_for_job,
+                result,
+            }
+        }));
+    }
+
     fn submit(&mut self, input: UserInput, follow: bool) {
         self.submit_with_display(input, None, follow);
     }
@@ -596,21 +755,8 @@ impl TuiApp {
                 input.images.len(),
             ));
         }
-        #[cfg(feature = "history-search")]
-        {
-            let history_text = display_text.as_deref().unwrap_or(&input.text);
-            if !history_text.is_empty()
-                && self
-                    .prompts
-                    .last()
-                    .is_none_or(|entry| entry.text != history_text)
-            {
-                self.prompts
-                    .push(crate::ui::views::history_search::HistoryEntry {
-                        text: history_text.to_owned(),
-                    });
-            }
-        }
+        let history_text = display_text.as_deref().unwrap_or(&input.text);
+        self.record_prompt_history(history_text);
         let h = self.harness.clone();
         let active = self.running;
         let restore_draft = UserInput {

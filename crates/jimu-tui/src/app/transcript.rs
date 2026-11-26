@@ -244,12 +244,17 @@ impl Transcript {
                         accumulate_output(&previous, &mut output);
                     }
                 }
+                let is_local_bash = effective_name.as_deref() == Some("!");
                 let data = tool_data(
                     effective_name.unwrap_or(previous.name),
                     previous.args,
                     Some(output),
                 );
                 self.state.update_tool(id, data, renderers, true);
+                if is_local_bash && let Some(entry) = self.state.get_by_id_mut(id) {
+                    entry.set_display_mode(crate::ui::scrollback::DisplayMode::Expanded);
+                    self.state.mark_height_dirty(id);
+                }
             }
             TuiEvent::SubagentEvent(update) => {
                 let mut block = SubagentBlock::started(

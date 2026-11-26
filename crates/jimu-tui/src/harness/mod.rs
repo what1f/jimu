@@ -14,7 +14,7 @@ pub use capabilities::{
     BackgroundTask, CompactionCap, ContextMeterCap, ContextMeterSnapshot, HarnessCapabilities,
     McpCap, McpServerSummary, ModelOption, ModelPickerCap, PermissionModeCap, PermissionModeOption,
     QueueCap, QueuedItem, RewindCap, RewindOutcome, RewindPoint, SessionOption, SessionPickerCap,
-    SkillSummary, SkillsCap, TasksCap,
+    ShellCap, ShellCommandResult, SkillSummary, SkillsCap, TasksCap,
 };
 pub use chrome::{
     AutocompleteProvider, ChromeConfig, ChromeSlots, ChromeState, CombinedAutocompleteProvider,

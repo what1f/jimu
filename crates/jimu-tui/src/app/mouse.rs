@@ -144,13 +144,18 @@ impl TuiApp {
 
         if let Some(welcome) = &self.hits.welcome
             && left_down
-            && let Some(WelcomeTarget::Menu(index)) = welcome.hit_test(col, row)
         {
-            self.focus = Focus::Welcome(index);
-            if let Some((id, _, _)) = self.welcome_actions().get(index) {
-                self.welcome_action(id);
+            if let Some(WelcomeTarget::Menu(index)) = welcome.hit_test(col, row) {
+                self.focus = Focus::Welcome(index);
+                if let Some((id, _, _)) = self.welcome_actions().get(index) {
+                    self.welcome_action(id);
+                }
+                return;
             }
-            return;
+            if !self.hits.prompt.contains(position) {
+                self.focus_prompt();
+                return;
+            }
         }
         if left_down
             && let Some((id, rect)) = self.hits.view_button
@@ -229,9 +234,15 @@ impl TuiApp {
             self.queue_pane.clear_row_hover();
         }
         if self.mode != ScreenMode::Fullscreen {
+            if left_down {
+                self.focus_prompt();
+            }
             return;
         }
         let Some(frame) = self.hits.transcript.clone() else {
+            if left_down {
+                self.focus_prompt();
+            }
             return;
         };
         if let Some(direction) = wheel {
@@ -254,6 +265,7 @@ impl TuiApp {
             return;
         }
         if !frame.scrollback_rect.contains(position) {
+            self.focus_prompt();
             return;
         }
         let clicks = self.mouse.count_click((col, row));
@@ -340,16 +352,18 @@ impl TuiApp {
                 .header
                 .is_some_and(|header| header.contains((col, row).into()))
         {
-            self.focus = Focus::Transcript;
             if clicks == 2 {
                 self.open_block(hit.entry_id);
             } else {
                 frame.toggle_block(state, col, row);
             }
+            self.focus_prompt();
         } else if clicks == 2 && state.select_word(col, row)
             || clicks == 3 && state.select_line(col, row)
         {
             self.copy_selection();
+        } else {
+            self.focus_prompt();
         }
     }
 

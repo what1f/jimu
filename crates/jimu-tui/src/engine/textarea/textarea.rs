@@ -2351,6 +2351,26 @@ impl TextArea {
         self.apply_edit_command(EditCommand::MoveGraphemeRight, None);
     }
 
+    /// True when the cursor is on the first visual line (or first logical line before wrap).
+    pub fn cursor_on_first_visual_line(&self) -> bool {
+        if let Some(cache) = self.wrap_cache.borrow().as_ref()
+            && let Some(idx) = Self::wrapped_line_index_by_start(&cache.lines, self.cursor())
+        {
+            return idx == 0;
+        }
+        !self.text_slice(..self.cursor()).contains('\n')
+    }
+
+    /// True when the cursor is on the last visual line (or last logical line before wrap).
+    pub fn cursor_on_last_visual_line(&self) -> bool {
+        if let Some(cache) = self.wrap_cache.borrow().as_ref()
+            && let Some(idx) = Self::wrapped_line_index_by_start(&cache.lines, self.cursor())
+        {
+            return idx + 1 >= cache.lines.len();
+        }
+        !self.text_slice(self.cursor()..).contains('\n')
+    }
+
     pub fn move_cursor_up(&mut self) {
         self.scroll_override = None;
         // If we have a wrapping cache, prefer navigating across wrapped (visual) lines.

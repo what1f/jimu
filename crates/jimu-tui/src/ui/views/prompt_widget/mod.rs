@@ -906,6 +906,47 @@ impl PromptWidget {
         }
     }
 
+    /// Display text of the currently highlighted completion item, if the dropdown is open.
+    pub fn selected_completion_display(&self) -> Option<&str> {
+        if !self.completion_dropdown_open() {
+            return None;
+        }
+        self.suggestions
+            .dropdown
+            .items
+            .get(self.suggestions.dropdown.selected)
+            .map(|item| item.display.as_str())
+    }
+
+    /// True when the cursor is on the first visual line of the composer.
+    pub fn cursor_on_first_visual_line(&self) -> bool {
+        self.textarea.cursor_on_first_visual_line()
+    }
+
+    /// True when the cursor is on the last visual line of the composer.
+    pub fn cursor_on_last_visual_line(&self) -> bool {
+        self.textarea.cursor_on_last_visual_line()
+    }
+
+    /// Place the cursor at the end of the first logical line (convenient after Up history recall).
+    pub fn set_cursor_first_line_end(&mut self) {
+        let pos = self.text().find('\n').unwrap_or_else(|| self.text().len());
+        self.set_cursor(pos);
+    }
+
+    /// Clear the composer while recording an undo step so `Ctrl+Z` restores both text and images.
+    pub fn clear_undoable(&mut self) {
+        self.post_insert_image_preview = None;
+        self.hovered_image_element_id = None;
+        self.suggestions.invalidate_draft();
+        self.slash_close();
+        if !self.images.is_empty() {
+            self.image_undo_stash.append(&mut self.images);
+        }
+        self.textarea.set_text("");
+        self.update_file_search_context();
+    }
+
     /// Get the current text.
     pub fn text(&self) -> &str {
         self.textarea.text()
@@ -1498,19 +1539,41 @@ impl PromptWidget {
         if key!('r', CONTROL).matches(key) {
             return PromptEvent::SearchHistory;
         }
-        if self.completion_dropdown_open() && key.modifiers.is_empty() {
-            match key.code {
-                KeyCode::Up => self.completion_dropdown_move(-1),
-                KeyCode::Down => self.completion_dropdown_move(1),
-                KeyCode::PageUp => self.completion_dropdown_scroll(-6),
-                KeyCode::PageDown => self.completion_dropdown_scroll(6),
-                KeyCode::Esc => self.completion_dropdown_close(),
-                KeyCode::Enter | KeyCode::Tab => {
-                    self.accept_completion();
+        if self.completion_dropdown_open() {
+            if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => self.completion_dropdown_move(-1),
+                    KeyCode::Down => self.completion_dropdown_move(1),
+                    KeyCode::PageUp => self.completion_dropdown_scroll(-6),
+                    KeyCode::PageDown => self.completion_dropdown_scroll(6),
+                    KeyCode::Esc => self.completion_dropdown_close(),
+                    KeyCode::BackTab => self.completion_dropdown_move(-1),
+                    KeyCode::Enter | KeyCode::Tab => {
+                        self.accept_completion();
+                    }
+                    _ => return self.handle_key_inner(key),
                 }
-                _ => return self.handle_key_inner(key),
+                return PromptEvent::Edited;
             }
-            return PromptEvent::Edited;
+            if key.modifiers == crossterm::event::KeyModifiers::CONTROL {
+                match key.code {
+                    KeyCode::Char('p') => {
+                        self.completion_dropdown_move(-1);
+                        return PromptEvent::Edited;
+                    }
+                    KeyCode::Char('n') => {
+                        self.completion_dropdown_move(1);
+                        return PromptEvent::Edited;
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(key.code, KeyCode::BackTab | KeyCode::Tab)
+                && key.modifiers == crossterm::event::KeyModifiers::SHIFT
+            {
+                self.completion_dropdown_move(-1);
+                return PromptEvent::Edited;
+            }
         }
         self.handle_key_inner(key)
     }
@@ -1591,11 +1654,11 @@ impl PromptWidget {
         }
         // Not at an element boundary: fall through to type ':' normally
 
-        // Newline: Shift/Alt+Enter, Apple Terminal CoreGraphics rescue (inside is_mod_enter),
-        // or a delivered SUPER+Enter (Kitty). SUPER is excluded from is_mod_enter (fullscreen
-        // on many terminals) and from bare-Enter send; insert here instead of textarea fallthrough.
+        // Newline: Shift/Alt+Enter, Ctrl+J (LF, works on all terminals including tmux/SSH),
+        // Apple Terminal CoreGraphics rescue (inside is_mod_enter), or a delivered SUPER+Enter (Kitty).
         if crate::engine::input::is_mod_enter(key)
             || crate::engine::input::is_delivered_super_enter(key)
+            || key!('j', CONTROL).matches(key)
         {
             self.insert_replacing_selection("\n");
             return PromptEvent::Edited;

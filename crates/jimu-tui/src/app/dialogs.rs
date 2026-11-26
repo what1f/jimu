@@ -1435,8 +1435,15 @@ impl Shortcuts {
         #[allow(unused_mut)]
         let mut shortcuts = vec![
             (Enter, M::NONE, "Send or steer"),
-            (Enter, M::SHIFT, "New line"),
-            (Enter, M::ALT, "Queue follow-up"),
+            (Enter, M::SHIFT, "New line (or Alt+Enter / Ctrl+J)"),
+            (Enter, M::CONTROL, "Queue follow-up"),
+            (Up, M::NONE, "Previous input / focus queue"),
+            (Down, M::NONE, "Next input"),
+            (Char('s'), M::CONTROL, "Stash / restore draft (or Alt+S)"),
+            (Char('g'), M::CONTROL, "Edit prompt in $EDITOR"),
+            (Char('m'), M::ALT, "Toggle multiline mode"),
+            (Char('!'), M::NONE, "Local shell mode (on empty prompt)"),
+            (Char('z'), M::CONTROL, "Undo (restores cleared draft)"),
             (Esc, M::NONE, "Stop / double-Esc rewind"),
             (Char('c'), M::CONTROL, "Stop / clear / twice to exit"),
             (Char('d'), M::CONTROL, "Exit on empty prompt"),

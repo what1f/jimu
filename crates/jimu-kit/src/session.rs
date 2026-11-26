@@ -857,6 +857,11 @@ impl KitSession {
         self.agent.remove_queued_input(id)
     }
 
+    /// Remove and return the full pending steering or follow-up item by id.
+    pub fn take_queued_input(&self, id: &str) -> Option<jimu_agent::QueuedInput> {
+        self.agent.take_queued_input(id)
+    }
+
     /// Return a snapshot of the session's root header (shared across all branches).
     pub fn header(&self) -> SessionHeader {
         self.session

@@ -109,6 +109,16 @@ pub trait ContextMeterCap: Send + Sync {
 pub trait QueueCap: Send + Sync {
     fn pending_inputs(&self) -> Vec<QueuedItem>;
     fn remove_queued(&self, id: &str) -> bool;
+
+    /// Remove and return the full queued input (preserving attachments when supported).
+    fn take_queued(&self, id: &str) -> Option<super::UserInput> {
+        let text = self
+            .pending_inputs()
+            .into_iter()
+            .find(|item| item.id == id)?
+            .text;
+        self.remove_queued(id).then(|| super::UserInput::text(text))
+    }
 }
 
 /// Conversation compaction capability (`/compact`).
@@ -210,6 +220,27 @@ pub trait RewindCap: Send + Sync {
     fn rewind_to(&self, id: &str) -> BoxFuture<'_, Result<RewindOutcome, String>>;
 }
 
+/// Result of a user-initiated `!` local shell command executed via [`ShellCap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellCommandResult {
+    pub command: String,
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub interrupted: bool,
+}
+
+/// Optional local shell execution capability backing `!` quick bash mode.
+///
+/// Harnesses implementing this execute the user command in the session workspace and record the
+/// command + output into conversation context so subsequent agent turns can see it.
+pub trait ShellCap: Send + Sync {
+    fn run_shell(
+        &self,
+        command: String,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> BoxFuture<'_, Result<ShellCommandResult, String>>;
+}
+
 /// Collection of optional capabilities advertised by a [`super::TuiHarness`].
 #[derive(Default)]
 pub struct HarnessCapabilities<'a> {
@@ -223,4 +254,5 @@ pub struct HarnessCapabilities<'a> {
     pub skills: Option<&'a dyn SkillsCap>,
     pub mcp: Option<&'a dyn McpCap>,
     pub rewind: Option<&'a dyn RewindCap>,
+    pub shell: Option<&'a dyn ShellCap>,
 }

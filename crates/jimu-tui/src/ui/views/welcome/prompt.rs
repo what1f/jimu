@@ -25,6 +25,8 @@ fn prompt_style(
     focus: WelcomePromptFocus,
     compact: bool,
     placeholder: Option<&'static str>,
+    prefix_override: Option<(&'static str, ratatui::style::Color)>,
+    accent_color_override: Option<ratatui::style::Color>,
 ) -> PromptStyle {
     PromptStyle {
         focused: focus == WelcomePromptFocus::Focused,
@@ -35,6 +37,10 @@ fn prompt_style(
         chrome_pad_left: CHROME_PAD,
         chrome_pad_right: CHROME_PAD,
         placeholder_override: placeholder,
+        placeholder_when_focused: prefix_override.is_some(),
+        prefix_override,
+        accent_color_override,
+        border_color_override: accent_color_override,
         ..PromptStyle::default()
     }
 }
@@ -48,7 +54,7 @@ pub fn desired_prompt_height(
 ) -> u16 {
     let inset = prompt_area_inset(compact);
     // Focus only tints, never changes the row count
-    let style = prompt_style(WelcomePromptFocus::Focused, compact, None);
+    let style = prompt_style(WelcomePromptFocus::Focused, compact, None, None, None);
     prompt.desired_height(
         content_width.saturating_sub(inset * 2),
         &style,
@@ -58,6 +64,7 @@ pub fn desired_prompt_height(
 }
 
 /// Returns the cursor position and the post-flush output that carries terminal-overlay ownership.
+#[allow(clippy::too_many_arguments)]
 pub fn render_prompt(
     area: Rect,
     buf: &mut Buffer,
@@ -66,11 +73,19 @@ pub fn render_prompt(
     info: &PromptInfo<'_>,
     compact: bool,
     placeholder: Option<&'static str>,
+    prefix_override: Option<(&'static str, ratatui::style::Color)>,
+    accent_color_override: Option<ratatui::style::Color>,
 ) -> (
     Option<(u16, u16)>,
     Option<crate::ui::views::prompt_widget::PromptPostFlush>,
 ) {
-    let style = prompt_style(focus, compact, placeholder);
+    let style = prompt_style(
+        focus,
+        compact,
+        placeholder,
+        prefix_override,
+        accent_color_override,
+    );
 
     let inset = prompt_area_inset(compact);
     let inset_area = Rect {

@@ -1537,7 +1537,8 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
         .with_mcp(Arc::new(SharedMcpCap {
             hub: Arc::clone(&mcp_hub),
         }))
-        .with_session_controller(Arc::clone(&session_manager) as Arc<dyn JimuSessionController>);
+        .with_session_controller(Arc::clone(&session_manager) as Arc<dyn JimuSessionController>)
+        .with_shell_cwd(cwd.clone());
 
     let effective_model = session.model();
     let auth_hint = if effective_model.id.is_empty() {
@@ -1644,6 +1645,7 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
         chrome,
         slash_commands,
         directory: Some(cwd),
+        prompt_history_path: Some(jimu_home.join("history.jsonl")),
         initial_prompt: config.initial_prompt,
         open_resume_picker: config.open_resume_picker,
         initial_notices,

@@ -2298,3 +2298,329 @@ fn image_retry_relative_cwd_multiline_dedup_and_batch_cap_e2e() {
         }
     }
 }
+
+struct ComposerHarness {
+    tx: Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>,
+    submitted: Mutex<Vec<String>>,
+    follow_ups: Mutex<Vec<String>>,
+    queue: Mutex<Vec<jimu_tui::harness::QueuedItem>>,
+    shell_commands: Mutex<Vec<String>>,
+}
+
+impl ComposerHarness {
+    fn new() -> Self {
+        Self {
+            tx: Mutex::new(None),
+            submitted: Mutex::new(Vec::new()),
+            follow_ups: Mutex::new(Vec::new()),
+            queue: Mutex::new(Vec::new()),
+            shell_commands: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn emit(&self, ev: TuiEvent) {
+        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+            let _ = tx.unbounded_send(ev);
+        }
+    }
+}
+
+impl jimu_tui::harness::QueueCap for ComposerHarness {
+    fn pending_inputs(&self) -> Vec<jimu_tui::harness::QueuedItem> {
+        self.queue.lock().unwrap().clone()
+    }
+
+    fn remove_queued(&self, id: &str) -> bool {
+        let mut q = self.queue.lock().unwrap();
+        let before = q.len();
+        q.retain(|item| item.id != id);
+        q.len() != before
+    }
+}
+
+impl jimu_tui::harness::ShellCap for ComposerHarness {
+    fn run_shell(
+        &self,
+        command: String,
+        _cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> BoxFuture<'_, Result<jimu_tui::harness::ShellCommandResult, String>> {
+        self.shell_commands.lock().unwrap().push(command.clone());
+        Box::pin(async move {
+            Ok(jimu_tui::harness::ShellCommandResult {
+                command: command.clone(),
+                output: format!("ran:{command}"),
+                exit_code: Some(0),
+                interrupted: false,
+            })
+        })
+    }
+}
+
+impl TuiHarness for ComposerHarness {
+    fn submit(&self, input: UserInput) -> BoxFuture<'_, Result<(), String>> {
+        let text = input.text;
+        Box::pin(async move {
+            self.submitted.lock().unwrap().push(text.clone());
+            self.emit(TuiEvent::TurnStarted);
+            self.emit(TuiEvent::UserMessage {
+                id: None,
+                text,
+                steered: false,
+            });
+            self.emit(TuiEvent::TurnEnded);
+            Ok(())
+        })
+    }
+
+    fn follow_up(&self, input: UserInput) -> BoxFuture<'_, Result<(), String>> {
+        let text = input.text;
+        Box::pin(async move {
+            self.follow_ups.lock().unwrap().push(text.clone());
+            let mut q = self.queue.lock().unwrap();
+            let id = format!("q-{}", q.len() + 1);
+            q.push(jimu_tui::harness::QueuedItem {
+                id,
+                is_steering: false,
+                text,
+            });
+            let snap = q.clone();
+            drop(q);
+            self.emit(TuiEvent::QueueChanged(snap));
+            Ok(())
+        })
+    }
+
+    fn subscribe(&self) -> BoxEventStream {
+        let (tx, rx) = mpsc::unbounded();
+        *self.tx.lock().unwrap() = Some(tx);
+        Box::pin(rx)
+    }
+
+    fn abort(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    fn capabilities(&self) -> HarnessCapabilities<'_> {
+        HarnessCapabilities {
+            queue: Some(self),
+            shell: Some(self),
+            ..Default::default()
+        }
+    }
+}
+
+#[test]
+fn composer_multiline_history_stash_undo_chips_and_editor_e2e() {
+    let _guard = UI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = std::env::temp_dir().join(format!("jimu-tui-composer-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let history_path = tmp.join("history.jsonl");
+
+    // 1. Multiline input (Alt+Enter, Shift+Enter, Ctrl+J) + Alt+M multiline mode + Ctrl+C undo + Ctrl+S stash + Ctrl+G editor + paste chip expand + direct slash Enter.
+    let harness = Arc::new(ComposerHarness::new());
+    let editor_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let editor_seen_cb = Arc::clone(&editor_seen);
+    let mut cfg = TuiAppConfig {
+        directory: Some(tmp.clone()),
+        prompt_history_path: Some(history_path.clone()),
+        external_editor: Some(Arc::new(move |draft, _| {
+            editor_seen_cb.lock().unwrap().push(draft.to_owned());
+            Ok(format!("{draft}\nedited-by-ext"))
+        })),
+        ..TuiAppConfig::default()
+    };
+    cfg.chrome.show_header = false;
+    let mut ui = TestUi::start(TuiApp::new(harness.clone(), cfg));
+
+    // Alt+Enter, Shift+Enter, Ctrl+J all insert newlines instead of submitting.
+    ui.send(Event::Paste("line1".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::ALT);
+    ui.send(Event::Paste("line2".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::SHIFT);
+    ui.send(Event::Paste("line3".into()));
+    ui.key(KeyCode::Char('j'), KeyModifiers::CONTROL);
+    ui.send(Event::Paste("line4".into()));
+    assert!(
+        harness.submitted.lock().unwrap().is_empty(),
+        "newline chords must not submit early"
+    );
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        harness.submitted.lock().unwrap().as_slice(),
+        &["line1\nline2\nline3\nline4"]
+    );
+
+    // Multiline mode (Alt+M): bare Enter inserts newline, Alt+Enter submits.
+    ui.key(KeyCode::Char('m'), KeyModifiers::ALT);
+    assert!(ui.screen().contains("multiline"));
+    ui.send(Event::Paste("multiA".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    ui.send(Event::Paste("multiB".into()));
+    assert_eq!(harness.submitted.lock().unwrap().len(), 1);
+    ui.key(KeyCode::Enter, KeyModifiers::ALT);
+    assert_eq!(harness.submitted.lock().unwrap()[1], "multiA\nmultiB");
+    // Toggle multiline off via slash completion one-step Enter (`/multi` -> `/multiline`).
+    for ch in "/multi".chars() {
+        ui.key(KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(ui.screen().contains("Multiline mode off"));
+
+    // Ctrl+C clears draft undoably; Ctrl+Z restores it.
+    ui.send(Event::Paste("keep-me".into()));
+    ui.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(!ui.screen().contains("keep-me"));
+    ui.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+    assert!(ui.screen().contains("keep-me"));
+
+    // Ctrl+S stashes draft, immediate Ctrl+Z restores; re-stash auto-restores after next send.
+    ui.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert!(ui.screen().contains("stashed"));
+    ui.key(KeyCode::Char('z'), KeyModifiers::CONTROL);
+    assert!(ui.screen().contains("keep-me"));
+    ui.key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    ui.enter("quick-question");
+    assert_eq!(
+        harness.submitted.lock().unwrap().last().unwrap(),
+        "quick-question"
+    );
+    assert!(
+        ui.screen().contains("keep-me"),
+        "stashed draft must auto-restore after sending another prompt:\n{}",
+        ui.screen()
+    );
+
+    // Ctrl+G invokes external editor and replaces composer text.
+    ui.key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+    assert_eq!(editor_seen.lock().unwrap().as_slice(), &["keep-me"]);
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        harness.submitted.lock().unwrap().last().unwrap(),
+        "keep-me\nedited-by-ext"
+    );
+
+    // Long paste creates [Pasted: 5 lines] chip; cursor left + Enter expands inline.
+    ui.send(Event::Paste("p1\np2\np3\np4\np5".into()));
+    assert!(ui.screen().contains("[Pasted: 5 lines]"));
+    ui.key(KeyCode::Left, KeyModifiers::NONE);
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !ui.screen().contains("[Pasted: 5 lines]") && ui.screen().contains("p1"),
+        "Enter on paste chip must expand it inline:\n{}",
+        ui.screen()
+    );
+    ui.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    ui.stop();
+
+    // 2. Cross-session persisted history + newest-first Up/Down recall preserving draft.
+    let harness2 = Arc::new(ComposerHarness::new());
+    let cfg2 = TuiAppConfig {
+        directory: Some(tmp.clone()),
+        prompt_history_path: Some(history_path.clone()),
+        ..TuiAppConfig::default()
+    };
+    let mut ui2 = TestUi::start(TuiApp::new(harness2.clone(), cfg2));
+    ui2.send(Event::Paste("unsent-draft".into()));
+    ui2.key(KeyCode::Up, KeyModifiers::NONE);
+    assert!(
+        ui2.screen().contains("keep-me"),
+        "first Up must recall newest persisted entry:\n{}",
+        ui2.screen()
+    );
+    ui2.key(KeyCode::Up, KeyModifiers::NONE);
+    assert!(
+        ui2.screen().contains("quick-question"),
+        "second Up must step to previous persisted entry:\n{}",
+        ui2.screen()
+    );
+    ui2.key(KeyCode::Down, KeyModifiers::NONE);
+    ui2.key(KeyCode::Down, KeyModifiers::NONE);
+    assert!(
+        ui2.screen().contains("unsent-draft"),
+        "Down past newest must restore stashed unsent draft:\n{}",
+        ui2.screen()
+    );
+    ui2.stop();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn composer_bash_mode_and_queue_recall_e2e() {
+    let _guard = UI_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = Arc::new(ComposerHarness::new());
+    let mut ui = TestUi::start(TuiApp::new(harness.clone(), TuiAppConfig::default()));
+
+    // Clicking anywhere on the page refocuses the prompt; `!` enters bash mode, Backspace exits.
+    ui.key(KeyCode::Down, KeyModifiers::NONE);
+    ui.click(Position::new(2, 2));
+    ui.key(KeyCode::Char('!'), KeyModifiers::NONE);
+    assert!(
+        ui.screen().contains("! Run shell command..."),
+        "expected bash prompt after clicking page:\n{}",
+        ui.screen()
+    );
+    ui.key(KeyCode::Backspace, KeyModifiers::NONE);
+    assert!(!ui.screen().contains("Run shell command..."));
+
+    // Run a `!` shell command and verify ShellCap received it and transcript shows output expanded.
+    ui.key(KeyCode::Char('!'), KeyModifiers::NONE);
+    ui.enter("echo hi");
+    assert_eq!(
+        harness.shell_commands.lock().unwrap().as_slice(),
+        &["echo hi"]
+    );
+    assert!(
+        ui.screen().contains("ran:echo hi"),
+        "bash output should render expanded in transcript:\n{}",
+        ui.screen()
+    );
+
+    // Recalling `!echo hi` via Up restores bash mode without duplicating `!`, and re-running works.
+    ui.key(KeyCode::Char('!'), KeyModifiers::NONE);
+    ui.key(KeyCode::Up, KeyModifiers::NONE);
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        harness.shell_commands.lock().unwrap().as_slice(),
+        &["echo hi", "echo hi"]
+    );
+
+    // Typing while in Transcript focus automatically refocuses the prompt and inserts characters.
+    ui.key(KeyCode::Up, KeyModifiers::CONTROL);
+    ui.key(KeyCode::Char('h'), KeyModifiers::NONE);
+    ui.key(KeyCode::Char('i'), KeyModifiers::NONE);
+    assert!(
+        ui.screen().contains("hi"),
+        "typing while focused on transcript must refocus prompt:\n{}",
+        ui.screen()
+    );
+    ui.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    // Queue follow-up + Up focuses queue + `e` pulls queued item back into composer + empty Enter sends top queued.
+    harness.emit(TuiEvent::TurnStarted);
+    ui.settle();
+    ui.send(Event::Paste("queued-one".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::CONTROL);
+    ui.send(Event::Paste("queued-two".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::CONTROL);
+    assert_eq!(harness.follow_ups.lock().unwrap().len(), 2);
+
+    // Up on empty prompt focuses queue; `e` pulls the latest queued row into composer for editing.
+    ui.key(KeyCode::Up, KeyModifiers::NONE);
+    ui.key(KeyCode::Char('e'), KeyModifiers::NONE);
+    assert!(
+        ui.screen().contains("queued-two"),
+        "editing queued row should populate composer:\n{}",
+        ui.screen()
+    );
+    // Clear draft, then bare Enter on empty prompt sends the remaining top queued item immediately.
+    ui.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    harness.emit(TuiEvent::TurnEnded);
+    ui.settle();
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        harness.submitted.lock().unwrap().as_slice(),
+        &["queued-one"]
+    );
+    ui.stop();
+}

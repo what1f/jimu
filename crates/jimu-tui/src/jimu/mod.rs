@@ -10,12 +10,12 @@ use crate::harness::{
     BackgroundTask, BoxEventStream, BoxFuture, CompactionCap, ContextMeterCap,
     ContextMeterSnapshot, HarnessCapabilities, HistoryMessage, McpCap, ModelOption, ModelPickerCap,
     NoticeLevel, PermissionModeCap, QueueCap, QueuedItem, RewindCap, RewindOutcome, RewindPoint,
-    SessionOption, SessionPickerCap, SkillSummary, SkillsCap, TasksCap, TuiEvent, TuiHarness,
-    UsageStats, UserInput,
+    SessionOption, SessionPickerCap, ShellCap, ShellCommandResult, SkillSummary, SkillsCap,
+    TasksCap, TuiEvent, TuiHarness, UsageStats, UserInput,
 };
 use events::{
-    KitEventTranslator, context_usage_to_snapshot, queued_summary_to_item, restore_history,
-    user_input_to_parts,
+    KitEventTranslator, context_usage_to_snapshot, parts_to_user_input, queued_summary_to_item,
+    restore_history, user_input_to_parts,
 };
 use futures_channel::mpsc;
 use futures_core::Stream;
@@ -198,6 +198,7 @@ pub struct JimuHarness {
     thinking_levels_resolver: Option<ThinkingLevelsFn>,
     on_model_change: Option<OnModelChangeFn>,
     on_thinking_change: Option<OnThinkingChangeFn>,
+    shell_cwd: Option<std::path::PathBuf>,
     serial: AtomicU64,
 }
 
@@ -226,8 +227,15 @@ impl JimuHarness {
             thinking_levels_resolver: None,
             on_model_change: None,
             on_thinking_change: None,
+            shell_cwd: None,
             serial: AtomicU64::new(1),
         }
+    }
+
+    /// Set the working directory used by `!` local shell commands.
+    pub fn with_shell_cwd(mut self, cwd: std::path::PathBuf) -> Self {
+        self.shell_cwd = Some(cwd);
+        self
     }
 
     /// Access the currently active [`KitSession`].
@@ -512,8 +520,191 @@ impl TuiHarness for JimuHarness {
             skills: Some(self),
             mcp: self.mcp.as_deref(),
             rewind: Some(self),
+            shell: Some(self),
         }
     }
+}
+
+impl ShellCap for JimuHarness {
+    fn run_shell(
+        &self,
+        command: String,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> BoxFuture<'_, Result<ShellCommandResult, String>> {
+        let session = self.session();
+        let cwd = self
+            .shell_cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        Box::pin(async move {
+            let (tx, rx) = futures_channel::oneshot::channel();
+            let cmd_clone = command.clone();
+            std::thread::Builder::new()
+                .name("jimu-tui-bash".into())
+                .spawn(move || {
+                    let res = execute_local_shell(&cmd_clone, cwd.as_deref(), &cancel);
+                    let _ = tx.send(res);
+                })
+                .map_err(|err| format!("Failed to spawn shell worker: {err}"))?;
+            let result = rx
+                .await
+                .map_err(|_| "Shell worker terminated unexpectedly".to_owned())??;
+            let status_line = if result.interrupted {
+                "interrupted".to_owned()
+            } else if let Some(code) = result.exit_code {
+                format!("exit {code}")
+            } else {
+                "terminated".to_owned()
+            };
+            let context_body = if result.output.trim().is_empty() {
+                format!(
+                    "User ran local shell command (`{status_line}`):\n```sh\n{}\n```\n(no output)",
+                    result.command
+                )
+            } else {
+                format!(
+                    "User ran local shell command (`{status_line}`):\n```sh\n{}\n```\nOutput:\n```\n{}\n```",
+                    result.command, result.output
+                )
+            };
+            session.append_context(context_body);
+            Ok(result)
+        })
+    }
+}
+
+fn execute_local_shell(
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ShellCommandResult, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
+        c
+    };
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("Failed to run command: {err}"))?;
+    let child_pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let done_readers = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let spawn_reader = |pipe: Option<Box<dyn Read + Send>>| {
+        let done = Arc::clone(&done_readers);
+        std::thread::spawn(move || -> Vec<u8> {
+            let mut out = Vec::new();
+            let Some(mut reader) = pipe else {
+                done.fetch_add(1, Ordering::Release);
+                return out;
+            };
+            let mut buf = [0u8; 4096];
+            let mut truncated = false;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if out.len() < MAX_CAPTURE_BYTES {
+                            let take = n.min(MAX_CAPTURE_BYTES - out.len());
+                            out.extend_from_slice(&buf[..take]);
+                            if take < n {
+                                truncated = true;
+                            }
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            if truncated {
+                out.extend_from_slice(b"\n...[output truncated]");
+            }
+            done.fetch_add(1, Ordering::Release);
+            out
+        })
+    };
+
+    let stdout_handle = spawn_reader(stdout.map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let stderr_handle = spawn_reader(stderr.map(|s| Box::new(s) as Box<dyn Read + Send>));
+
+    let mut interrupted = false;
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            interrupted = true;
+            kill_process_group(child_pid, &mut child);
+            break child.wait().ok();
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => break child.wait().ok(),
+        }
+    };
+
+    // A backgrounded grandchild (e.g. `sleep 600 &`) may still hold stdout/stderr pipes after the
+    // shell exits; keep honoring cancellation while waiting for pipes to reach EOF.
+    while done_readers.load(Ordering::Acquire) < 2 {
+        if cancel.load(Ordering::Relaxed) {
+            interrupted = true;
+            kill_process_group(child_pid, &mut child);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+
+    let mut combined = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    if !stderr_text.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr_text);
+    }
+
+    Ok(ShellCommandResult {
+        command: command.to_owned(),
+        output: combined.trim_end_matches('\n').to_owned(),
+        exit_code: status.and_then(|s| s.code()),
+        interrupted,
+    })
+}
+
+fn kill_process_group(pid: u32, child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if pid > 0 && pid <= i32::MAX as u32 {
+            // SAFETY: Negative PID targets the dedicated process group created via `process_group(0)`.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 impl ContextMeterCap for JimuHarness {
@@ -539,6 +730,16 @@ impl QueueCap for JimuHarness {
             self.emit_queue_snapshot();
         }
         removed
+    }
+
+    fn take_queued(&self, id: &str) -> Option<UserInput> {
+        let item = self.session().take_queued_input(id)?;
+        self.emit_queue_snapshot();
+        if item.content.is_empty() {
+            Some(UserInput::text(item.text))
+        } else {
+            Some(parts_to_user_input(&item.content))
+        }
     }
 }
 

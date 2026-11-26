@@ -31,6 +31,67 @@ pub(crate) fn user_input_to_parts(input: UserInput) -> Vec<ContentPart> {
     parts
 }
 
+pub(crate) fn parts_to_user_input(parts: &[ContentPart]) -> UserInput {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text(t) => {
+                if !text.is_empty() && !t.text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&t.text);
+            }
+            ContentPart::Image(img) => {
+                if let Some(data) = decode_base64(&img.data) {
+                    images.push(crate::harness::InputImage {
+                        mime_type: img.mime_type.clone(),
+                        data,
+                        label: None,
+                    });
+                }
+            }
+        }
+    }
+    UserInput { text, images }
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let (chunks, _) = bytes.as_chunks::<4>();
+    for chunk in chunks {
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = val(chunk[2])?;
+            out.push((b << 4) | (c >> 2));
+            if chunk[3] != b'=' {
+                let d = val(chunk[3])?;
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Some(out)
+}
+
 pub(crate) fn parts_to_text(parts: &[ContentPart]) -> String {
     parts
         .iter()

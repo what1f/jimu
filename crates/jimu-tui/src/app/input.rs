@@ -42,6 +42,11 @@ impl TuiApp {
                     self.composer.handle_mouse(mouse);
                 }
             }
+            Event::FocusGained => {
+                if self.modals.is_empty() && self.search.is_none() {
+                    self.focus_prompt();
+                }
+            }
             Event::FocusLost | Event::Resize(_, _) => {
                 self.mouse.reset();
                 self.history.state.clear_text_selection();
@@ -80,10 +85,11 @@ impl TuiApp {
             Event::Paste(text) => {
                 self.last_ctrl_c = None;
                 self.last_esc = None;
+                self.reset_history_nav();
                 self.focus_prompt();
                 self.composer.completion_dropdown_close();
                 #[cfg(feature = "clipboard-image")]
-                {
+                if !self.bash_mode {
                     let remaining = crate::ui::views::prompt_widget::PromptWidget::IMAGE_CAP
                         .saturating_sub(self.composer.reconciled_images().len());
                     if let Some(batch) = super::image_paste::try_load_pasted_image_paths(
@@ -105,6 +111,11 @@ impl TuiApp {
     }
 
     pub(super) fn refresh_completion(&mut self) {
+        if self.bash_mode {
+            self.composer.completion_dropdown_close();
+            self.composer.set_slash_chrome(SlashChrome::default());
+            return;
+        }
         #[cfg(feature = "history-search")]
         if self.composer.history_search.is_active() {
             return;
@@ -363,15 +374,21 @@ impl TuiApp {
 
     fn handle_ctrl_c(&mut self) {
         self.last_esc = None;
-        if self.running {
+        if self.is_busy() {
             self.last_ctrl_c = None;
             self.abort();
             return;
         }
         if !self.composer.is_effectively_empty() {
             self.last_ctrl_c = None;
-            self.composer.set_text_discarding_images("");
+            self.reset_history_nav();
+            self.composer.clear_undoable();
             self.refresh_completion();
+            return;
+        }
+        if self.bash_mode {
+            self.last_ctrl_c = None;
+            self.set_bash_mode(false);
             return;
         }
         let now = Instant::now();
@@ -389,9 +406,14 @@ impl TuiApp {
 
     fn handle_prompt_esc(&mut self) {
         self.last_ctrl_c = None;
-        if self.running {
+        if self.is_busy() {
             self.last_esc = None;
             self.abort();
+            return;
+        }
+        if self.bash_mode && self.composer.is_effectively_empty() {
+            self.last_esc = None;
+            self.set_bash_mode(false);
             return;
         }
         if !self.composer.is_effectively_empty() {
@@ -414,9 +436,119 @@ impl TuiApp {
         }
     }
 
+    fn set_bash_mode(&mut self, enabled: bool) {
+        if self.bash_mode == enabled {
+            return;
+        }
+        self.bash_mode = enabled;
+        self.composer.completion_dropdown_close();
+        if enabled {
+            self.composer
+                .set_placeholder(self.config.labels.get("Run shell command...").to_owned());
+        } else {
+            self.composer
+                .set_placeholder(self.config.text.input_placeholder.clone());
+        }
+    }
+
+    fn handle_stash_chord(&mut self) {
+        if !self.composer.is_effectively_empty() {
+            self.reset_history_nav();
+            let stash = self.composer.stash();
+            self.prompt_stash = Some(stash);
+            self.composer.set_text_discarding_images("");
+            self.composer.clear_history();
+            self.stash_undo_armed = true;
+            self.refresh_completion();
+            self.show_toast("Draft stashed");
+        } else if let Some(stash) = self.prompt_stash.take() {
+            self.reset_history_nav();
+            self.composer.restore(stash);
+            self.refresh_completion();
+        }
+    }
+
+    fn apply_history_entry(&mut self, entry: &str, cursor_at_first_line_end: bool) {
+        self.composer.completion_dropdown_close();
+        let (bash, body) = if let Some(cmd) = entry.strip_prefix('!')
+            && self.harness.capabilities().shell.is_some()
+        {
+            (true, cmd)
+        } else {
+            (false, entry)
+        };
+        self.set_bash_mode(bash);
+        self.composer.set_text_discarding_images(body);
+        if cursor_at_first_line_end {
+            self.composer.set_cursor_first_line_end();
+        } else {
+            self.composer.set_cursor(body.len());
+        }
+        self.refresh_slash_highlight();
+    }
+
+    fn step_history_older(&mut self) -> bool {
+        if self.prompts.is_empty() {
+            return false;
+        }
+        let next_idx = match self.history_nav_index {
+            None => {
+                self.history_nav_draft = Some(self.composer.stash());
+                self.history_nav_bash_mode = self.bash_mode;
+                0
+            }
+            Some(i) if i + 1 < self.prompts.len() => i + 1,
+            Some(_) => return true,
+        };
+        self.history_nav_index = Some(next_idx);
+        let entry = self.prompts[next_idx].clone();
+        self.apply_history_entry(&entry, true);
+        true
+    }
+
+    fn step_history_newer(&mut self) -> bool {
+        let Some(cur) = self.history_nav_index else {
+            return false;
+        };
+        if cur > 0 {
+            let next_idx = cur - 1;
+            self.history_nav_index = Some(next_idx);
+            let entry = self.prompts[next_idx].clone();
+            self.apply_history_entry(&entry, false);
+        } else {
+            self.history_nav_index = None;
+            let prev_bash = std::mem::take(&mut self.history_nav_bash_mode);
+            self.set_bash_mode(prev_bash);
+            if let Some(draft) = self.history_nav_draft.take() {
+                self.composer.restore(draft);
+            } else {
+                self.composer.set_text_discarding_images("");
+            }
+            self.refresh_slash_highlight();
+        }
+        true
+    }
+
+    fn drain_pending_viewer_request(&mut self) {
+        if let Some(req) = self.composer.pending_viewer_request.take() {
+            self.open_file_preview(&req.path, req.initial_range);
+        }
+    }
+
+    fn restore_stashed_draft_after_send(&mut self) {
+        if self.composer.is_effectively_empty()
+            && let Some(stash) = self.prompt_stash.take()
+        {
+            self.composer.restore(stash);
+            self.refresh_completion();
+        }
+    }
+
     fn key(&mut self, key: KeyEvent) {
+        let stash_undo_armed = std::mem::take(&mut self.stash_undo_armed);
         let ctrl = key.modifiers.contains(M::CONTROL);
         let alt = key.modifiers.contains(M::ALT);
+        let shift = key.modifiers.contains(M::SHIFT);
         let is_ctrl_c = ctrl && key.code == K::Char('c');
         let is_bare_esc = key.code == K::Esc && key.modifiers.is_empty();
         if !is_ctrl_c {
@@ -508,7 +640,11 @@ impl TuiApp {
                     return;
                 }
                 (Focus::Prompt, K::Up | K::Down)
-                    if key.modifiers.is_empty() && self.composer.is_effectively_empty() =>
+                    if key.modifiers.is_empty()
+                        && self.composer.is_effectively_empty()
+                        && self.history_nav_index.is_none()
+                        && (key.code == K::Down
+                            || (self.prompts.is_empty() && self.queue.is_empty())) =>
                 {
                     self.focus = Focus::Welcome(if key.code == K::Down {
                         0
@@ -526,8 +662,13 @@ impl TuiApp {
         }
         if self.focus == Focus::Queue {
             match key.code {
-                K::Esc | K::Tab => self.focus_prompt(),
-                K::Delete | K::Backspace | K::Char('x' | 'e') | K::Enter => {
+                K::Esc | K::Tab => {
+                    self.focus_prompt();
+                    return;
+                }
+                K::Delete | K::Backspace | K::Char('x' | 'e') | K::Enter
+                    if key.modifiers.is_empty() =>
+                {
                     match self
                         .queue_pane
                         .handle_key(&key, KeyShortcut::ctrl(K::Enter))
@@ -538,12 +679,13 @@ impl TuiApp {
                         Some(QueueEvent::EditSelected { id }) => self.remove_queued_row(id, true),
                         _ => {}
                     }
+                    return;
                 }
+                _ if self.queue_pane.handle_navigation_key(&key) => return,
                 _ => {
-                    self.queue_pane.handle_navigation_key(&key);
+                    self.focus_prompt();
                 }
             }
-            return;
         }
         if self.mode == ScreenMode::Fullscreen {
             if !self.composer.completion_dropdown_open()
@@ -564,15 +706,25 @@ impl TuiApp {
         }
         if self.focus == Focus::Transcript {
             match key.code {
-                K::Char('j') | K::Down => self.move_block(true),
-                K::Char('k') | K::Up => self.move_block(false),
-                K::Char(' ') => {
+                K::Char('j') | K::Down if key.modifiers.is_empty() => {
+                    self.move_block(true);
+                    return;
+                }
+                K::Char('k') | K::Up if key.modifiers.is_empty() => {
+                    self.move_block(false);
+                    return;
+                }
+                K::Char(' ') if key.modifiers.is_empty() => {
                     if !self.history.state.toggle_group_expansion() {
                         self.history.state.toggle_fold_selected();
                     }
+                    return;
                 }
-                K::Enter => self.open_selected(),
-                K::Char('y') => {
+                K::Enter if key.modifiers.is_empty() => {
+                    self.open_selected();
+                    return;
+                }
+                K::Char('y') if key.modifiers.is_empty() => {
                     let state = &self.history.state;
                     let text = state.selected_text().or_else(|| {
                         state
@@ -582,19 +734,163 @@ impl TuiApp {
                     if let Some(text) = text {
                         self.copy(&text);
                     }
+                    return;
                 }
                 K::Esc | K::Tab => {
                     self.history.state.clear_text_selection();
                     self.focus_prompt();
+                    return;
                 }
-                K::Char('?') => self.shortcuts(),
-                _ => {}
+                K::Char('?') if key.modifiers.is_empty() => {
+                    self.shortcuts();
+                    return;
+                }
+                _ => {
+                    self.history.state.clear_text_selection();
+                    self.focus_prompt();
+                }
             }
-            return;
         }
         self.focus = Focus::Prompt;
         if self.composer.completion_dropdown_open() && key.code == K::Esc {
             self.composer.completion_dropdown_close();
+            return;
+        }
+        if self.composer.completion_dropdown_open()
+            && key.code == K::Enter
+            && key.modifiers.is_empty()
+        {
+            let text = self.composer.text();
+            let direct_slash = !self.bash_mode
+                && text.starts_with('/')
+                && !text.contains(char::is_whitespace)
+                && self
+                    .composer
+                    .selected_completion_display()
+                    .is_some_and(|display| self.is_direct_execute_slash(display));
+            self.composer.accept_completion();
+            self.reset_history_nav();
+            self.refresh_completion();
+            if direct_slash {
+                self.send_prompt(false);
+            }
+            return;
+        }
+        if ctrl && !alt && !shift {
+            match key.code {
+                K::Char('g') => {
+                    self.request_external_editor();
+                    return;
+                }
+                K::Char('s') => {
+                    self.handle_stash_chord();
+                    return;
+                }
+                K::Char('m') if crate::engine::terminal::kitty_flags_pushed() => {
+                    self.multiline_mode = !self.multiline_mode;
+                    self.show_toast(if self.multiline_mode {
+                        "Multiline mode on"
+                    } else {
+                        "Multiline mode off"
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if alt && !ctrl && !shift {
+            match key.code {
+                K::Char('s') | K::Char('S') => {
+                    self.handle_stash_chord();
+                    return;
+                }
+                K::Char('m') | K::Char('M') => {
+                    self.multiline_mode = !self.multiline_mode;
+                    self.show_toast(if self.multiline_mode {
+                        "Multiline mode on"
+                    } else {
+                        "Multiline mode off"
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if stash_undo_armed
+            && self.composer.is_effectively_empty()
+            && crate::engine::textarea::is_undo_input(&key)
+            && let Some(stash) = self.prompt_stash.take()
+        {
+            self.composer.restore(stash);
+            self.refresh_completion();
+            return;
+        }
+        // Quick local shell mode: `!` on empty prompt enters bash mode; Backspace on empty exits.
+        if !self.bash_mode
+            && !self.composer.completion_dropdown_open()
+            && self.composer.is_effectively_empty()
+            && key.code == K::Char('!')
+            && (key.modifiers.is_empty() || key.modifiers == M::SHIFT)
+            && self.harness.capabilities().shell.is_some()
+        {
+            self.reset_history_nav();
+            self.set_bash_mode(true);
+            return;
+        }
+        if self.bash_mode
+            && self.composer.is_effectively_empty()
+            && key.code == K::Backspace
+            && key.modifiers.is_empty()
+        {
+            self.set_bash_mode(false);
+            return;
+        }
+        // In-place Up/Down history recall and queue focus when no dropdown is open.
+        if !self.composer.completion_dropdown_open() && key.modifiers.is_empty() {
+            if key.code == K::Up {
+                if !self.queue.is_empty()
+                    && self.composer.is_effectively_empty()
+                    && self.history_nav_index.is_none()
+                    && !self.bash_mode
+                {
+                    self.focus = Focus::Queue;
+                    return;
+                }
+                if !self.prompts.is_empty() && self.composer.cursor_on_first_visual_line() {
+                    self.step_history_older();
+                    return;
+                }
+            } else if key.code == K::Down
+                && self.history_nav_index.is_some()
+                && self.composer.cursor_on_last_visual_line()
+            {
+                self.step_history_newer();
+                return;
+            }
+        }
+        // Element interaction on paste / file-ref / image chips before Enter routing.
+        if !self.composer.completion_dropdown_open()
+            && let Some(interaction) = self.composer.try_element_interaction(&key)
+        {
+            match interaction {
+                crate::ui::views::prompt_widget::ElementInteraction::Inlined => {
+                    self.reset_history_nav();
+                    self.refresh_completion();
+                }
+                crate::ui::views::prompt_widget::ElementInteraction::ImagePreview => {
+                    if let Some(img) = self.composer.image_at_cursor() {
+                        let label = img
+                            .source_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| img.mime_type.clone());
+                        self.show_toast(&format!(
+                            "[Image #{}] {} ({} bytes)",
+                            img.display_number, label, img.byte_len
+                        ));
+                    }
+                }
+            }
             return;
         }
         match key.code {
@@ -603,24 +899,77 @@ impl TuiApp {
             K::Char('?') if !ctrl && !alt && self.composer.is_effectively_empty() => {
                 self.shortcuts()
             }
-            K::Enter if ctrl || alt => self.send_prompt(true),
-            _ if self.try_clipboard_image_paste_key(&key) => {}
+            K::Enter if ctrl && !alt && !shift => {
+                if self.bash_mode {
+                    self.send_prompt(false);
+                } else if self.composer.is_effectively_empty() && !self.queue.is_empty() {
+                    self.send_top_queued_now();
+                } else {
+                    self.send_prompt(true);
+                }
+            }
+            _ if self.try_clipboard_image_paste_key(&key) => {
+                self.reset_history_nav();
+            }
+            _ if self.multiline_mode
+                && !self.bash_mode
+                && !self.composer.completion_dropdown_open()
+                && crate::engine::input::is_mod_enter(&key) =>
+            {
+                self.send_prompt(false);
+            }
+            _ if self.multiline_mode
+                && !self.bash_mode
+                && !self.composer.completion_dropdown_open()
+                && key.code == K::Enter
+                && key.modifiers.is_empty() =>
+            {
+                let trimmed = self.composer.text().trim();
+                if trimmed.is_empty() && !self.queue.is_empty() {
+                    self.send_top_queued_now();
+                } else if let Some(cmd) = trimmed.strip_prefix('/')
+                    && !cmd.contains('\n')
+                    && self.is_known_slash_name(cmd.split_whitespace().next().unwrap_or(""))
+                {
+                    self.send_prompt(false);
+                } else {
+                    self.composer.insert_replacing_selection("\n");
+                    self.reset_history_nav();
+                    self.refresh_completion();
+                }
+            }
             _ => match self.composer.route_enter(&key) {
-                EnterOutcome::Submit => self.send_prompt(false),
-                EnterOutcome::NewlineInserted => self.refresh_completion(),
+                EnterOutcome::Submit => {
+                    if !self.bash_mode
+                        && self.composer.is_effectively_empty()
+                        && !self.queue.is_empty()
+                    {
+                        self.send_top_queued_now();
+                    } else {
+                        self.send_prompt(false);
+                    }
+                }
+                EnterOutcome::NewlineInserted => {
+                    self.reset_history_nav();
+                    self.refresh_completion();
+                }
                 EnterOutcome::PassThrough => {
                     let before = (self.composer.text().to_owned(), self.composer.cursor());
                     match self.composer.handle_key(&key) {
                         #[cfg(feature = "history-search")]
                         crate::ui::views::prompt_widget::PromptEvent::SearchHistory => {
-                            self.composer.open_history(&self.prompts, false);
+                            let entries = self.history_search_entries();
+                            self.composer.open_history(&entries, false);
                         }
-                        _ if before.0 != self.composer.text()
-                            || before.1 != self.composer.cursor() =>
-                        {
-                            self.refresh_completion()
+                        _ => {
+                            self.drain_pending_viewer_request();
+                            if before.0 != self.composer.text() {
+                                self.reset_history_nav();
+                                self.refresh_completion();
+                            } else if before.1 != self.composer.cursor() {
+                                self.refresh_completion();
+                            }
                         }
-                        _ => {}
                     }
                 }
             },
@@ -689,6 +1038,21 @@ impl TuiApp {
 
     fn send_prompt(&mut self, follow: bool) {
         if let Some(raw_text) = self.composer.try_send() {
+            self.reset_history_nav();
+            if self.bash_mode {
+                if self.bash_cancel.is_some() {
+                    self.show_toast("A shell command is already running");
+                    return;
+                }
+                let cmd = raw_text.trim().to_owned();
+                self.composer.set_text_discarding_images("");
+                self.composer.clear_history();
+                self.set_bash_mode(false);
+                self.refresh_completion();
+                self.run_bash_command(cmd);
+                self.restore_stashed_draft_after_send();
+                return;
+            }
             let mut clean_text = self.composer.submitted_text_without_image_chips(&raw_text);
             let images: Vec<crate::harness::InputImage> = self
                 .composer
@@ -708,6 +1072,23 @@ impl TuiApp {
                     })
                 })
                 .collect();
+            if images.is_empty()
+                && let Some(cmd) = clean_text.trim().strip_prefix('!')
+                && !cmd.trim().is_empty()
+                && self.harness.capabilities().shell.is_some()
+            {
+                if self.bash_cancel.is_some() {
+                    self.show_toast("A shell command is already running");
+                    return;
+                }
+                let cmd = cmd.trim().to_owned();
+                self.composer.set_text_discarding_images("");
+                self.composer.clear_history();
+                self.refresh_completion();
+                self.run_bash_command(cmd);
+                self.restore_stashed_draft_after_send();
+                return;
+            }
             let display_override = if !images.is_empty() {
                 clean_text = clean_text.trim().to_owned();
                 let raw_trimmed = raw_text.trim();
@@ -725,6 +1106,7 @@ impl TuiApp {
             self.composer.set_text_discarding_images("");
             self.composer.clear_history();
             self.refresh_completion();
+            let is_slash = images.is_empty() && clean_text.trim_end().starts_with('/');
             self.submit_with_display(
                 UserInput {
                     text: clean_text,
@@ -733,6 +1115,9 @@ impl TuiApp {
                 display_override,
                 follow,
             );
+            if !is_slash {
+                self.restore_stashed_draft_after_send();
+            }
         }
     }
 

@@ -911,8 +911,8 @@ impl Agent {
         out
     }
 
-    /// Remove a pending steering or follow-up item by id. Returns `true` if found and removed.
-    pub fn remove_queued_input(&self, id: &str) -> bool {
+    /// Remove and return a pending steering or follow-up item by id.
+    pub fn take_queued_input(&self, id: &str) -> Option<QueuedInput> {
         {
             let mut steering = self
                 .queues
@@ -920,8 +920,7 @@ impl Agent {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(pos) = steering.items.iter().position(|item| item.id == id) {
-                steering.items.remove(pos);
-                return true;
+                return steering.items.remove(pos);
             }
         }
         {
@@ -931,11 +930,15 @@ impl Agent {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(pos) = follow_up.items.iter().position(|item| item.id == id) {
-                follow_up.items.remove(pos);
-                return true;
+                return follow_up.items.remove(pos);
             }
         }
-        false
+        None
+    }
+
+    /// Remove a pending steering or follow-up item by id. Returns `true` if found and removed.
+    pub fn remove_queued_input(&self, id: &str) -> bool {
+        self.take_queued_input(id).is_some()
     }
 
     // ---- Event Subscription ----

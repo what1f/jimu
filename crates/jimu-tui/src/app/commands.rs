@@ -52,6 +52,10 @@ impl TuiApp {
             ("skills", "Available skills", caps.skills.is_some()),
             ("mcp", "Connected servers", caps.mcp.is_some()),
             ("copy", "Copy last response", true),
+            ("edit", "Edit prompt in external editor", true),
+            ("multiline", "Toggle multiline input mode", true),
+            #[cfg(feature = "history-search")]
+            ("history", "Search prompt history", true),
             ("theme", "Color theme", true),
             ("help", "Keyboard shortcuts", true),
         ] {
@@ -96,6 +100,9 @@ impl TuiApp {
                 | "exit"
                 | "quit"
                 | "copy"
+                | "edit"
+                | "multiline"
+                | "history"
                 | "export"
                 | "model"
                 | "effort"
@@ -538,6 +545,98 @@ impl TuiApp {
         }
     }
 
+    pub(super) fn send_top_queued_now(&mut self) -> bool {
+        let Some(first) = self.queue.first().cloned() else {
+            return false;
+        };
+        let Some(cap) = self.harness.capabilities().queue else {
+            return false;
+        };
+        let Some(input) = cap.take_queued(&first.id) else {
+            return false;
+        };
+        let queue = cap.pending_inputs();
+        self.set_queue(queue);
+        self.submit(input, false);
+        true
+    }
+
+    pub(super) fn open_file_preview(
+        &mut self,
+        path: &Path,
+        initial_range: Option<std::ops::Range<usize>>,
+    ) {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(dir) = &self.config.directory {
+            dir.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        let Ok(content) = std::fs::read_to_string(&resolved) else {
+            self.show_toast(&format!("Could not read {}", path.display()));
+            return;
+        };
+        let all_lines: Vec<&str> = content.lines().collect();
+        let (start_line, end_line) = match initial_range {
+            Some(range) => {
+                let s = range.start.saturating_sub(1).min(all_lines.len());
+                let e = range.end.min(all_lines.len()).max(s);
+                (s, e)
+            }
+            None => (0, all_lines.len().min(400)),
+        };
+        let mut rows: Vec<String> = all_lines[start_line..end_line]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>4}  {line}", start_line + i + 1))
+            .collect();
+        if end_line < all_lines.len() {
+            rows.push(format!("... ({} more lines)", all_lines.len() - end_line));
+        }
+        if rows.is_empty() {
+            rows.push("(empty file)".to_owned());
+        }
+        self.show_lines(&path.display().to_string(), rows);
+    }
+
+    pub(super) fn is_direct_execute_slash(&self, display_token: &str) -> bool {
+        let Some(name) = display_token.strip_prefix('/') else {
+            return false;
+        };
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return false;
+        }
+        // Only built-in or registered slash commands execute immediately on Enter;
+        // skills stay editable so users can append arguments after the `/skill` mention.
+        matches!(
+            name,
+            "help"
+                | "hotkeys"
+                | "theme"
+                | "new"
+                | "clear"
+                | "exit"
+                | "quit"
+                | "copy"
+                | "edit"
+                | "multiline"
+                | "history"
+                | "export"
+                | "model"
+                | "effort"
+                | "thinking"
+                | "permissions"
+                | "resume"
+                | "rewind"
+                | "tree"
+                | "skills"
+                | "mcp"
+                | "compact"
+                | "context"
+        ) || self.config.slash_commands.iter().any(|c| c.name() == name)
+    }
+
     pub(super) fn command(&mut self, cmd: &str) {
         let _ = self.dispatch_slash(cmd);
     }
@@ -572,6 +671,24 @@ impl TuiApp {
             "new" | "clear" => self.new_session_command(),
             "exit" | "quit" => self.quit = true,
             "copy" => self.copy_last_response(),
+            "edit" => self.request_external_editor(),
+            "multiline" => {
+                self.multiline_mode = !self.multiline_mode;
+                self.show_toast(if self.multiline_mode {
+                    "Multiline mode on"
+                } else {
+                    "Multiline mode off"
+                });
+            }
+            #[cfg(feature = "history-search")]
+            "history" => {
+                let entries = self.history_search_entries();
+                if entries.is_empty() {
+                    self.show_toast("No prompt history yet");
+                } else {
+                    self.composer.open_history(&entries, false);
+                }
+            }
             "export" => self.export_markdown(args.trim()),
             "model" if let Some(c) = caps.model_picker => {
                 let target = args.trim();
