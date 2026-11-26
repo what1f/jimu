@@ -55,6 +55,8 @@ impl ToolBlockData {
             return ToolCallBlock::Other(other);
         }
 
+        block.set_tool_name(name);
+
         if let Some(output) = output {
             let error = output.is_error.then(|| output.text.clone());
             match &mut block {

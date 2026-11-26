@@ -17,14 +17,20 @@ fn is_valid_permission_mode(raw: &str) -> bool {
 }
 
 fn is_valid_theme(raw: &str) -> bool {
-    #[cfg(feature = "tui")]
-    {
-        jimu_tui::engine::theme::ThemeKind::from_name(raw).is_some()
-    }
-    #[cfg(not(feature = "tui"))]
-    {
-        !raw.trim().is_empty()
-    }
+    !raw.trim().is_empty()
+}
+
+/// Configuration for an external shell command rendering the TUI bottom status line.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StatusLineConfig {
+    /// Shell command executed via `sh -c <command>` (receiving JSON state on stdin).
+    pub command: String,
+    /// Optional periodic refresh interval in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_ms: Option<u64>,
+    /// Optional per-run execution timeout in milliseconds (defaults to 1500ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 fn acquire_settings_lock(jimu_home: &Path) -> std::io::Result<fs::File> {
@@ -59,6 +65,15 @@ pub struct UserSettings {
     /// Default fast-mode toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
+    /// Optional external shell command rendering the TUI bottom status line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<StatusLineConfig>,
+    /// Show the built-in 1-row top header bar in fullscreen TUI mode (defaults to false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_header: Option<bool>,
+    /// Additional QuickJS extension files or directories loaded across all modes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<PathBuf>,
     /// Global MCP servers attached across TUI, `-p`, RPC, and ACP modes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
@@ -116,6 +131,36 @@ impl UserSettings {
             match serde_json::from_value(v.clone()) {
                 Ok(parsed) => settings.fast = parsed,
                 Err(err) => warnings.push(format!("settings.json `fast` ignored: {err}")),
+            }
+        }
+        if let Some(v) = obj.get("status_line") {
+            match serde_json::from_value::<Option<StatusLineConfig>>(v.clone()) {
+                Ok(Some(cfg)) if !cfg.command.trim().is_empty() => {
+                    settings.status_line = Some(cfg);
+                }
+                Ok(Some(_)) => warnings.push(
+                    "settings.json `status_line` ignored: `command` must be a non-empty string"
+                        .into(),
+                ),
+                Ok(None) => settings.status_line = None,
+                Err(err) => warnings.push(format!("settings.json `status_line` ignored: {err}")),
+            }
+        }
+        if let Some(v) = obj.get("show_header") {
+            match serde_json::from_value(v.clone()) {
+                Ok(parsed) => settings.show_header = parsed,
+                Err(err) => warnings.push(format!("settings.json `show_header` ignored: {err}")),
+            }
+        }
+        if let Some(v) = obj.get("extensions") {
+            match serde_json::from_value::<Vec<PathBuf>>(v.clone()) {
+                Ok(parsed) => {
+                    settings.extensions = parsed
+                        .into_iter()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .collect();
+                }
+                Err(err) => warnings.push(format!("settings.json `extensions` ignored: {err}")),
             }
         }
         if let Some(raw_servers) = obj.get("mcp_servers") {
@@ -227,6 +272,27 @@ impl UserSettings {
         )?;
         patch_optional_field(&mut root_obj, "theme", &before.theme, &after.theme)?;
         patch_optional_field(&mut root_obj, "fast", &before.fast, &after.fast)?;
+        patch_optional_field(
+            &mut root_obj,
+            "status_line",
+            &before.status_line,
+            &after.status_line,
+        )?;
+        patch_optional_field(
+            &mut root_obj,
+            "show_header",
+            &before.show_header,
+            &after.show_header,
+        )?;
+        if before.extensions != after.extensions {
+            if after.extensions.is_empty() {
+                root_obj.remove("extensions");
+            } else {
+                let encoded = serde_json::to_value(&after.extensions)
+                    .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
+                root_obj.insert("extensions".into(), encoded);
+            }
+        }
         if before.mcp_servers != after.mcp_servers {
             if after.mcp_servers.is_empty() {
                 root_obj.remove("mcp_servers");
@@ -261,4 +327,87 @@ fn patch_optional_field<T: PartialEq + Serialize>(
         }
     }
     Ok(())
+}
+
+/// Discover custom JSON themes from `~/.jimu/themes/*.json` (user-level) and
+/// `<cwd>/.jimu/themes/*.json` (project-level). Project themes override user themes of the same
+/// name. Malformed JSON files produce warnings and are skipped without blocking startup.
+#[cfg(feature = "tui")]
+pub fn discover_custom_themes(
+    jimu_home: &Path,
+    cwd: &Path,
+) -> (
+    BTreeMap<String, jimu_tui::engine::theme::ThemeOverrides>,
+    Vec<String>,
+) {
+    let mut themes: BTreeMap<String, jimu_tui::engine::theme::ThemeOverrides> = BTreeMap::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let user_dir = jimu_home.join("themes");
+    let project_dir = cwd.join(".jimu").join("themes");
+
+    let mut dirs = vec![user_dir.clone()];
+    if !crate::host::paths_same_dir(&user_dir, &project_dir) {
+        dirs.push(project_dir);
+    }
+
+    for dir in dirs {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = read_dir
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            })
+            .collect();
+        files.sort();
+
+        for path in files {
+            let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(err) => {
+                    warnings.push(format!("failed to read theme {}: {err}", path.display()));
+                    continue;
+                }
+            };
+            match serde_json::from_str::<jimu_tui::engine::theme::ThemeOverrides>(&raw) {
+                Ok(overrides) => {
+                    // Replace any existing case-insensitive match so project overrides user cleanly.
+                    let lower = stem.to_ascii_lowercase();
+                    let prev_key = themes
+                        .keys()
+                        .find(|k| k.to_ascii_lowercase() == lower)
+                        .cloned();
+                    if let Some(prev) = prev_key
+                        && prev != stem
+                    {
+                        themes.remove(&prev);
+                    }
+                    themes.insert(stem.to_owned(), overrides);
+                }
+                Err(err) => {
+                    warnings.push(format!(
+                        "theme {} skipped (invalid JSON): {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    (themes, warnings)
 }

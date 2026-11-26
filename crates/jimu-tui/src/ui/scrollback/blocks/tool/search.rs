@@ -78,6 +78,8 @@ pub struct SearchToolCallBlock {
     pub elapsed_ms: Option<i64>,
     /// Whether this ordinary search targets a memory v2 scope.
     pub is_memory_activity: bool,
+    /// Actual tool name preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 impl SearchToolCallBlock {
@@ -94,6 +96,7 @@ impl SearchToolCallBlock {
             started_at: None,
             elapsed_ms: None,
             is_memory_activity: false,
+            tool_name: None,
         }
     }
 

@@ -4,42 +4,53 @@
 use crate::{
     host::{
         BuiltWorkspaceTools, HostConfig, LoadedExtensions, SessionFileLock,
-        apply_session_model_on_open, attach_extensions_to_config, build_auth_provider,
-        build_http_transport, build_instruction_discovery, build_skill_discovery,
-        build_workspace_tools, canonical_jsonl_path, load_js_extensions, make_background_callback,
-        paths_same_dir, resolve_existing_session_cwd, resolve_system_prompt,
-        should_enable_deferred_gateway,
+        apply_session_model_on_open, build_auth_provider, build_http_transport,
+        build_instruction_discovery, build_skill_discovery, build_workspace_tools,
+        canonical_jsonl_path, discover_extension_paths, load_js_extensions,
+        make_background_callback, paths_same_dir, reserved_extension_tool_names,
+        resolve_existing_session_cwd, resolve_system_prompt, should_enable_deferred_gateway,
+        validate_extension_tools,
     },
     mcp::McpHub,
     providers::{ProviderStore, model_key},
-    settings::UserSettings,
+    settings::{UserSettings, discover_custom_themes},
+    status_line::{StatusLineRunner, StatusLineSnapshot},
+    ui_mod::UiModBridge,
 };
 use jimu_agent::{
-    AgentMessage, AgentMiddleware, BeforeToolCallCtx, BeforeToolCallResult, QueueMode,
+    AfterToolCallCtx, AfterToolCallResult, AgentContextSnapshot, AgentMessage, AgentMiddleware,
+    BeforeToolCallCtx, BeforeToolCallResult, FinishTurnCtx, QueueMode, RequestOverride,
+    TurnDecision,
 };
 use jimu_ai::{BoxFuture, CancelToken, ContentPart, HttpTransport, Message, Model, StreamProvider};
+use jimu_js::UiComponent;
 #[cfg(not(target_os = "ios"))]
 use jimu_kit::SkillWatcher;
-use jimu_kit::{BackgroundEventSender, KitSession, KitSessionConfig, KitToolSpec};
+use jimu_kit::{
+    BackgroundEventSender, CALL_TOOL_NAME, CODEMODE_EXEC_TOOL_NAME, KitSession, KitSessionConfig,
+    KitToolSpec,
+};
 use jimu_session::{JsonlSessionStore, SessionEntryPayload, SessionStore};
 #[cfg(not(target_os = "ios"))]
 use jimu_tools::{MonitorManager, ProcessSessionManager};
 use jimu_tui::{
     app::{ScreenMode, TuiApp, TuiAppConfig},
-    engine::theme::ThemeKind,
+    engine::theme::{Theme, ThemeKind, ThemeOverrides},
     harness::{
         BoxFuture as TuiBoxFuture, ChromeConfig, ChromeSlots, ChromeState, CompletionItem, McpCap,
         McpServerSummary, NoticeLevel, PermissionModeCap, PermissionModeOption, SessionOption,
-        SlashCommand, SlashContext,
+        SlashCommand, SlashContext, SurfaceDecoration, ToolRowView, TuiController,
+        render_default_status_line_with_spinner,
     },
     jimu::{JimuApprovalMiddleware, JimuHarness, JimuInteractionSink, JimuSessionController},
 };
+use ratatui::text::{Line, Span};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, RwLock},
-    time::UNIX_EPOCH,
+    time::{Instant, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -177,10 +188,119 @@ impl AgentMiddleware for DynamicPermissionMiddleware {
 
 struct DynamicChromeSlots {
     active_session: Arc<RwLock<Arc<KitSession>>>,
+    transcript_path: Arc<RwLock<Option<PathBuf>>>,
+    project_dir: PathBuf,
+    started_at: Instant,
+    status_line_runner: Option<Arc<StatusLineRunner>>,
+    ui_mod: Arc<UiModBridge>,
+}
+
+impl DynamicChromeSlots {
+    fn build_status_line_snapshot(&self, state: &ChromeState<'_>) -> StatusLineSnapshot {
+        let session = self
+            .active_session
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let model = session.model();
+        let transcript_path = self
+            .transcript_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (context_window_size, used_percentage) = match state.context {
+            Some(ctx) => {
+                let cap = u64::from(ctx.context_window);
+                let used = ctx.tokens.unwrap_or(ctx.estimated_tokens);
+                let pct = ctx.percent.unwrap_or_else(|| {
+                    if cap > 0 {
+                        (used as f64 / cap as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                });
+                (cap, pct)
+            }
+            None => (u64::from(model.context_window), 0.0),
+        };
+        StatusLineSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            session_id: state.session_id.unwrap_or_default().to_owned(),
+            transcript_path,
+            model_id: model.id.clone(),
+            model_display_name: state.model_name.unwrap_or(&model.name).to_owned(),
+            current_dir: state.cwd.to_string_lossy().into_owned(),
+            project_dir: self.project_dir.to_string_lossy().into_owned(),
+            git_branch: state.git_branch.unwrap_or_default().to_owned(),
+            context_window_size,
+            used_percentage,
+            input_tokens: state.usage.input_tokens,
+            output_tokens: state.usage.output_tokens,
+            cache_read_input_tokens: state.usage.cache_read_tokens,
+            cache_creation_input_tokens: state.usage.cache_write_tokens,
+            total_cost_usd: state.usage.cost_usd,
+            total_duration_ms: self.started_at.elapsed().as_millis() as u64,
+            effort: state.effort.unwrap_or_default().to_owned(),
+            fast_mode: state.fast_mode || session.fast(),
+            permission_mode: state.permission_mode.unwrap_or_default().to_owned(),
+            running: state.running,
+        }
+    }
 }
 
 impl ChromeSlots for DynamicChromeSlots {
-    fn status_flags(&self, _state: &ChromeState<'_>) -> Vec<String> {
+    fn header(&self, state: &ChromeState<'_>) -> Vec<Line<'static>> {
+        self.ui_mod
+            .render_chrome_slot(UiComponent::Header, state, &[])
+            .unwrap_or_default()
+    }
+
+    fn above_prompt(&self, state: &ChromeState<'_>) -> Vec<Line<'static>> {
+        self.ui_mod
+            .render_chrome_slot(UiComponent::AbovePrompt, state, &[])
+            .unwrap_or_default()
+    }
+
+    fn footer(&self, state: &ChromeState<'_>) -> Vec<Line<'static>> {
+        self.ui_mod
+            .render_chrome_slot(UiComponent::Footer, state, &[])
+            .unwrap_or_default()
+    }
+
+    fn status_line(&self, state: &ChromeState<'_>) -> Option<Vec<Line<'static>>> {
+        let shell_lines = if let Some(runner) = &self.status_line_runner {
+            runner.update_snapshot(self.build_status_line_snapshot(state));
+            runner.current_lines()
+        } else {
+            None
+        };
+
+        if self.ui_mod.is_active() {
+            let spinner_override = self.ui_mod.spinner_override(state);
+            let native_lines = match &shell_lines {
+                Some(lines) if !lines.is_empty() => lines.clone(),
+                _ => vec![render_default_status_line_with_spinner(
+                    state,
+                    spinner_override,
+                )],
+            };
+            if let Some(lines) =
+                self.ui_mod
+                    .render_chrome_slot(UiComponent::StatusLine, state, &native_lines)
+            {
+                return Some(lines);
+            }
+        }
+
+        shell_lines
+    }
+
+    fn status_flags(&self, state: &ChromeState<'_>) -> Vec<String> {
+        if state.fast_mode {
+            return vec!["fast".into()];
+        }
         let session = self
             .active_session
             .read()
@@ -191,6 +311,310 @@ impl ChromeSlots for DynamicChromeSlots {
         } else {
             Vec::new()
         }
+    }
+
+    fn decorate_user_message(
+        &self,
+        text: &str,
+        image_count: usize,
+        width: u16,
+        theme: &Theme,
+    ) -> Option<SurfaceDecoration> {
+        self.ui_mod
+            .user_message_decoration(text, image_count, width, theme)
+    }
+
+    fn decorate_tool_row(&self, row: &ToolRowView<'_>, theme: &Theme) -> Option<SurfaceDecoration> {
+        self.ui_mod.tool_row_decoration(row, theme)
+    }
+
+    fn spinner_override(&self, state: &ChromeState<'_>) -> Option<Span<'static>> {
+        self.ui_mod.spinner_override(state)
+    }
+}
+
+/// Delegates agent lifecycle hooks to whichever [`JsExtensionRuntime`] is currently loaded so
+/// `/reload` can activate newly added extensions or swap runtimes without restarting the session.
+struct DynamicJsMiddleware {
+    extensions: Arc<RwLock<Option<Arc<LoadedExtensions>>>>,
+}
+
+impl DynamicJsMiddleware {
+    fn current_runtime(&self) -> Option<Arc<jimu_js::JsExtensionRuntime>> {
+        self.extensions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|ext| Arc::clone(&ext.runtime))
+    }
+}
+
+impl AgentMiddleware for DynamicJsMiddleware {
+    fn prepare_request<'a>(
+        &'a self,
+        snapshot: &'a AgentContextSnapshot,
+        cancel: CancelToken,
+    ) -> BoxFuture<'a, Option<RequestOverride>> {
+        let Some(rt) = self.current_runtime() else {
+            return Box::pin(async { None });
+        };
+        Box::pin(async move { rt.prepare_request(snapshot, cancel).await })
+    }
+
+    fn transform_context<'a>(
+        &'a self,
+        messages: Vec<AgentMessage>,
+        cancel: CancelToken,
+    ) -> BoxFuture<'a, Vec<AgentMessage>> {
+        let Some(rt) = self.current_runtime() else {
+            return Box::pin(async move { messages });
+        };
+        Box::pin(async move { rt.transform_context(messages, cancel).await })
+    }
+
+    fn before_tool_call<'a>(
+        &'a self,
+        ctx: BeforeToolCallCtx<'a>,
+        cancel: CancelToken,
+    ) -> BoxFuture<'a, Option<BeforeToolCallResult>> {
+        let Some(rt) = self.current_runtime() else {
+            return Box::pin(async { None });
+        };
+        Box::pin(async move { rt.before_tool_call(ctx, cancel).await })
+    }
+
+    fn after_tool_call<'a>(
+        &'a self,
+        ctx: AfterToolCallCtx<'a>,
+        cancel: CancelToken,
+    ) -> BoxFuture<'a, Option<AfterToolCallResult>> {
+        let Some(rt) = self.current_runtime() else {
+            return Box::pin(async { None });
+        };
+        Box::pin(async move { rt.after_tool_call(ctx, cancel).await })
+    }
+
+    fn finish_turn<'a>(
+        &'a self,
+        ctx: FinishTurnCtx<'a>,
+        cancel: CancelToken,
+    ) -> BoxFuture<'a, Option<TurnDecision>> {
+        let Some(rt) = self.current_runtime() else {
+            return Box::pin(async { None });
+        };
+        Box::pin(async move { rt.finish_turn(ctx, cancel).await })
+    }
+}
+
+struct ReloadCommand {
+    active_session: Arc<RwLock<Arc<KitSession>>>,
+    extensions: Arc<RwLock<Option<Arc<LoadedExtensions>>>>,
+    loaded_extension_paths: Arc<Mutex<Vec<PathBuf>>>,
+    extension_tool_names: Arc<Mutex<Vec<String>>>,
+    ui_mod: Arc<UiModBridge>,
+    jimu_home: PathBuf,
+    cwd: PathBuf,
+    cli_extensions: Vec<PathBuf>,
+}
+
+impl SlashCommand for ReloadCommand {
+    fn name(&self) -> &str {
+        "reload"
+    }
+
+    fn description(&self) -> &str {
+        "Hot-reload JS extensions, UI mods, and custom themes"
+    }
+
+    fn run(&self, ctx: SlashContext) -> TuiBoxFuture<'_, ()> {
+        Box::pin(async move {
+            let session = self
+                .active_session
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+
+            // Rescan custom JSON themes off the UI event loop.
+            let theme_home = self.jimu_home.clone();
+            let theme_cwd = self.cwd.clone();
+            let (themes, theme_warnings) = match tokio::task::spawn_blocking(move || {
+                discover_custom_themes(&theme_home, &theme_cwd)
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(err) => {
+                    ctx.controller.push_notice(
+                        NoticeLevel::Error,
+                        format!("Failed to reload custom themes: {err}"),
+                    );
+                    return;
+                }
+            };
+            let theme_count = themes.len();
+            ctx.controller.replace_custom_themes(themes);
+            for warning in theme_warnings {
+                ctx.controller.push_notice(NoticeLevel::Warning, warning);
+            }
+
+            if session.is_running() {
+                ctx.controller.push_notice(
+                    NoticeLevel::Warning,
+                    "Cannot reload extensions while a turn is running",
+                );
+                ctx.controller.invalidate_history_layout();
+                return;
+            }
+
+            let old_names: Vec<String> = self
+                .extension_tool_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let old_name_set: HashSet<&str> = old_names.iter().map(String::as_str).collect();
+
+            let mut non_extension_names: HashSet<String> = session
+                .resident_tool_definitions()
+                .into_iter()
+                .map(|def| def.name)
+                .collect();
+            for def in session.deferred_tools() {
+                if !old_name_set.contains(def.name.as_str()) {
+                    non_extension_names.insert(def.name);
+                }
+            }
+            let forbidden = reserved_extension_tool_names(&non_extension_names);
+            let prev_paths = self
+                .loaded_extension_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let prev_runtime = self
+                .extensions
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|ext| Arc::clone(&ext.runtime));
+
+            let ext_home = self.jimu_home.clone();
+            let ext_cwd = self.cwd.clone();
+            let cli_extensions = self.cli_extensions.clone();
+            let reload_result = tokio::task::spawn_blocking(move || {
+                let saved = UserSettings::load(&ext_home);
+                let new_paths = discover_extension_paths(
+                    &ext_home,
+                    &ext_cwd,
+                    &saved.extensions,
+                    &cli_extensions,
+                );
+                if new_paths.is_empty() {
+                    return Ok::<_, String>((new_paths, None));
+                }
+                if new_paths == prev_paths
+                    && let Some(rt) = prev_runtime
+                {
+                    rt.reload_excluding(forbidden)
+                        .map_err(|err| format!("Failed to reload JS extensions: {err}"))?;
+                    let tools = rt.tools();
+                    return Ok((
+                        new_paths,
+                        Some(Arc::new(LoadedExtensions { runtime: rt, tools })),
+                    ));
+                }
+                let loaded = load_js_extensions(&new_paths, &non_extension_names)?;
+                Ok((new_paths, loaded.map(Arc::new)))
+            })
+            .await;
+
+            let (new_paths, new_loaded) = match reload_result {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(err)) => {
+                    ctx.controller.push_notice(NoticeLevel::Error, err);
+                    ctx.controller.invalidate_history_layout();
+                    return;
+                }
+                Err(err) => {
+                    ctx.controller.push_notice(
+                        NoticeLevel::Error,
+                        format!("Failed to reload JS extensions: {err}"),
+                    );
+                    ctx.controller.invalidate_history_layout();
+                    return;
+                }
+            };
+
+            let new_tools = new_loaded
+                .as_ref()
+                .map(|loaded| loaded.tools.clone())
+                .unwrap_or_default();
+            let has_gateway = session
+                .resident_tool_definitions()
+                .into_iter()
+                .any(|def| def.name == CALL_TOOL_NAME || def.name == CODEMODE_EXEC_TOOL_NAME);
+
+            let old_refs: Vec<&str> = old_names.iter().map(String::as_str).collect();
+            if !old_refs.is_empty()
+                && let Err(err) = session.remove_tools(&old_refs)
+            {
+                ctx.controller.push_notice(
+                    NoticeLevel::Error,
+                    format!("Failed to detach old extension tools: {err}"),
+                );
+                return;
+            }
+
+            let next_names = if new_tools.is_empty() {
+                Vec::new()
+            } else if has_gateway {
+                let names: Vec<String> = new_tools.iter().map(|t| t.definition().name).collect();
+                if let Err(err) = session.upsert_tools(new_tools) {
+                    ctx.controller.push_notice(
+                        NoticeLevel::Error,
+                        format!("Failed to attach reloaded extension tools: {err}"),
+                    );
+                    return;
+                }
+                names
+            } else {
+                ctx.controller.push_notice(
+                    NoticeLevel::Info,
+                    "New extension tools will activate on /new (current session has no tool gateway)",
+                );
+                Vec::new()
+            };
+
+            *self
+                .extension_tool_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = next_names;
+            *self
+                .loaded_extension_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = new_paths;
+            *self.extensions.write().unwrap_or_else(|e| e.into_inner()) = new_loaded.clone();
+
+            let js_overrides = new_loaded
+                .as_ref()
+                .map(|loaded| loaded.runtime.ui_theme_overrides())
+                .filter(|colors| !colors.is_empty())
+                .map(|colors| ThemeOverrides { base: None, colors });
+            ctx.controller.set_theme_overrides(js_overrides);
+
+            self.ui_mod.set_runtime(
+                new_loaded
+                    .as_ref()
+                    .map(|loaded| Arc::clone(&loaded.runtime)),
+            );
+
+            let ext_count = new_loaded
+                .as_ref()
+                .map(|loaded| loaded.runtime.loaded_extensions().len())
+                .unwrap_or(0);
+            ctx.controller.show_toast(format!(
+                "Reloaded {ext_count} extension(s), {theme_count} theme(s)"
+            ));
+            ctx.controller.invalidate_history_layout();
+        })
     }
 }
 
@@ -270,6 +694,7 @@ impl SlashCommand for FastCommand {
 struct BuiltTuiSession {
     session: Arc<KitSession>,
     built_tools: Arc<BuiltWorkspaceTools>,
+    attached_extension_tools: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -282,7 +707,7 @@ struct SessionTemplate {
     explicit_model_override: bool,
     shared_mode: Arc<Mutex<PermissionMode>>,
     sink: JimuInteractionSink,
-    extensions: Option<Arc<LoadedExtensions>>,
+    extensions: Arc<RwLock<Option<Arc<LoadedExtensions>>>>,
     mcp_hub: Arc<McpHub>,
 }
 
@@ -340,19 +765,39 @@ impl SessionTemplate {
         opts.tools
             .extend(built_tools.tools.iter().cloned().map(KitToolSpec::resident));
 
-        let has_extensions = if let Some(loaded) = &self.extensions {
-            if let Err(err) = attach_extensions_to_config(&mut opts, loaded) {
+        let current_extensions = self
+            .extensions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let attached_extension_tools = if let Some(loaded) = current_extensions.as_ref() {
+            let existing_names: HashSet<String> = opts
+                .tools
+                .iter()
+                .map(|spec| spec.tool.definition().name)
+                .collect();
+            if let Err(err) = validate_extension_tools(&loaded.tools, &existing_names) {
                 built_tools.shutdown().await;
                 return Err(err);
             }
-            true
+            let mut names = Vec::with_capacity(loaded.tools.len());
+            for tool in &loaded.tools {
+                names.push(tool.definition().name);
+                opts.tools.push(KitToolSpec::deferred(Arc::clone(tool)));
+            }
+            names
         } else {
-            false
+            Vec::new()
         };
+        let has_extension_tools = !attached_extension_tools.is_empty();
 
-        // Install approval middleware AFTER JS extensions so user approval always evaluates the
-        // final post-hook arguments (matching ACP middleware ordering). Each session receives its
-        // own JimuApprovalMiddleware instance so "always allow" grants never leak across sessions.
+        // Install dynamic JS middleware BEFORE approval middleware so /reload activates hooks
+        // seamlessly and user approval always evaluates the final post-hook arguments (matching
+        // ACP middleware ordering). Each session receives its own JimuApprovalMiddleware instance
+        // so "always allow" grants never leak across sessions.
+        opts.middlewares.push(Arc::new(DynamicJsMiddleware {
+            extensions: Arc::clone(&self.extensions),
+        }));
         opts.middlewares
             .push(Arc::new(DynamicPermissionMiddleware::new(
                 Arc::clone(&self.shared_mode),
@@ -364,7 +809,7 @@ impl SessionTemplate {
         opts.enable_deferred_gateway = should_enable_deferred_gateway(
             &host.tools,
             host.enable_codemode,
-            has_extensions,
+            has_extension_tools,
             has_mcp,
         );
         let has_tools = !opts.tools.is_empty() || host.enable_codemode || has_mcp;
@@ -418,6 +863,7 @@ impl SessionTemplate {
         Ok(BuiltTuiSession {
             session,
             built_tools: Arc::new(built_tools),
+            attached_extension_tools,
             warnings,
         })
     }
@@ -436,6 +882,8 @@ struct TuiSessionManager {
     sessions_dir: Option<PathBuf>,
     cwd: PathBuf,
     active_session: Arc<RwLock<Arc<KitSession>>>,
+    transcript_path: Arc<RwLock<Option<PathBuf>>>,
+    extension_tool_names: Arc<Mutex<Vec<String>>>,
     #[cfg(not(target_os = "ios"))]
     skill_watcher: Mutex<Option<SkillWatcher>>,
     state: Mutex<ActiveSessionState>,
@@ -477,7 +925,12 @@ impl TuiSessionManager {
         tools.shutdown().await;
     }
 
-    async fn activate(&self, next_session: Arc<KitSession>, next_state: ActiveSessionState) {
+    async fn activate(
+        &self,
+        next_session: Arc<KitSession>,
+        next_state: ActiveSessionState,
+        next_extension_tools: Vec<String>,
+    ) {
         // Shut down the outgoing session's background tools BEFORE mutating active state so
         // cancelling the switch future at the await point never leaves active_session, file lock,
         // and harness diverged. The actual swap below is synchronous with zero await points.
@@ -497,10 +950,19 @@ impl TuiSessionManager {
                 .unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *slot, Arc::clone(&next_session))
         };
+        let next_path = next_state.path.clone();
         let prev_state = {
             let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *slot, next_state)
         };
+        *self
+            .transcript_path
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = next_path;
+        *self
+            .extension_tool_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next_extension_tools;
         #[cfg(not(target_os = "ios"))]
         {
             *self.skill_watcher.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -602,6 +1064,7 @@ impl JimuSessionController for TuiSessionManager {
                     _file_lock: Some(file_lock),
                     built_tools: built.built_tools,
                 },
+                built.attached_extension_tools,
             )
             .await;
             Ok(built.session)
@@ -639,6 +1102,7 @@ impl JimuSessionController for TuiSessionManager {
                     _file_lock: file_lock,
                     built_tools: built.built_tools,
                 },
+                built.attached_extension_tools,
             )
             .await;
             Ok(built.session)
@@ -795,21 +1259,61 @@ fn is_approval_required(
     }
 }
 
+fn find_custom_theme_name(
+    custom_themes: &BTreeMap<String, ThemeOverrides>,
+    raw: &str,
+) -> Option<String> {
+    let trimmed = raw.trim();
+    if custom_themes.contains_key(trimmed) {
+        return Some(trimmed.to_owned());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    custom_themes
+        .keys()
+        .find(|k| k.to_ascii_lowercase() == lower)
+        .cloned()
+}
+
 /// Run the interactive TUI with full shared host capabilities (tools, MCP, extensions, skills).
 pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
     let host = config.host;
     let initial_mode = PermissionMode::parse(&host.initial_mode)?;
-    let theme_kind = match config.theme.as_deref() {
-        Some(raw) => ThemeKind::from_name(raw).ok_or_else(|| format!("unknown --theme `{raw}`"))?,
-        None => ThemeKind::Auto,
+    let cwd = host.cwd.clone();
+
+    let (saved_settings, settings_warnings) = UserSettings::load_with_warnings(&host.jimu_home);
+    let (custom_themes, theme_warnings) = discover_custom_themes(&host.jimu_home, &cwd);
+
+    let mut startup_warnings = settings_warnings;
+    startup_warnings.extend(theme_warnings);
+
+    let (theme_kind, initial_custom_theme) = if let Some(raw) = config.theme.as_deref() {
+        if let Some(custom_key) = find_custom_theme_name(&custom_themes, raw) {
+            (ThemeKind::Auto, Some(custom_key))
+        } else if let Some(kind) = ThemeKind::from_name(raw) {
+            (kind, None)
+        } else {
+            return Err(format!("unknown --theme `{raw}`"));
+        }
+    } else if let Some(raw) = saved_settings.theme.as_deref() {
+        if let Some(custom_key) = find_custom_theme_name(&custom_themes, raw) {
+            (ThemeKind::Auto, Some(custom_key))
+        } else if let Some(kind) = ThemeKind::from_name(raw) {
+            (kind, None)
+        } else {
+            startup_warnings.push(format!(
+                "settings.json `theme` ignored: unknown theme `{raw}`"
+            ));
+            (ThemeKind::Auto, None)
+        }
+    } else {
+        (ThemeKind::Auto, None)
     };
 
-    let cwd = host.cwd.clone();
     let transport = build_http_transport(host.transport_override.clone())?;
     let override_provider = host.provider_override.is_some();
 
     let provider_store = Arc::new(ProviderStore::new(host.provider_store_config()));
-    let mut startup_warnings = provider_store.warnings();
+    startup_warnings.extend(provider_store.warnings());
     let active_model = provider_store
         .default_model()
         .unwrap_or_else(|| provider_store.unconfigured_placeholder_model());
@@ -837,13 +1341,21 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
     startup_warnings.extend(mcp_warnings);
     let mcp_hub = Arc::new(mcp_hub);
 
-    let loaded_extensions = match load_js_extensions(&host.extensions, &HashSet::new()) {
+    let cli_extensions = host.extensions.clone();
+    let initial_extension_paths = host.resolve_extension_paths(&cwd);
+    let loaded_extensions = match load_js_extensions(&initial_extension_paths, &HashSet::new()) {
         Ok(loaded) => loaded.map(Arc::new),
         Err(err) => {
             mcp_hub.shutdown().await;
             return Err(err);
         }
     };
+    let js_runtime = loaded_extensions
+        .as_ref()
+        .map(|ext| Arc::clone(&ext.runtime));
+    let live_extensions: Arc<RwLock<Option<Arc<LoadedExtensions>>>> =
+        Arc::new(RwLock::new(loaded_extensions));
+    let loaded_extension_paths = Arc::new(Mutex::new(initial_extension_paths));
 
     let sink = JimuInteractionSink::new();
     let shared_mode = Arc::new(Mutex::new(initial_mode));
@@ -861,7 +1373,7 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
         explicit_model_override,
         shared_mode: Arc::clone(&shared_mode),
         sink: sink.clone(),
-        extensions: loaded_extensions,
+        extensions: Arc::clone(&live_extensions),
         mcp_hub: Arc::clone(&mcp_hub),
     };
 
@@ -971,11 +1483,15 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
     let initial_watcher = session.watch_skills(|_| {}).ok();
 
     let active_session = Arc::new(RwLock::new(Arc::clone(&session)));
+    let transcript_path = Arc::new(RwLock::new(initial_path.clone()));
+    let extension_tool_names = Arc::new(Mutex::new(initial_built.attached_extension_tools));
     let session_manager = Arc::new(TuiSessionManager {
         template,
         sessions_dir,
         cwd: cwd.clone(),
         active_session: Arc::clone(&active_session),
+        transcript_path: Arc::clone(&transcript_path),
+        extension_tool_names: Arc::clone(&extension_tool_names),
         #[cfg(not(target_os = "ios"))]
         skill_watcher: Mutex::new(initial_watcher),
         state: Mutex::new(ActiveSessionState {
@@ -1042,10 +1558,57 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
         ))
     };
 
+    let redraw_handle: Arc<RwLock<Option<TuiController>>> = Arc::new(RwLock::new(None));
+    let on_chrome_update: Arc<dyn Fn() + Send + Sync> = {
+        let handle = Arc::clone(&redraw_handle);
+        Arc::new(move || {
+            if let Some(ctrl) = handle.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                ctrl.request_redraw();
+            }
+        })
+    };
+    let on_history_update: Arc<dyn Fn() + Send + Sync> = {
+        let handle = Arc::clone(&redraw_handle);
+        Arc::new(move || {
+            if let Some(ctrl) = handle.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                ctrl.invalidate_history_layout();
+            }
+        })
+    };
+
+    let status_line_runner = saved_settings.status_line.clone().map(|sl_cfg| {
+        Arc::new(StatusLineRunner::spawn(
+            sl_cfg,
+            cwd.clone(),
+            Arc::clone(&on_chrome_update),
+        ))
+    });
+
+    let ui_mod = Arc::new(UiModBridge::with_callbacks(
+        js_runtime.clone(),
+        Arc::clone(&on_chrome_update),
+        Arc::clone(&on_history_update),
+    ));
+
+    let js_theme_colors = js_runtime
+        .as_ref()
+        .map(|rt| rt.ui_theme_overrides())
+        .unwrap_or_default();
+    let theme_overrides = (!js_theme_colors.is_empty()).then_some(ThemeOverrides {
+        base: None,
+        colors: js_theme_colors,
+    });
+
     let chrome = ChromeConfig {
         slots: Arc::new(DynamicChromeSlots {
             active_session: Arc::clone(&active_session),
+            transcript_path,
+            project_dir: cwd.clone(),
+            started_at: Instant::now(),
+            status_line_runner,
+            ui_mod: Arc::clone(&ui_mod),
         }),
+        show_header: saved_settings.show_header.unwrap_or(false),
         app_name: Some("jimu".into()),
         app_version: Some(env!("CARGO_PKG_VERSION").into()),
         footer_hint: auth_hint,
@@ -1053,10 +1616,22 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
         ..ChromeConfig::default()
     };
 
-    let slash_commands: Vec<Arc<dyn SlashCommand>> = vec![Arc::new(FastCommand {
-        active_session: Arc::clone(&active_session),
-        jimu_home: jimu_home.clone(),
-    })];
+    let slash_commands: Vec<Arc<dyn SlashCommand>> = vec![
+        Arc::new(FastCommand {
+            active_session: Arc::clone(&active_session),
+            jimu_home: jimu_home.clone(),
+        }),
+        Arc::new(ReloadCommand {
+            active_session: Arc::clone(&active_session),
+            extensions: live_extensions,
+            loaded_extension_paths,
+            extension_tool_names,
+            ui_mod,
+            jimu_home: jimu_home.clone(),
+            cwd: cwd.clone(),
+            cli_extensions,
+        }),
+    ];
 
     let initial_notices = startup_warnings
         .into_iter()
@@ -1072,18 +1647,22 @@ pub async fn run(config: TuiLaunchConfig) -> Result<(), String> {
         initial_prompt: config.initial_prompt,
         open_resume_picker: config.open_resume_picker,
         initial_notices,
-        on_theme_change: Some(Arc::new(move |kind| {
+        on_theme_name_change: Some(Arc::new(move |name| {
+            let owned = name.to_owned();
             let _ = UserSettings::update(&theme_home, |settings| {
-                settings.theme = Some(kind.display_name().to_owned());
+                settings.theme = Some(owned);
             });
         })),
+        theme_overrides,
+        custom_themes,
+        initial_custom_theme,
         ..Default::default()
     };
 
-    let result = TuiApp::new(Arc::new(harness), tui_cfg)
-        .run()
-        .await
-        .map_err(|err| err.to_string());
+    let app = TuiApp::new(Arc::new(harness), tui_cfg);
+    *redraw_handle.write().unwrap_or_else(|e| e.into_inner()) = Some(app.controller());
+    let result = app.run().await.map_err(|err| err.to_string());
+    *redraw_handle.write().unwrap_or_else(|e| e.into_inner()) = None;
 
     session_manager.shutdown_current().await;
     mcp_hub.shutdown().await;

@@ -1,6 +1,22 @@
 //! Runtime scrollback appearance options.
 
+use crate::harness::ChromeSlots;
 use ratatui::style::Color;
+use std::fmt;
+use std::sync::Arc;
+
+/// Cloneable, debuggable handle to optional host [`ChromeSlots`] for lightweight block decoration.
+#[derive(Clone, Default)]
+pub struct ChromeSlotsHandle(pub Option<Arc<dyn ChromeSlots>>);
+
+impl fmt::Debug for ChromeSlotsHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(_) => f.write_str("ChromeSlotsHandle(Some(..))"),
+            None => f.write_str("ChromeSlotsHandle(None)"),
+        }
+    }
+}
 
 /// Background style for block content area.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -23,6 +39,7 @@ pub struct AppearanceConfig {
     pub collapsed_edit_blocks: bool,
     pub render_mermaid: RenderMermaid,
     pub word_separators: String,
+    pub chrome_slots: ChromeSlotsHandle,
 }
 
 impl Default for AppearanceConfig {
@@ -37,6 +54,7 @@ impl Default for AppearanceConfig {
             collapsed_edit_blocks: false,
             render_mermaid: RenderMermaid::default(),
             word_separators: super::DEFAULT_WORD_SEPARATORS.to_owned(),
+            chrome_slots: ChromeSlotsHandle::default(),
         }
     }
 }

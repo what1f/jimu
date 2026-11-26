@@ -82,6 +82,20 @@ impl TuiApp {
                 self.last_esc = None;
                 self.focus_prompt();
                 self.composer.completion_dropdown_close();
+                #[cfg(feature = "clipboard-image")]
+                {
+                    let remaining = crate::ui::views::prompt_widget::PromptWidget::IMAGE_CAP
+                        .saturating_sub(self.composer.reconciled_images().len());
+                    if let Some(batch) = super::image_paste::try_load_pasted_image_paths(
+                        &text,
+                        self.config.directory.as_deref(),
+                        remaining,
+                    ) {
+                        self.insert_pasted_images(batch);
+                        self.refresh_completion();
+                        return;
+                    }
+                }
                 self.composer.handle_paste(&text);
                 self.refresh_slash_highlight();
             }
@@ -342,6 +356,9 @@ impl TuiApp {
         if let Some(cb) = &self.config.on_theme_change {
             cb(next);
         }
+        if let Some(cb) = &self.config.on_theme_name_change {
+            cb(next.display_name());
+        }
     }
 
     fn handle_ctrl_c(&mut self) {
@@ -587,6 +604,7 @@ impl TuiApp {
                 self.shortcuts()
             }
             K::Enter if ctrl || alt => self.send_prompt(true),
+            _ if self.try_clipboard_image_paste_key(&key) => {}
             _ => match self.composer.route_enter(&key) {
                 EnterOutcome::Submit => self.send_prompt(false),
                 EnterOutcome::NewlineInserted => self.refresh_completion(),
@@ -609,10 +627,70 @@ impl TuiApp {
         }
     }
 
+    #[cfg(feature = "clipboard-image")]
+    fn insert_pasted_images(&mut self, batch: super::image_paste::PastedImageBatch) {
+        let mut toast = batch.warning;
+        for img in batch.images {
+            if let Err(err) = self.composer.insert_image(img) {
+                if toast.is_none() {
+                    toast = Some(err);
+                }
+                if self.composer.reconciled_images().len()
+                    >= crate::ui::views::prompt_widget::PromptWidget::IMAGE_CAP
+                {
+                    break;
+                }
+            }
+        }
+        if let Some(msg) = toast {
+            self.show_toast(&msg);
+        }
+    }
+
+    fn try_clipboard_image_paste_key(&mut self, key: &KeyEvent) -> bool {
+        #[cfg(not(feature = "clipboard-image"))]
+        {
+            let _ = key;
+            false
+        }
+        #[cfg(feature = "clipboard-image")]
+        {
+            if crate::engine::input::key::is_inline_paste_key(key) {
+                return false;
+            }
+            let is_image_paste_chord = crate::engine::input::key::is_paste_key(key)
+                || KeyShortcut::new(K::Char('v'), M::ALT).matches(key);
+            if !is_image_paste_chord {
+                return false;
+            }
+            let clipboard_text = crate::engine::clipboard::system_clipboard_get();
+            let remaining = crate::ui::views::prompt_widget::PromptWidget::IMAGE_CAP
+                .saturating_sub(self.composer.reconciled_images().len());
+            if let Some(batch) = super::image_paste::probe_clipboard_images(
+                clipboard_text.as_deref(),
+                self.config.directory.as_deref(),
+                remaining,
+            ) {
+                self.composer.completion_dropdown_close();
+                self.insert_pasted_images(batch);
+                self.refresh_completion();
+                return true;
+            }
+            if let Some(text) = clipboard_text {
+                self.composer.completion_dropdown_close();
+                self.composer.handle_paste(&text);
+                self.refresh_completion();
+                return true;
+            }
+            // No image and no text on clipboard: swallow Alt+V/Ctrl+V cleanly without inserting a character.
+            true
+        }
+    }
+
     fn send_prompt(&mut self, follow: bool) {
-        if let Some(text) = self.composer.try_send() {
-            let text = self.composer.submitted_text_without_image_chips(&text);
-            let images = self
+        if let Some(raw_text) = self.composer.try_send() {
+            let mut clean_text = self.composer.submitted_text_without_image_chips(&raw_text);
+            let images: Vec<crate::harness::InputImage> = self
                 .composer
                 .drain_images()
                 .into_iter()
@@ -630,10 +708,31 @@ impl TuiApp {
                     })
                 })
                 .collect();
+            let display_override = if !images.is_empty() {
+                clean_text = clean_text.trim().to_owned();
+                let raw_trimmed = raw_text.trim();
+                if raw_trimmed.is_empty() {
+                    Some(super::image_paste::format_user_display(
+                        &clean_text,
+                        images.len(),
+                    ))
+                } else {
+                    Some(raw_trimmed.to_owned())
+                }
+            } else {
+                None
+            };
             self.composer.set_text_discarding_images("");
             self.composer.clear_history();
             self.refresh_completion();
-            self.submit(UserInput { text, images }, follow);
+            self.submit_with_display(
+                UserInput {
+                    text: clean_text,
+                    images,
+                },
+                display_override,
+                follow,
+            );
         }
     }
 

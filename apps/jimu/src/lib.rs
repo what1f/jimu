@@ -7,9 +7,13 @@ pub mod mcp;
 pub mod prompt;
 pub mod providers;
 pub mod settings;
+#[cfg(feature = "tui")]
+pub mod status_line;
 pub mod tools;
 #[cfg(feature = "tui")]
 pub mod tui;
+#[cfg(feature = "tui")]
+pub mod ui_mod;
 
 use jimu_session::{JsonlSessionStore, SessionEntryPayload, SessionStore};
 use std::{

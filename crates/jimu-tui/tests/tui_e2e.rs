@@ -444,7 +444,7 @@ fn standalone_harness_fullscreen_mouse_dual_screen_and_program_status_e2e() {
     );
     let response = ui.screen();
     assert!(
-        response.contains("demo.rs") && response.contains("32K / 100K"),
+        response.contains("demo.rs") && response.contains("32K/100K"),
         "{response}"
     );
     let tool = ui.find("Run echo hi");
@@ -819,7 +819,7 @@ fn jimu_native_harness_approval_context_queue_and_wakeup_e2e() {
     let format = jimu_tui::ui::views::context_bar::fmt_tokens;
     assert!(
         ui.screen().contains(&format!(
-            "{} / {}",
+            "{}/{}",
             format(used),
             format(u64::from(context.context_window))
         )),
@@ -1363,4 +1363,938 @@ fn new_session_while_turn_running_resets_tui_to_idle_e2e() {
         "expected fresh-reply on screen:\n{screen}"
     );
     ui.stop();
+}
+
+#[cfg(feature = "clipboard-image")]
+#[test]
+fn image_path_paste_creates_chip_and_preserves_placeholder_in_transcript_e2e() {
+    let _terminal = UI_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    struct ImageCaptureHarness {
+        tx: Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>,
+        received: Mutex<Vec<UserInput>>,
+    }
+
+    impl TuiHarness for ImageCaptureHarness {
+        fn submit(&self, input: UserInput) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                let text = input.text.clone();
+                self.received.lock().unwrap().push(input);
+                if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                    let _ = tx.unbounded_send(TuiEvent::TurnStarted);
+                    let _ = tx.unbounded_send(TuiEvent::UserMessage {
+                        id: None,
+                        text,
+                        steered: false,
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::TextDelta {
+                        block_index: 0,
+                        delta: "got image".into(),
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::AssistantMessageEnd { error: None });
+                    let _ = tx.unbounded_send(TuiEvent::TurnEnded);
+                }
+                Ok(())
+            })
+        }
+
+        fn subscribe(&self) -> BoxEventStream {
+            let (tx, rx) = mpsc::unbounded();
+            *self.tx.lock().unwrap() = Some(tx);
+            Box::pin(rx)
+        }
+
+        fn abort(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("jimu-tui-img-paste-{} dir", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let png_path = tmp.join("sample shot.png");
+    let img = image::RgbaImage::from_pixel(16, 16, image::Rgba([40, 120, 220, 255]));
+    img.save(&png_path).unwrap();
+
+    let harness = Arc::new(ImageCaptureHarness {
+        tx: Mutex::new(None),
+        received: Mutex::new(Vec::new()),
+    });
+    let app = TuiApp::new(
+        harness.clone(),
+        TuiAppConfig {
+            screen_mode: ScreenMode::Fullscreen,
+            theme_kind: ThemeKind::Dark,
+            directory: Some(tmp.clone()),
+            ..Default::default()
+        },
+    );
+    let mut ui = TestUi::start(app);
+
+    // 1. Pasting a quoted local image path inserts an atomic `[Image #1]` chip into the prompt.
+    let quoted = format!("'{}'", png_path.display());
+    ui.send(Event::Paste(quoted));
+    assert!(
+        ui.screen().contains("Image #1"),
+        "prompt must show [Image #1] chip after path paste:\n{}",
+        ui.screen()
+    );
+
+    // 2. Append user text and submit: model receives clean text + image bytes, while transcript keeps `[Image #1]`.
+    ui.send(Event::Paste("inspect button".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    {
+        let received = harness.received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].text.trim(), "inspect button");
+        assert!(!received[0].text.contains("[Image #1]"));
+        assert_eq!(received[0].images.len(), 1);
+        assert_eq!(received[0].images[0].mime_type, "image/png");
+    }
+    let screen = ui.screen();
+    assert!(
+        screen.contains("[Image #1]") && screen.contains("inspect button"),
+        "transcript bubble must keep [Image #1] alongside user text:\n{screen}"
+    );
+
+    // 3. Image-only submission via `file://` URI keeps `[Image #1]` in the transcript (no blank bubble).
+    let file_uri = url::Url::from_file_path(&png_path).unwrap().to_string();
+    ui.send(Event::Paste(file_uri));
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    {
+        let received = harness.received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(received[1].text.trim().is_empty());
+        assert_eq!(received[1].images.len(), 1);
+    }
+    assert!(
+        ui.screen().contains("[Image #1]"),
+        "image-only message must still display [Image #1] in transcript:\n{}",
+        ui.screen()
+    );
+
+    ui.stop();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn default_chrome_hides_header_and_supports_custom_status_and_above_prompt_e2e() {
+    use jimu_tui::harness::{
+        ChromeSlots, ChromeState, PermissionModeCap, PermissionModeOption, SessionOption,
+        SessionPickerCap,
+    };
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+
+    let _terminal = UI_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    struct StatusHarness {
+        tx: Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>,
+        effort: Mutex<String>,
+        perm: Mutex<String>,
+    }
+
+    impl ContextMeterCap for StatusHarness {
+        fn context_usage(&self) -> Option<ContextMeterSnapshot> {
+            Some(ContextMeterSnapshot {
+                tokens: Some(23_000),
+                estimated_tokens: 23_000,
+                context_window: 300_000,
+                percent: Some(7.6),
+                compaction_threshold: Some(240_000),
+            })
+        }
+    }
+
+    impl ModelPickerCap for StatusHarness {
+        fn current_model(&self) -> ModelOption {
+            ModelOption {
+                id: "opus-4".into(),
+                name: "opus-4".into(),
+                provider: "mock".into(),
+                supports_thinking: true,
+            }
+        }
+        fn available_models(&self) -> Vec<ModelOption> {
+            vec![self.current_model()]
+        }
+        fn set_model(&self, _: &str) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn thinking_levels(&self) -> Vec<String> {
+            vec!["low".into(), "high".into()]
+        }
+        fn current_thinking_level(&self) -> Option<String> {
+            Some(self.effort.lock().unwrap().clone())
+        }
+        fn set_thinking_level(&self, level: &str) -> BoxFuture<'_, Result<(), String>> {
+            let level = level.to_owned();
+            Box::pin(async move {
+                *self.effort.lock().unwrap() = level;
+                Ok(())
+            })
+        }
+        fn fast_mode(&self) -> bool {
+            true
+        }
+    }
+
+    impl PermissionModeCap for StatusHarness {
+        fn current_mode(&self) -> String {
+            self.perm.lock().unwrap().clone()
+        }
+        fn available_modes(&self) -> Vec<PermissionModeOption> {
+            vec![PermissionModeOption {
+                id: "bypassPermissions".into(),
+                description: "Bypass".into(),
+            }]
+        }
+        fn set_mode(&self, mode: &str) -> Result<(), String> {
+            *self.perm.lock().unwrap() = mode.to_owned();
+            Ok(())
+        }
+    }
+
+    impl SessionPickerCap for StatusHarness {
+        fn current_session_id(&self) -> Option<String> {
+            Some("sess-42".into())
+        }
+        fn list_sessions(&self) -> BoxFuture<'_, Result<Vec<SessionOption>, String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn switch_session(&self, _: &str) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn new_session(&self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl TuiHarness for StatusHarness {
+        fn submit(&self, input: UserInput) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                    let _ = tx.unbounded_send(TuiEvent::TurnStarted);
+                    let _ = tx.unbounded_send(TuiEvent::UserMessage {
+                        id: None,
+                        text: input.text,
+                        steered: false,
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::TextDelta {
+                        block_index: 0,
+                        delta: "ack".into(),
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::AssistantMessageEnd { error: None });
+                    let _ = tx.unbounded_send(TuiEvent::TurnEnded);
+                }
+                Ok(())
+            })
+        }
+        fn subscribe(&self) -> BoxEventStream {
+            let (tx, rx) = mpsc::unbounded();
+            *self.tx.lock().unwrap() = Some(tx);
+            Box::pin(rx)
+        }
+        fn abort(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn capabilities(&self) -> HarnessCapabilities<'_> {
+            HarnessCapabilities {
+                context_meter: Some(self),
+                model_picker: Some(self),
+                permission_mode: Some(self),
+                session_picker: Some(self),
+                ..Default::default()
+            }
+        }
+    }
+
+    // Part 1: default ChromeConfig hides top header and renders restrained bottom status line.
+    let harness = Arc::new(StatusHarness {
+        tx: Mutex::new(None),
+        effort: Mutex::new("high".into()),
+        perm: Mutex::new("bypassPermissions".into()),
+    });
+    assert!(!ChromeConfig::default().show_header);
+    let app = TuiApp::new(
+        harness.clone(),
+        TuiAppConfig {
+            screen_mode: ScreenMode::Fullscreen,
+            theme_kind: ThemeKind::Dark,
+            directory: Some(std::path::PathBuf::from("/tmp/demo-project")),
+            chrome: ChromeConfig {
+                app_name: Some("HiddenTitle".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut ui = TestUi::start(app);
+    ui.enter("hello");
+    ui.enter("/effort low");
+    let screen = ui.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let top_row = lines.first().copied().unwrap_or_default();
+    assert!(
+        !top_row.contains("HiddenTitle") && !top_row.contains("Theme"),
+        "default show_header=false must not paint legacy top bar:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Effort: low"),
+        "switching effort must not clutter transcript with Effort notice:\n{screen}"
+    );
+    let bottom_row = lines.last().copied().unwrap_or_default();
+    assert!(
+        bottom_row.contains("opus-4 low")
+            && bottom_row.contains("fast")
+            && bottom_row.contains("demo-project")
+            && bottom_row.contains("23K/300K (8%)")
+            && bottom_row.contains("bypassPermissions"),
+        "default bottom status bar missing expected items: {bottom_row:?}\nfull:\n{screen}"
+    );
+    assert!(
+        !bottom_row.contains('·'),
+        "status bar must never join items with middle dot `·`: {bottom_row:?}"
+    );
+    ui.stop();
+
+    // Part 2: custom ChromeSlots overrides `status_line`, adds `above_prompt`, and inspects extended `ChromeState`.
+    struct CustomSlots;
+    impl ChromeSlots for CustomSlots {
+        fn above_prompt(&self, state: &ChromeState<'_>) -> Vec<Line<'static>> {
+            vec![Line::from(format!(
+                "ABOVE_BAR sess={} perm={}",
+                state.session_id.unwrap_or("-"),
+                state.permission_mode.unwrap_or("-")
+            ))]
+        }
+        fn status_line(&self, state: &ChromeState<'_>) -> Option<Vec<Line<'static>>> {
+            Some(vec![Line::from(Span::styled(
+                format!(
+                    "CUSTOM_STATUS effort={} fast={}",
+                    state.effort.unwrap_or("-"),
+                    state.fast_mode
+                ),
+                Style::default().fg(state.theme.text_primary),
+            ))])
+        }
+    }
+
+    let app2 = TuiApp::new(
+        harness,
+        TuiAppConfig {
+            screen_mode: ScreenMode::Fullscreen,
+            theme_kind: ThemeKind::Dark,
+            directory: Some(std::path::PathBuf::from("/tmp/demo-project")),
+            chrome: ChromeConfig {
+                slots: Arc::new(CustomSlots),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut ui2 = TestUi::start(app2);
+    ui2.enter("hi");
+    let screen2 = ui2.screen();
+    assert!(
+        screen2.contains("ABOVE_BAR sess=sess-42 perm=bypassPermissions"),
+        "above_prompt slot did not render:\n{screen2}"
+    );
+    assert!(
+        screen2.contains("CUSTOM_STATUS effort=low fast=true"),
+        "custom status_line did not override default:\n{screen2}"
+    );
+    assert!(
+        !screen2.contains("23K/300K (8%)"),
+        "default status_line should be replaced when custom returns Some:\n{screen2}"
+    );
+    ui2.stop();
+}
+
+#[test]
+fn theme_overrides_and_component_decoration_hooks_e2e() {
+    use jimu_tui::{
+        engine::theme::{Theme, ThemeOverrides, cache as theme_cache},
+        harness::{ChromeSlots, SurfaceDecoration, ToolRowView},
+    };
+    use ratatui::{
+        style::{Color, Style},
+        text::{Line, Span},
+    };
+    use std::collections::BTreeMap;
+
+    let _terminal = UI_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    struct ModSlots;
+    impl ChromeSlots for ModSlots {
+        fn decorate_user_message(
+            &self,
+            _text: &str,
+            _image_count: usize,
+            _width: u16,
+            _theme: &Theme,
+        ) -> Option<SurfaceDecoration> {
+            Some(SurfaceDecoration {
+                prefix_lines: vec![Line::from(Span::styled(
+                    "┌─ USER_MOD_TOP",
+                    Style::default().fg(Color::Cyan),
+                ))],
+                suffix_lines: vec![Line::from("└─ USER_MOD_BOT")],
+                left_border: Some(Color::Cyan),
+                replace: None,
+            })
+        }
+
+        fn decorate_tool_row(
+            &self,
+            row: &ToolRowView<'_>,
+            _theme: &Theme,
+        ) -> Option<SurfaceDecoration> {
+            Some(SurfaceDecoration {
+                prefix_lines: vec![Line::from(format!("TOOL_DECO {}", row.name))],
+                suffix_lines: Vec::new(),
+                left_border: Some(Color::Magenta),
+                replace: None,
+            })
+        }
+    }
+
+    // 1. Verify `Theme::with_overrides` parses `#rrggbb`, `#rgb`, and ANSI color names accurately.
+    let mut colors = BTreeMap::new();
+    colors.insert("bg_base".into(), "#102030".into());
+    colors.insert("accent_primary".into(), "#f0a".into());
+    colors.insert("accent_error".into(), "bright_red".into());
+    let custom_ov = ThemeOverrides {
+        base: Some("dark".into()),
+        colors,
+    };
+    let derived = Theme::dark().with_overrides(&custom_ov);
+    assert_eq!(
+        derived.accent_error,
+        jimu_tui::engine::theme::quantize(Color::LightRed)
+    );
+    assert_eq!(
+        derived.bg_base,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0x10, 0x20, 0x30))
+    );
+    assert_eq!(
+        derived.accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0xff, 0x00, 0xaa))
+    );
+
+    // 2. Inject custom theme + component decoration hooks into live TuiApp and test `/theme <custom>` + `SetThemeOverrides`.
+    let mut custom_themes = BTreeMap::new();
+    custom_themes.insert("oceanic".into(), custom_ov);
+    let harness = Arc::new(StandaloneHarness::new());
+    let app = TuiApp::new(
+        harness,
+        TuiAppConfig {
+            screen_mode: ScreenMode::Fullscreen,
+            theme_kind: ThemeKind::Dark,
+            custom_themes,
+            chrome: ChromeConfig {
+                slots: Arc::new(ModSlots),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let ctrl = app.controller();
+    let mut ui = TestUi::start(app);
+
+    ui.enter("/theme oceanic");
+    assert_eq!(
+        Theme::current().bg_base,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0x10, 0x20, 0x30))
+    );
+
+    // Live override via TuiController
+    let mut live_colors = BTreeMap::new();
+    live_colors.insert("accent_success".into(), "cyan".into());
+    ctrl.set_theme_overrides(Some(ThemeOverrides {
+        base: Some("dark".into()),
+        colors: live_colors,
+    }));
+    ui.enter("decorated prompt");
+    assert_eq!(
+        Theme::current().accent_success,
+        jimu_tui::engine::theme::quantize(Color::Cyan)
+    );
+
+    let screen = ui.screen();
+    assert!(
+        screen.contains("┌─ USER_MOD_TOP")
+            && screen.contains("decorated prompt")
+            && screen.contains("└─ USER_MOD_BOT"),
+        "user decoration must wrap without losing native text:\n{screen}"
+    );
+    assert!(
+        screen.contains("TOOL_DECO edit") && screen.contains("demo.rs"),
+        "tool decoration must wrap without losing native tool row:\n{screen}"
+    );
+
+    // Clean up global overrides so other tests stay isolated.
+    ctrl.set_theme_overrides(None);
+    ui.stop();
+    theme_cache::set_overrides(None);
+}
+
+#[test]
+fn review_regressions_theme_chrome_tool_name_and_images_e2e() {
+    use jimu_tui::{
+        engine::theme::{Theme, ThemeOverrides, cache as theme_cache, parse_color},
+        harness::{
+            ChromeSlots, ChromeState, SurfaceDecoration, ToolRowView, render_default_status_line,
+        },
+    };
+    use ratatui::{style::Color, text::Line};
+    use std::collections::BTreeMap;
+
+    let _terminal = UI_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // 1. Non-ASCII hex color specs must never panic on char boundary slicing.
+    assert_eq!(parse_color("#中"), None);
+    assert_eq!(parse_color("#中文"), None);
+    assert_eq!(parse_color("#12g"), None);
+    assert_eq!(parse_color("#f0a"), Some(Color::Rgb(0xff, 0x00, 0xaa)));
+
+    // 2. `base: auto` preserves the resolved light/dark base theme; `base: terminal` keeps Reset
+    // backgrounds while applying explicit color overrides.
+    let auto_ov = ThemeOverrides {
+        base: Some("auto".into()),
+        colors: BTreeMap::from([("accent_user".into(), "#112233".into())]),
+    };
+    let light_auto = Theme::light().with_overrides(&auto_ov);
+    assert_eq!(
+        light_auto.bg_base,
+        jimu_tui::engine::theme::quantize(Theme::light().bg_base)
+    );
+    assert_eq!(
+        light_auto.accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0x11, 0x22, 0x33))
+    );
+
+    let term_ov = ThemeOverrides {
+        base: Some("terminal".into()),
+        colors: BTreeMap::from([("accent_user".into(), "#ff5500".into())]),
+    };
+    theme_cache::set(ThemeKind::Terminal);
+    theme_cache::set_overrides(Some(term_ov));
+    let term_current = Theme::current();
+    assert_eq!(term_current.bg_base, Color::Reset);
+    assert_eq!(
+        term_current.accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0xff, 0x55, 0x00))
+    );
+    theme_cache::set_overrides(None);
+    theme_cache::set(ThemeKind::Dark);
+
+    // 3. Theme layering, ReplaceCustomThemes, header deduplication, default status line helper,
+    // and real `ToolRowView.name` (`apply_patch` / `write` instead of `edit`).
+    struct ToolAndHeaderHarness {
+        tx: Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>,
+    }
+    impl TuiHarness for ToolAndHeaderHarness {
+        fn submit(&self, input: UserInput) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                    let _ = tx.unbounded_send(TuiEvent::TurnStarted);
+                    let _ = tx.unbounded_send(TuiEvent::UserMessage {
+                        id: None,
+                        text: input.text,
+                        steered: false,
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::ToolStart {
+                        call_id: "ap1".into(),
+                        name: "apply_patch".into(),
+                        effective_name: None,
+                        args: json!({"patch": "*** Update File: src/lib.rs\n@@ -1 +1 @@\n-old\n+new"}),
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::ToolEnd {
+                        call_id: "ap1".into(),
+                        name: "apply_patch".into(),
+                        effective_name: None,
+                        output: ToolOutput {
+                            text: "patched".into(),
+                            ..Default::default()
+                        },
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::ToolStart {
+                        call_id: "wr1".into(),
+                        name: "write".into(),
+                        effective_name: None,
+                        args: json!({"path": "new.rs", "content": "fn main() {}"}),
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::ToolEnd {
+                        call_id: "wr1".into(),
+                        name: "write".into(),
+                        effective_name: None,
+                        output: ToolOutput {
+                            text: "written".into(),
+                            ..Default::default()
+                        },
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::TurnEnded);
+                }
+                Ok(())
+            })
+        }
+        fn subscribe(&self) -> BoxEventStream {
+            let (tx, rx) = mpsc::unbounded();
+            *self.tx.lock().unwrap() = Some(tx);
+            Box::pin(rx)
+        }
+        fn abort(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    struct InspectSlots;
+    impl ChromeSlots for InspectSlots {
+        fn header(&self, _state: &ChromeState<'_>) -> Vec<Line<'static>> {
+            vec![Line::from("CUSTOM_HDR_ONLY")]
+        }
+        fn status_line(&self, state: &ChromeState<'_>) -> Option<Vec<Line<'static>>> {
+            Some(vec![
+                render_default_status_line(state),
+                Line::from("TAG_OK"),
+            ])
+        }
+        fn decorate_tool_row(
+            &self,
+            row: &ToolRowView<'_>,
+            _theme: &Theme,
+        ) -> Option<SurfaceDecoration> {
+            Some(SurfaceDecoration {
+                prefix_lines: vec![Line::from(format!("REAL_TOOL={}", row.name))],
+                ..Default::default()
+            })
+        }
+    }
+
+    let mut custom_themes = BTreeMap::new();
+    custom_themes.insert(
+        "ocean".into(),
+        ThemeOverrides {
+            base: Some("dark".into()),
+            colors: BTreeMap::from([
+                ("bg_base".into(), "#081828".into()),
+                ("accent_user".into(), "#104060".into()),
+            ]),
+        },
+    );
+    let harness = Arc::new(ToolAndHeaderHarness {
+        tx: Mutex::new(None),
+    });
+    let app = TuiApp::new(
+        harness,
+        TuiAppConfig {
+            screen_mode: ScreenMode::Fullscreen,
+            theme_kind: ThemeKind::Dark,
+            directory: Some(std::path::PathBuf::from("/tmp/status-dir")),
+            custom_themes,
+            chrome: ChromeConfig {
+                show_header: true,
+                app_name: Some("BUILTIN_HDR_HIDDEN".into()),
+                slots: Arc::new(InspectSlots),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let ctrl = app.controller();
+    let mut ui = TestUi::start(app);
+
+    // Select custom theme, apply overlay, then switch built-in theme: overlay colors survive.
+    ui.enter("/theme ocean");
+    ctrl.set_theme_overrides(Some(ThemeOverrides {
+        base: None,
+        colors: BTreeMap::from([("accent_user".into(), "#ff00ff".into())]),
+    }));
+    ctrl.request_redraw();
+    ui.enter("run tools");
+    assert_eq!(
+        Theme::current().bg_base,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0x08, 0x18, 0x28))
+    );
+    assert_eq!(
+        Theme::current().accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0xff, 0x00, 0xff))
+    );
+
+    // ReplaceCustomThemes updates active custom theme; removing it falls back cleanly to default.
+    ctrl.replace_custom_themes(BTreeMap::from([(
+        "ocean".into(),
+        ThemeOverrides {
+            base: Some("dark".into()),
+            colors: BTreeMap::from([("bg_base".into(), "#122436".into())]),
+        },
+    )]));
+    ui.key(KeyCode::Null, KeyModifiers::NONE);
+    assert_eq!(
+        Theme::current().bg_base,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0x12, 0x24, 0x36))
+    );
+    assert_eq!(
+        Theme::current().accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0xff, 0x00, 0xff))
+    );
+
+    ctrl.replace_custom_themes(BTreeMap::new());
+    ui.key(KeyCode::Null, KeyModifiers::NONE);
+    assert_eq!(
+        Theme::current().bg_base,
+        jimu_tui::engine::theme::quantize(Theme::dark().bg_base)
+    );
+    assert_eq!(
+        Theme::current().accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0xff, 0x00, 0xff))
+    );
+
+    // Switching built-in `/theme light` keeps overlay colors intact.
+    ui.enter("/theme light");
+    assert_eq!(
+        Theme::current().bg_base,
+        jimu_tui::engine::theme::quantize(Theme::light().bg_base)
+    );
+    assert_eq!(
+        Theme::current().accent_user,
+        jimu_tui::engine::theme::quantize(Color::Rgb(0xff, 0x00, 0xff))
+    );
+
+    ctrl.invalidate_history_layout();
+    ui.key(KeyCode::Null, KeyModifiers::NONE);
+    let screen = ui.screen();
+    assert!(
+        screen.contains("CUSTOM_HDR_ONLY") && !screen.contains("BUILTIN_HDR_HIDDEN"),
+        "custom header must suppress duplicate built-in header:\n{screen}"
+    );
+    assert!(
+        screen.contains("status-dir") && screen.contains("TAG_OK"),
+        "render_default_status_line must preserve native dir alongside custom tag:\n{screen}"
+    );
+    assert!(
+        screen.contains("REAL_TOOL=apply_patch") && screen.contains("REAL_TOOL=write"),
+        "ToolRowView.name must expose real tool names rather than 'edit':\n{screen}"
+    );
+
+    ctrl.set_theme_overrides(None);
+    ui.stop();
+    theme_cache::set_overrides(None);
+    theme_cache::set(ThemeKind::Dark);
+}
+
+#[cfg(feature = "clipboard-image")]
+#[test]
+fn image_retry_relative_cwd_multiline_dedup_and_batch_cap_e2e() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _terminal = UI_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    struct RetryAndEchoHarness {
+        tx: Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>,
+        fail_next: AtomicBool,
+        received: Mutex<Vec<UserInput>>,
+    }
+
+    impl TuiHarness for RetryAndEchoHarness {
+        fn submit(&self, input: UserInput) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err("transient network error".into());
+                }
+                let echo = if input.images.is_empty() {
+                    input.text.clone()
+                } else {
+                    let chips = (1..=input.images.len())
+                        .map(|n| format!("[Image #{n}]"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if input.text.trim().is_empty() {
+                        chips
+                    } else {
+                        format!("{chips} {}", input.text.trim())
+                    }
+                };
+                self.received.lock().unwrap().push(input);
+                if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                    let _ = tx.unbounded_send(TuiEvent::TurnStarted);
+                    let _ = tx.unbounded_send(TuiEvent::UserMessage {
+                        id: None,
+                        text: echo,
+                        steered: false,
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::TextDelta {
+                        block_index: 0,
+                        delta: "ok".into(),
+                    });
+                    let _ = tx.unbounded_send(TuiEvent::AssistantMessageEnd { error: None });
+                    let _ = tx.unbounded_send(TuiEvent::TurnEnded);
+                }
+                Ok(())
+            })
+        }
+        fn subscribe(&self) -> BoxEventStream {
+            let (tx, rx) = mpsc::unbounded();
+            *self.tx.lock().unwrap() = Some(tx);
+            Box::pin(rx)
+        }
+        fn abort(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("jimu-tui-img-reg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let img = image::RgbaImage::from_pixel(16, 16, image::Rgba([20, 180, 90, 255]));
+    for i in 1..=12 {
+        img.save(tmp.join(format!("p{i}.png"))).unwrap();
+    }
+    std::fs::write(tmp.join("corrupt.png"), b"not a valid png").unwrap();
+
+    let harness = Arc::new(RetryAndEchoHarness {
+        tx: Mutex::new(None),
+        fail_next: AtomicBool::new(true),
+        received: Mutex::new(Vec::new()),
+    });
+    let app = TuiApp::new(
+        harness.clone(),
+        TuiAppConfig {
+            screen_mode: ScreenMode::Fullscreen,
+            theme_kind: ThemeKind::Dark,
+            directory: Some(tmp.clone()),
+            ..Default::default()
+        },
+    );
+    let mut ui = TestUi::start(app);
+
+    // 1. Relative path `./p1.png` resolves against TUI `directory` (`-C`), fails once, and retries
+    // without leaking `[Image #1]` into the text sent to the model.
+    ui.send(Event::Paste("./p1.png".into()));
+    ui.send(Event::Paste("retry body".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(harness.received.lock().unwrap().is_empty());
+    // Retry immediately by pressing Enter on the restored draft.
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    {
+        let rec = harness.received.lock().unwrap();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].text, "retry body");
+        assert!(!rec[0].text.contains("[Image #1]"));
+        assert_eq!(rec[0].images.len(), 1);
+    }
+
+    // 2. Multiline message with trailing image deduplicates cleanly (only 1 bubble, not 2).
+    ui.send(Event::Paste("line_alpha\nline_beta\n".into()));
+    ui.send(Event::Paste("./p2.png".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    let screen = ui.screen();
+    assert_eq!(
+        screen.matches("line_alpha").count(),
+        1,
+        "multiline + trailing image must not create duplicate bubbles:\n{screen}"
+    );
+
+    // 3. Batch with a corrupt image still inserts the valid images around it, and exceeding
+    // IMAGE_CAP truncates to remaining capacity with a clear toast.
+    ui.send(Event::Paste("./p1.png ./corrupt.png ./p2.png".into()));
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    {
+        let rec = harness.received.lock().unwrap();
+        assert_eq!(rec.len(), 3);
+        assert_eq!(
+            rec[2].images.len(),
+            2,
+            "corrupt file must not drop valid siblings"
+        );
+    }
+
+    let twelve = (1..=12)
+        .map(|i| format!("./p{i}.png"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    ui.send(Event::Paste(twelve));
+    assert!(
+        ui.screen().contains("Image limit reached"),
+        "over-cap multi-image paste must display limit toast:\n{}",
+        ui.screen()
+    );
+    ui.key(KeyCode::Enter, KeyModifiers::NONE);
+    {
+        let rec = harness.received.lock().unwrap();
+        assert_eq!(rec.len(), 4);
+        assert_eq!(
+            rec[3].images.len(),
+            jimu_tui::ui::views::prompt_widget::PromptWidget::IMAGE_CAP
+        );
+    }
+
+    ui.stop();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // 4. History restore with literal `[Image #1]` text alongside real image attachments must still
+    // display the real `[Image #1]` `[Image #2]` chips (never hide real attachments).
+    #[cfg(feature = "jimu")]
+    {
+        use jimu_ai::{
+            ApiKind, AssistantBlock, AssistantMessage, AssistantMessageEvent as Ev, ContentPart,
+            ImageContent, Model, StopReason, TextContent, Usage,
+        };
+        let provider = Arc::new(jimu_testkit::FauxProvider::new());
+        provider.enqueue_events(vec![Ev::Done {
+            reason: StopReason::Stop,
+            message: AssistantMessage {
+                content: vec![AssistantBlock::Text(TextContent::plain("seen"))],
+                api: ApiKind::OpenaiResponses,
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                response_id: None,
+                thinking_level: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                diagnostics: Vec::new(),
+                duration_ms: None,
+                timestamp: 1,
+            },
+        }]);
+        let model = Model::new("mock-model", "mock", ApiKind::OpenaiResponses, "");
+        let mut cfg = jimu_kit::KitSessionConfig::new(model);
+        cfg.skill_discovery.include_user_skills = false;
+        let session = Arc::new(jimu_kit::KitSession::new(provider, cfg).expect("session"));
+        let jimu_harness = jimu_tui::jimu::JimuHarness::new(Arc::clone(&session));
+        futures_executor::block_on(session.prompt_parts(vec![
+            ContentPart::Text(TextContent::plain("compare with [Image #1] literal")),
+            ContentPart::Image(ImageContent {
+                data: "AAAA".into(),
+                mime_type: "image/png".into(),
+            }),
+            ContentPart::Image(ImageContent {
+                data: "BBBB".into(),
+                mime_type: "image/png".into(),
+            }),
+        ]))
+        .expect("prompt_parts");
+        let history = jimu_harness.initial_history();
+        match &history[0] {
+            jimu_tui::harness::HistoryMessage::User { text, .. } => {
+                assert_eq!(
+                    text,
+                    "[Image #1] [Image #2] compare with [Image #1] literal"
+                );
+            }
+            other => panic!("expected User history message, got {other:?}"),
+        }
+    }
 }

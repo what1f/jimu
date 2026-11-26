@@ -1,6 +1,7 @@
 //! Harness-independent terminal conversation host.
 mod commands;
 mod dialogs;
+mod image_paste;
 mod input;
 mod mouse;
 mod runner;
@@ -12,7 +13,9 @@ use crate::{
     engine::{
         input::KeyboardNormalizer,
         terminal::osc7501::ProgramStatus,
-        theme::{Theme, ThemeKind, cache, env_appearance, osc11, system_appearance},
+        theme::{
+            Theme, ThemeKind, ThemeOverrides, cache, env_appearance, osc11, system_appearance,
+        },
         x10_filter::X10ReassemblyFilter,
     },
     harness::{
@@ -49,6 +52,9 @@ impl Labels {
 /// Optional host clipboard implementation. The default uses the platform clipboard utility.
 pub type ClipboardWriter = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 /// Presentation and host extensions for one conversation.
+/// Host callback invoked with the active theme name whenever the user switches to a built-in or
+/// custom theme.
+pub type ThemeNameCallback = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct TuiAppConfig {
     pub screen_mode: ScreenMode,
     pub theme_kind: ThemeKind,
@@ -69,6 +75,15 @@ pub struct TuiAppConfig {
     pub initial_notices: Vec<(crate::harness::NoticeLevel, String)>,
     /// Optional callback invoked when the user switches the color theme.
     pub on_theme_change: Option<Arc<dyn Fn(ThemeKind) + Send + Sync>>,
+    /// Optional callback invoked with the active theme name whenever the user switches to a
+    /// built-in or custom theme.
+    pub on_theme_name_change: Option<ThemeNameCallback>,
+    /// Optional color overrides layered on top of `theme_kind`.
+    pub theme_overrides: Option<ThemeOverrides>,
+    /// Named custom themes injected by the host and selectable via `/theme`.
+    pub custom_themes: BTreeMap<String, ThemeOverrides>,
+    /// Optional name of a theme in `custom_themes` to activate on startup.
+    pub initial_custom_theme: Option<String>,
 }
 impl Default for TuiAppConfig {
     fn default() -> Self {
@@ -87,6 +102,10 @@ impl Default for TuiAppConfig {
             open_resume_picker: false,
             initial_notices: vec![],
             on_theme_change: None,
+            on_theme_name_change: None,
+            theme_overrides: None,
+            custom_themes: BTreeMap::new(),
+            initial_custom_theme: None,
         }
     }
 }
@@ -135,6 +154,8 @@ pub struct TuiApp {
     normalizer: KeyboardNormalizer,
     theme: Theme,
     auto_palette: ThemeKind,
+    active_custom_theme: Option<String>,
+    overlay_overrides: Option<ThemeOverrides>,
     native: bool,
     appearance: Option<system_appearance::SystemAppearanceWatcher>,
     observed: Option<system_appearance::SystemAppearance>,
@@ -163,6 +184,7 @@ impl TuiApp {
     pub fn new(harness: Arc<dyn TuiHarness>, config: TuiAppConfig) -> Self {
         let (controller, controls) = TuiController::channel(Arc::new(config.text.clone()));
         let mode = config.screen_mode;
+        let overlay_overrides = config.theme_overrides.clone();
         let mut app = Self {
             config,
             harness,
@@ -189,6 +211,8 @@ impl TuiApp {
             normalizer: KeyboardNormalizer::from_terminal_context(),
             theme: Theme::current(),
             auto_palette: ThemeKind::Dark,
+            active_custom_theme: None,
+            overlay_overrides,
             native: false,
             appearance: None,
             observed: None,
@@ -206,6 +230,7 @@ impl TuiApp {
         };
         app.composer
             .set_placeholder(app.config.text.input_placeholder.clone());
+        app.sync_scrollback_appearance();
         if app.harness.capabilities().queue.is_none() {
             app.queue_pane
                 .set_mutation(crate::ui::views::queue_mutation::QueueMutation::ReadOnly);
@@ -213,12 +238,24 @@ impl TuiApp {
         app.refresh_commands();
         app
     }
+    fn sync_scrollback_appearance(&mut self) {
+        let mut appearance = self.history.state.appearance().clone();
+        appearance.chrome_slots = crate::ui::scrollback::appearance::ChromeSlotsHandle(Some(
+            self.config.chrome.slots.clone(),
+        ));
+        self.history.state.set_appearance(appearance);
+    }
     pub fn controller(&self) -> TuiController {
         self.controller.clone()
     }
     fn start(&mut self, native: bool) {
         self.native = native;
-        let osc = if native && self.config.theme_kind.is_auto() {
+        if let Some(custom_name) = self.config.initial_custom_theme.clone()
+            && let Some((key, _)) = self.find_custom_theme(&custom_name)
+        {
+            self.active_custom_theme = Some(key);
+        }
+        let osc = if native && self.effective_base_kind().is_auto() {
             osc11::detect_via_osc11()
         } else {
             None
@@ -229,7 +266,7 @@ impl TuiApp {
         self.auto_palette = appearance.map_or(ThemeKind::Dark, |a| {
             system_appearance::to_theme_kind(a, None, None)
         });
-        self.apply_theme(self.config.theme_kind);
+        self.recompute_active_theme();
         self.restore();
         for (level, message) in self.config.initial_notices.clone() {
             self.history.notice(level, message);
@@ -272,18 +309,106 @@ impl TuiApp {
             self.set_queue(q.pending_inputs());
         }
     }
-    fn apply_theme(&mut self, kind: ThemeKind) {
-        self.config.theme_kind = kind;
-        if self.native && kind.is_auto() && self.appearance.is_none() {
+    fn effective_base_kind(&self) -> ThemeKind {
+        if let Some(kind) = self
+            .overlay_overrides
+            .as_ref()
+            .and_then(|o| o.base.as_deref())
+            .and_then(ThemeKind::from_name)
+        {
+            return kind;
+        }
+        if let Some(name) = self.active_custom_theme.as_deref()
+            && let Some(kind) = self
+                .config
+                .custom_themes
+                .get(name)
+                .and_then(|c| c.base.as_deref())
+                .and_then(ThemeKind::from_name)
+        {
+            return kind;
+        }
+        self.config.theme_kind
+    }
+
+    fn recompute_active_theme(&mut self) {
+        let base_kind = self.effective_base_kind();
+        if self.native && base_kind.is_auto() && self.appearance.is_none() {
             self.appearance = system_appearance::SystemAppearanceWatcher::start_if_auto(true);
             self.observed = self.appearance.as_ref().and_then(|w| w.current());
         }
-        cache::set_auto_mode(kind.is_auto());
-        cache::set(if kind.is_auto() {
+        let concrete_kind = if base_kind.is_auto() {
             self.auto_palette
         } else {
-            kind
+            base_kind
+        };
+        let mut merged_colors = BTreeMap::new();
+        if let Some(name) = self.active_custom_theme.as_deref()
+            && let Some(custom) = self.config.custom_themes.get(name)
+        {
+            merged_colors.extend(custom.colors.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        if let Some(overlay) = &self.overlay_overrides {
+            merged_colors.extend(overlay.colors.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        let final_overrides = (!merged_colors.is_empty()).then_some(ThemeOverrides {
+            base: None,
+            colors: merged_colors,
         });
+        cache::set_auto_mode(base_kind.is_auto());
+        cache::set_overrides(final_overrides);
+        cache::set(concrete_kind);
+        self.refresh_active_theme();
+    }
+
+    fn apply_theme(&mut self, kind: ThemeKind) {
+        self.config.theme_kind = kind;
+        self.active_custom_theme = None;
+        if let Some(overlay) = &mut self.overlay_overrides {
+            overlay.base = None;
+        }
+        self.recompute_active_theme();
+    }
+
+    fn apply_custom_theme(&mut self, name: String) {
+        self.active_custom_theme = Some(name);
+        if let Some(overlay) = &mut self.overlay_overrides {
+            overlay.base = None;
+        }
+        self.recompute_active_theme();
+    }
+
+    fn apply_theme_overrides(&mut self, overrides: Option<ThemeOverrides>) {
+        self.config.theme_overrides = overrides.clone();
+        self.overlay_overrides = overrides;
+        self.recompute_active_theme();
+    }
+
+    fn replace_custom_themes(&mut self, themes: BTreeMap<String, ThemeOverrides>) {
+        self.config.custom_themes = themes;
+        if let Some(active) = self.active_custom_theme.clone() {
+            if let Some((canonical, _)) = self.find_custom_theme(&active) {
+                self.active_custom_theme = Some(canonical);
+            } else {
+                self.active_custom_theme = None;
+            }
+            self.recompute_active_theme();
+        }
+    }
+
+    fn find_custom_theme(&self, name: &str) -> Option<(String, ThemeOverrides)> {
+        if let Some(ov) = self.config.custom_themes.get(name) {
+            return Some((name.to_owned(), ov.clone()));
+        }
+        let lower = name.to_ascii_lowercase();
+        self.config
+            .custom_themes
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == lower)
+            .map(|(k, v)| (k.clone(), v.clone()))
+    }
+
+    fn refresh_active_theme(&mut self) {
         self.theme = Theme::current();
         self.palette += 1;
         self.history.state.invalidate_heights();
@@ -299,8 +424,8 @@ impl TuiApp {
         self.observed = current;
         let Some(a) = current else { return false };
         self.auto_palette = system_appearance::to_theme_kind(a, None, None);
-        if self.config.theme_kind.is_auto() {
-            self.apply_theme(ThemeKind::Auto);
+        if self.effective_base_kind().is_auto() {
+            self.recompute_active_theme();
             return true;
         }
         false
@@ -321,6 +446,7 @@ impl TuiApp {
     fn reset_transcript(&mut self) {
         self.history = Transcript::default();
         self.history.state.set_cwd(self.config.directory.clone());
+        self.sync_scrollback_appearance();
         self.focus = Focus::Prompt;
         self.search = None;
         self.mouse.reset();
@@ -398,11 +524,30 @@ impl TuiApp {
         match cmd {
             ControlCommand::Interaction(req) => self.event(TuiEvent::Interaction(req)),
             ControlCommand::Notice { level, message } => self.history.notice(level, message),
+            ControlCommand::Toast(message) => self.show_toast(&message),
             ControlCommand::ToggleScreenMode => self.toggle(),
             ControlCommand::SetTheme(name) => self.theme_command(&name),
+            ControlCommand::SetThemeOverrides(overrides) => self.apply_theme_overrides(overrides),
+            ControlCommand::RegisterCustomTheme { name, overrides } => {
+                let is_active = self
+                    .active_custom_theme
+                    .as_deref()
+                    .is_some_and(|active| active.eq_ignore_ascii_case(&name));
+                self.config.custom_themes.insert(name.clone(), overrides);
+                if is_active {
+                    self.active_custom_theme = Some(name);
+                    self.recompute_active_theme();
+                }
+            }
+            ControlCommand::ReplaceCustomThemes(themes) => self.replace_custom_themes(themes),
             ControlCommand::ClearTranscript => self.clear(),
             ControlCommand::Quit => self.quit = true,
-            ControlCommand::Redraw => {
+            ControlCommand::RequestRedraw => {
+                self.refresh_commands();
+                self.refresh_meters_and_queue();
+            }
+            ControlCommand::InvalidateHistoryLayout => {
+                self.history.state.invalidate_heights();
                 self.refresh_commands();
                 self.refresh_meters_and_queue();
             }
@@ -415,13 +560,23 @@ impl TuiApp {
         let h = self.harness.clone();
         self.aborting = Some(Box::pin(async move { h.abort().await }));
     }
-    fn submit(&mut self, mut input: UserInput, follow: bool) {
+    fn submit(&mut self, input: UserInput, follow: bool) {
+        self.submit_with_display(input, None, follow);
+    }
+
+    fn submit_with_display(
+        &mut self,
+        mut input: UserInput,
+        display_override: Option<String>,
+        follow: bool,
+    ) {
         if input.text.trim().is_empty() && input.images.is_empty() {
             return;
         }
         // Preserve leading whitespace (Claude Code convention): only a literal leading `/`
         // enters slash command / skill dispatch; leading spaces pass straight through as text.
-        let mut display_text: Option<String> = None;
+        let mut display_text: Option<String> = display_override;
+        let mut restore_text = input.text.clone();
         if input.images.is_empty()
             && let Some(cmd) = input.text.trim_end().strip_prefix('/')
         {
@@ -429,27 +584,35 @@ impl TuiApp {
                 commands::SlashDispatch::Handled => return,
                 commands::SlashDispatch::PassThrough => {}
                 commands::SlashDispatch::SendSkill { display, expanded } => {
-                    display_text = Some(display);
+                    display_text = Some(display.clone());
+                    restore_text = display;
                     input.text = expanded;
                 }
             }
         }
-        let history_text = display_text.as_deref().unwrap_or(&input.text);
+        if display_text.is_none() && !input.images.is_empty() {
+            display_text = Some(image_paste::format_user_display(
+                &input.text,
+                input.images.len(),
+            ));
+        }
         #[cfg(feature = "history-search")]
-        if !history_text.is_empty()
-            && self
-                .prompts
-                .last()
-                .is_none_or(|entry| entry.text != history_text)
         {
-            self.prompts
-                .push(crate::ui::views::history_search::HistoryEntry {
-                    text: history_text.to_owned(),
-                });
+            let history_text = display_text.as_deref().unwrap_or(&input.text);
+            if !history_text.is_empty()
+                && self
+                    .prompts
+                    .last()
+                    .is_none_or(|entry| entry.text != history_text)
+            {
+                self.prompts
+                    .push(crate::ui::views::history_search::HistoryEntry {
+                        text: history_text.to_owned(),
+                    });
+            }
         }
         let h = self.harness.clone();
         let active = self.running;
-        let restore_text = display_text.clone().unwrap_or_else(|| input.text.clone());
         let restore_draft = UserInput {
             text: restore_text,
             images: input.images.clone(),

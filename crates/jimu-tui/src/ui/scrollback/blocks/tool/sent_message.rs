@@ -152,6 +152,8 @@ pub struct SentMessageToolCallBlock {
     pub input: Option<SentMessageInput>,
     pub started_at: Option<std::time::Instant>,
     pub elapsed_ms: Option<i64>,
+    /// Actual tool name preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 impl SentMessageToolCallBlock {
@@ -161,6 +163,7 @@ impl SentMessageToolCallBlock {
             input,
             started_at: None,
             elapsed_ms: None,
+            tool_name: None,
         }
     }
 

@@ -850,6 +850,10 @@ impl ModelPickerCap for JimuHarness {
             Ok(())
         })
     }
+
+    fn fast_mode(&self) -> bool {
+        self.session().fast()
+    }
 }
 
 fn thinking_level_label(level: ThinkingLevel) -> String {

@@ -21,7 +21,10 @@ use crate::{
         render::{SafeBuf, osc8::LinkTarget},
         terminal::{SetDefaultCursor, SetPointerCursor},
     },
-    harness::ChromeState,
+    harness::{
+        ChromeSlots, ChromeState, render_default_status_line,
+        render_default_status_line_with_spinner,
+    },
     ui::{
         scrollback::{
             ScratchBuffer, ScrollbackFrame, ScrollbackPane,
@@ -31,6 +34,7 @@ use crate::{
             completion_dropdown::{DropdownChrome, render_floating_dropdown},
             context_bar::context_bar_line_for_session,
             header::{HeaderButton, HeaderConfig, HeaderHits, render_header},
+            location::location_parts,
             prompt_widget::{PromptFlag, PromptInfo, PromptPostFlush, PromptStyle},
             queue_pane::QueueLayout,
             welcome::{
@@ -118,38 +122,11 @@ impl TuiApp {
             .as_deref()
             .unwrap_or_else(|| self.config.labels.get("Terminal"));
         let caps = self.harness.capabilities();
-        let model_picker = caps.model_picker;
-        let model = model_picker.map(|cap| cap.current_model().name);
-        let thinking = model_picker
-            .and_then(|cap| cap.current_thinking_level())
-            .filter(|lvl| !lvl.is_empty() && lvl != "off");
-        let permission_mode = caps.permission_mode.map(|cap| cap.current_mode());
         let bg_tasks = caps.tasks.map(|cap| cap.list_tasks()).unwrap_or_default();
-        let state = ChromeState {
-            running: self.running,
-            usage: &self.usage,
-            context: self.context.as_ref(),
-            model_name: model.as_deref(),
-            queued_count: self.queue.len(),
-            theme,
-            width: area.width,
-        };
+        let snap = ChromeSnapshot::capture(self, cwd);
+        let state = snap.as_state(self, cwd, area.width);
         let dynamic_flags = chrome.slots.status_flags(&state);
         let mut flags = Vec::new();
-        if let Some(level) = thinking.as_deref() {
-            flags.push(PromptFlag {
-                text: level,
-                color: None,
-                bold: false,
-            });
-        }
-        if let Some(perm) = permission_mode.as_deref() {
-            flags.push(PromptFlag {
-                text: perm,
-                color: None,
-                bold: false,
-            });
-        }
         flags.extend(chrome.status_flags.iter().map(|text| PromptFlag {
             text,
             color: None,
@@ -160,23 +137,30 @@ impl TuiApp {
             color: None,
             bold: false,
         }));
-        if self.running {
-            flags.push(PromptFlag {
-                text: self.config.labels.get("Working"),
-                color: Some(theme.accent_success),
-                bold: false,
-            });
-        }
         let prompt_info = PromptInfo {
-            model_name: model.as_deref().unwrap_or_default(),
+            model_name: "",
             flags: &flags,
             ..Default::default()
         };
         let mouse = self.modals.is_empty().then_some(self.mouse.pos).flatten();
         let mut body = area;
         let header = chrome.slots.header(&state);
-        let mut footer = chrome.slots.footer(&state);
-        footer.extend(chrome.slots.status_line(&state).into_iter().flatten());
+        let above_prompt = chrome.slots.above_prompt(&state);
+        let status_lines = chrome
+            .slots
+            .status_line(&state)
+            .unwrap_or_else(|| default_status_line(&state, chrome.slots.as_ref()));
+        let mut footer = status_lines;
+        footer.extend(chrome.slots.footer(&state));
+        let welcome = if self.mode == ScreenMode::Fullscreen
+            && self.history.state.is_empty()
+            && self.queue.is_empty()
+            && !self.queue_open
+        {
+            chrome.slots.welcome(&state)
+        } else {
+            Vec::new()
+        };
         paint(buf, take_top(&mut body, row_count(header.len())), &header);
         paint(
             buf,
@@ -188,7 +172,6 @@ impl TuiApp {
             && self.queue.is_empty()
             && !self.queue_open
         {
-            let welcome = chrome.slots.welcome(&state);
             paint(buf, take_top(&mut body, row_count(welcome.len())), &welcome);
             let actions = self.welcome_actions();
             let menu = actions
@@ -241,57 +224,59 @@ impl TuiApp {
             drawing.post_flush = result.post_flush_escapes.take();
             self.hits.welcome = Some(result);
         } else {
-            let header = take_top(&mut body, 1);
-            let context = self.context.as_ref().map(|c| {
-                (
-                    Some(c.tokens.unwrap_or(c.estimated_tokens)),
-                    Some(u64::from(c.context_window)),
-                )
-            });
-            let context_line = context.and_then(|(used, cap)| {
-                context_bar_line_for_session(used, cap, false, theme, false)
-            });
-            let context_label = context_line.as_ref().map(ToString::to_string);
-            let mut buttons = Vec::new();
-            if let Some(label) = &context_label {
-                buttons.push(HeaderButton {
-                    id: "context",
-                    label,
+            if chrome.show_header && header.is_empty() {
+                let header = take_top(&mut body, 1);
+                let context = self.context.as_ref().map(|c| {
+                    (
+                        Some(c.tokens.unwrap_or(c.estimated_tokens)),
+                        Some(u64::from(c.context_window)),
+                    )
                 });
-            }
-            buttons.extend([
-                HeaderButton {
-                    id: "theme",
-                    label: self.config.labels.get("Theme"),
-                },
-                HeaderButton {
-                    id: "help",
-                    label: "?",
-                },
-            ]);
-            self.hits.header = render_header(
-                buf,
-                header,
-                theme,
-                &HeaderConfig {
-                    title: Some(title),
-                    cwd,
-                    buttons: &buttons,
-                    pointer: mouse,
-                    suppress_hits: false,
-                },
-            );
-            if let Some((used, cap)) = context
-                && let Some(&rect) = self.hits.header.buttons.get("context")
-                && let Some(line) = context_bar_line_for_session(
-                    used,
-                    cap,
-                    mouse.is_some_and(|pos| rect.contains(pos.into())),
+                let context_line = context.and_then(|(used, cap)| {
+                    context_bar_line_for_session(used, cap, false, theme, false)
+                });
+                let context_label = context_line.as_ref().map(ToString::to_string);
+                let mut buttons = Vec::new();
+                if let Some(label) = &context_label {
+                    buttons.push(HeaderButton {
+                        id: "context",
+                        label,
+                    });
+                }
+                buttons.extend([
+                    HeaderButton {
+                        id: "theme",
+                        label: self.config.labels.get("Theme"),
+                    },
+                    HeaderButton {
+                        id: "help",
+                        label: "?",
+                    },
+                ]);
+                self.hits.header = render_header(
+                    buf,
+                    header,
                     theme,
-                    false,
-                )
-            {
-                buf.set_line_safe(rect.x, rect.y, &line, rect.width);
+                    &HeaderConfig {
+                        title: Some(title),
+                        cwd,
+                        buttons: &buttons,
+                        pointer: mouse,
+                        suppress_hits: false,
+                    },
+                );
+                if let Some((used, cap)) = context
+                    && let Some(&rect) = self.hits.header.buttons.get("context")
+                    && let Some(line) = context_bar_line_for_session(
+                        used,
+                        cap,
+                        mouse.is_some_and(|pos| rect.contains(pos.into())),
+                        theme,
+                        false,
+                    )
+                {
+                    buf.set_line_safe(rect.x, rect.y, &line, rect.width);
+                }
             }
             if !bg_tasks.is_empty() && body.height > 1 {
                 let strip = take_bottom(&mut body, 1);
@@ -361,6 +346,13 @@ impl TuiApp {
                         false,
                     );
                 }
+            }
+            if !above_prompt.is_empty() {
+                paint(
+                    buf,
+                    take_bottom(&mut body, row_count(above_prompt.len())),
+                    &above_prompt,
+                );
             }
             if let Some(search) = &self.search {
                 let row = take_top(&mut body, 1);
@@ -653,29 +645,29 @@ impl Screen {
             true,
             (size.height / 3).max(4).min(size.height),
         );
-        let caps = app.harness.capabilities();
-        let model = caps.model_picker.map(|cap| cap.current_model().name);
-        let chrome_state = ChromeState {
-            running: app.running,
-            usage: &app.usage,
-            context: app.context.as_ref(),
-            model_name: model.as_deref(),
-            queued_count: app.queue.len(),
-            theme: &app.theme,
-            width,
-        };
+        let cwd = app
+            .config
+            .directory
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."));
+        let snap = ChromeSnapshot::capture(app, cwd);
+        let chrome_state = snap.as_state(app, cwd, width);
         let slots = &app.config.chrome.slots;
-        let extra = slots.header(&chrome_state).len()
+        let status_rows = slots
+            .status_line(&chrome_state)
+            .map_or(1, |lines| lines.len());
+        let custom_header_rows = slots.header(&chrome_state).len();
+        let extra = custom_header_rows
+            + slots.above_prompt(&chrome_state).len()
             + slots.footer(&chrome_state).len()
-            + slots
-                .status_line(&chrome_state)
-                .map_or(0, |lines| lines.len());
+            + status_rows;
         let dropdown = if app.composer.any_dropdown_open() {
             9
         } else {
             0
         };
-        (1_u16
+        let header_row = u16::from(app.config.chrome.show_header && custom_header_rows == 0);
+        (header_row
             .saturating_add(prompt)
             .saturating_add(
                 app.queue_pane
@@ -830,6 +822,72 @@ impl Screen {
             Write::flush(term.backend_mut())
         })
     }
+}
+
+struct ChromeSnapshot {
+    model: Option<String>,
+    effort: Option<String>,
+    permission_mode: Option<String>,
+    fast_mode: bool,
+    git_branch: Option<String>,
+    session_id: Option<String>,
+}
+
+impl ChromeSnapshot {
+    fn capture(app: &TuiApp, cwd: &Path) -> Self {
+        let caps = app.harness.capabilities();
+        let model_picker = caps.model_picker;
+        let model = model_picker.map(|cap| cap.current_model().name);
+        let effort = model_picker
+            .and_then(|cap| cap.current_thinking_level())
+            .filter(|lvl| !lvl.is_empty() && lvl != "off");
+        let fast_mode = model_picker.is_some_and(|cap| cap.fast_mode());
+        let permission_mode = caps.permission_mode.map(|cap| cap.current_mode());
+        let session_id = caps.session_picker.and_then(|cap| cap.current_session_id());
+        // Pure in-memory cached lookup; never spawns `git` on the draw hot path.
+        let git_branch = location_parts(cwd).branch;
+        Self {
+            model,
+            effort,
+            permission_mode,
+            fast_mode,
+            git_branch,
+            session_id,
+        }
+    }
+
+    fn as_state<'a>(&'a self, app: &'a TuiApp, cwd: &'a Path, width: u16) -> ChromeState<'a> {
+        ChromeState {
+            running: app.running,
+            usage: &app.usage,
+            context: app.context.as_ref(),
+            model_name: self.model.as_deref(),
+            queued_count: app.queue.len(),
+            theme: &app.theme,
+            width,
+            cwd,
+            git_branch: self.git_branch.as_deref(),
+            effort: self.effort.as_deref(),
+            permission_mode: self.permission_mode.as_deref(),
+            fast_mode: self.fast_mode,
+            session_id: self.session_id.as_deref(),
+        }
+    }
+}
+
+/// Re-export of [`crate::harness::render_default_status_line`] for hosts importing from `app::screen`.
+pub fn default_status_line_row(state: &ChromeState<'_>) -> Line<'static> {
+    render_default_status_line(state)
+}
+
+fn default_status_line(state: &ChromeState<'_>, slots: &dyn ChromeSlots) -> Vec<Line<'static>> {
+    if state.width == 0 {
+        return Vec::new();
+    }
+    vec![render_default_status_line_with_spinner(
+        state,
+        slots.spinner_override(state),
+    )]
 }
 
 fn ansi_row(row: &Line<'_>, width: u16) -> String {

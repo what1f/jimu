@@ -1,13 +1,15 @@
 //! In-memory theme selection and automatic appearance mappings.
-use super::{ThemeKind, system_appearance};
+use super::{ThemeKind, ThemeOverrides, system_appearance};
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 static CURRENT: AtomicU8 = AtomicU8::new(ThemeKind::Dark as u8);
 static AUTO_MODE: AtomicBool = AtomicBool::new(false);
 static TERMINAL_NATIVE_LOCK: AtomicBool = AtomicBool::new(false);
 static TERMINAL_THEME_ENABLED: AtomicBool = AtomicBool::new(true);
+static REVISION: AtomicU64 = AtomicU64::new(1);
+static OVERRIDES: RwLock<Option<ThemeOverrides>> = RwLock::new(None);
 static AUTO_THEME_CONFIG: Mutex<AutoThemeConfig> = Mutex::new(AutoThemeConfig {
     dark_theme: None,
     light_theme: None,
@@ -57,7 +59,27 @@ pub fn set(kind: ThemeKind) {
         kind
     };
     CURRENT.store(kind as u8, Ordering::Relaxed);
+    REVISION.fetch_add(1, Ordering::Relaxed);
     sync_markdown_polarity();
+}
+
+/// Monotonic revision bumped whenever the active theme kind, terminal-native lock, or overrides change.
+#[must_use]
+pub fn revision() -> u64 {
+    REVISION.load(Ordering::Relaxed)
+}
+
+/// Replace active theme overrides (pass `None` to clear).
+pub fn set_overrides(overrides: Option<ThemeOverrides>) {
+    *OVERRIDES.write().unwrap_or_else(|e| e.into_inner()) = overrides;
+    REVISION.fetch_add(1, Ordering::Relaxed);
+    sync_markdown_polarity();
+}
+
+/// Clone the currently active theme overrides, if any.
+#[must_use]
+pub fn current_overrides() -> Option<ThemeOverrides> {
+    OVERRIDES.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[must_use]
@@ -75,6 +97,7 @@ pub fn terminal_native_active() -> bool {
 /// Engage or clear the terminal-native theme lock.
 pub fn set_terminal_native_lock(locked: bool) {
     TERMINAL_NATIVE_LOCK.store(locked, Ordering::Relaxed);
+    REVISION.fetch_add(1, Ordering::Relaxed);
     sync_markdown_polarity();
 }
 

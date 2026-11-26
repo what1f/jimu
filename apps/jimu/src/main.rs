@@ -42,9 +42,10 @@ async fn main() -> ExitCode {
 fn build_host_config(cli: &args::CliArgs) -> jimu::host::HostConfig {
     let defaults = jimu::host::HostConfig::default();
     let jimu_home = cli.jimu_home.clone().unwrap_or(defaults.jimu_home);
+    let cwd = defaults.cwd.join(&cli.cwd);
     let saved = jimu::settings::UserSettings::load(&jimu_home);
     jimu::host::HostConfig {
-        cwd: defaults.cwd.join(&cli.cwd),
+        cwd,
         jimu_home,
         provider: cli.provider.clone(),
         model: cli.model.clone(),
@@ -108,13 +109,12 @@ async fn run_acp(cli: args::CliArgs) -> ExitCode {
 #[cfg(feature = "tui")]
 async fn run_tui(cli: args::CliArgs) -> ExitCode {
     let host = build_host_config(&cli);
-    let saved = jimu::settings::UserSettings::load(&host.jimu_home);
     let config = jimu::tui::TuiLaunchConfig {
         host,
         session_file: cli.session,
         continue_last: cli.continue_last,
         open_resume_picker: cli.open_resume_picker,
-        theme: cli.theme.or(saved.theme),
+        theme: cli.theme,
         initial_prompt: cli.prompt,
     };
     match jimu::tui::run(config).await {

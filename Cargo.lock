@@ -1986,13 +1986,17 @@ dependencies = [
  "jimu-testkit",
  "jimu-tools",
  "jimu-tui",
+ "libc",
+ "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "unicode-width 0.2.0",
  "url",
  "uuid",
+ "vte",
 ]
 
 [[package]]

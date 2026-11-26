@@ -13,6 +13,7 @@ struct CachedOutput {
     width: u16,
     raw: bool,
     theme: ThemeKind,
+    theme_revision: u64,
     is_selected: bool,
     cwd: Option<PathBuf>,
     rendered: RenderedBlockOutput,
@@ -21,7 +22,7 @@ struct CachedOutput {
 /// Caches truncated-mode line count so layout need not call `block.output()` (syntect or full wrap) on every redraw.
 /// Streaming invalidates the layout cache on each push; without this, every entry height is recomputed.
 /// `cwd` is keyed because Edit/Read header wrap can change between absolute and relative paths.
-type CachedTruncatedHeight = (u16, bool, ThemeKind, Option<PathBuf>, u16);
+type CachedTruncatedHeight = (u16, bool, ThemeKind, u64, Option<PathBuf>, u16);
 
 /// Unique identifier for a scrollback entry.
 /// EntryIds are stable across mutations: they won't become invalid if other entries are added or removed.
@@ -318,6 +319,7 @@ impl ScrollbackEntry {
                 || self.block.is_subagent());
 
         let current_theme = theme_cache::current_kind();
+        let current_revision = theme_cache::revision();
         let cwd_key = cwd.map(|p| p.to_path_buf());
         {
             let cache = self.cached_output.borrow();
@@ -325,6 +327,7 @@ impl ScrollbackEntry {
                 && cached.width == width
                 && cached.raw == self.raw
                 && cached.theme == current_theme
+                && cached.theme_revision == current_revision
                 && cached.is_selected == effective_selected
                 && cached.cwd == cwd_key
             {
@@ -348,6 +351,7 @@ impl ScrollbackEntry {
             width,
             raw: self.raw,
             theme: current_theme,
+            theme_revision: current_revision,
             is_selected: effective_selected,
             cwd: cwd_key,
             rendered,
@@ -384,14 +388,22 @@ impl ScrollbackEntry {
         cwd: Option<&Path>,
     ) -> u16 {
         let current_theme = theme_cache::current_kind();
+        let current_revision = theme_cache::revision();
         let cwd_key = cwd.map(|p| p.to_path_buf());
         {
             let cache = self.cached_truncated_height.borrow();
-            if let Some(&(cached_width, cached_raw, cached_theme, ref cached_cwd, height)) =
-                cache.as_ref()
+            if let Some(&(
+                cached_width,
+                cached_raw,
+                cached_theme,
+                cached_revision,
+                ref cached_cwd,
+                height,
+            )) = cache.as_ref()
                 && cached_width == content_width
                 && cached_raw == self.raw
                 && cached_theme == current_theme
+                && cached_revision == current_revision
                 && *cached_cwd == cwd_key
             {
                 return height;
@@ -406,8 +418,14 @@ impl ScrollbackEntry {
         let vpad = if has_vpad { 2 } else { 0 };
         let height = content_height + vpad;
 
-        *self.cached_truncated_height.borrow_mut() =
-            Some((content_width, self.raw, current_theme, cwd_key, height));
+        *self.cached_truncated_height.borrow_mut() = Some((
+            content_width,
+            self.raw,
+            current_theme,
+            current_revision,
+            cwd_key,
+            height,
+        ));
         height
     }
 

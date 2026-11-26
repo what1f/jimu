@@ -4,6 +4,7 @@ use ratatui::style::Style;
 use ratatui::text::{Span, Text};
 
 use crate::engine::diff::DiffHunk;
+use crate::engine::theme::Theme;
 use crate::ui::scrollback::appearance::AppearanceConfig;
 use crate::ui::scrollback::media::inline_media_reserved_rows;
 use crate::ui::scrollback::media::{InlineMediaInfo, ScrollbackImageRef, ScrollbackVideoRef};
@@ -17,8 +18,8 @@ use super::blocks::{
     WorkflowBlock,
 };
 use super::types::{
-    AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
-    Selectable, SelectionBoundaries, derive_selection_text,
+    AccentStyle, BlockBackground, BlockContext, BlockLine, BlockOutput, DisplayMode,
+    RenderedBlockOutput, Selectable, SelectionBoundaries, derive_selection_text,
 };
 
 /// The trailing inline image anchored within a block's rendered output. Mermaid diagrams do not use this path; they
@@ -382,6 +383,57 @@ pub(crate) fn join_searchable(parts: impl IntoIterator<Item = Option<String>>) -
 }
 
 impl RenderBlock {
+    fn surface_decoration(&self, ctx: &BlockContext) -> Option<crate::harness::SurfaceDecoration> {
+        let slots = ctx.appearance.chrome_slots.0.as_ref()?;
+        let theme = Theme::current();
+        match self {
+            RenderBlock::UserPrompt(user) => {
+                slots.decorate_user_message(&user.text, user.image_chip_count(), ctx.width, &theme)
+            }
+            RenderBlock::ToolCall(tool) => {
+                let view = crate::harness::ToolRowView {
+                    name: tool.tool_name(),
+                    running: ctx.is_running,
+                    is_error: !tool.is_success(),
+                    width: ctx.width,
+                };
+                slots.decorate_tool_row(&view, &theme)
+            }
+            _ => None,
+        }
+    }
+
+    fn apply_surface_decoration(&self, ctx: &BlockContext, output: &mut BlockOutput) {
+        let Some(deco) = self.surface_decoration(ctx) else {
+            return;
+        };
+        if let Some(replace) = deco.replace {
+            output.lines = replace.into_iter().map(BlockLine::from).collect();
+        }
+        if !deco.prefix_lines.is_empty() {
+            let mut prefix: Vec<BlockLine> = deco
+                .prefix_lines
+                .into_iter()
+                .map(|line| BlockLine {
+                    content: line,
+                    selectable: Selectable::None,
+                    ..Default::default()
+                })
+                .collect();
+            prefix.append(&mut output.lines);
+            output.lines = prefix;
+        }
+        if !deco.suffix_lines.is_empty() {
+            output
+                .lines
+                .extend(deco.suffix_lines.into_iter().map(|line| BlockLine {
+                    content: line,
+                    selectable: Selectable::None,
+                    ..Default::default()
+                }));
+        }
+    }
+
     pub(crate) fn rendered_output(&self, ctx: &BlockContext) -> RenderedBlockOutput {
         let mut rendered = match self {
             RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) => edit.rendered_output(ctx),
@@ -393,6 +445,7 @@ impl RenderBlock {
         if self.has_bullet(ctx) {
             prepend_bullet(&mut rendered.output, ctx, self.bullet(ctx));
         }
+        self.apply_surface_decoration(ctx, &mut rendered.output);
         rendered
     }
 }
@@ -404,11 +457,17 @@ impl BlockContent for RenderBlock {
             let bullet = delegate_block!(self, bullet(ctx));
             prepend_bullet(&mut output, ctx, bullet);
         }
+        self.apply_surface_decoration(ctx, &mut output);
         output
     }
 
     fn accent(&self, ctx: &BlockContext) -> Option<AccentStyle> {
-        delegate_block!(self, accent(ctx))
+        let base = delegate_block!(self, accent(ctx));
+        if let Some(color) = self.surface_decoration(ctx).and_then(|d| d.left_border) {
+            let animated = base.is_some_and(|a| a.animated);
+            return Some(AccentStyle { color, animated });
+        }
+        base
     }
 
     fn bullet(&self, ctx: &BlockContext) -> Option<AccentStyle> {

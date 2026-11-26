@@ -42,6 +42,31 @@ pub(crate) fn parts_to_text(parts: &[ContentPart]) -> String {
         .join("\n")
 }
 
+/// Format user message content parts for transcript display, preserving numbered `[Image #N]` chips.
+pub(crate) fn user_parts_to_display(parts: &[ContentPart]) -> String {
+    let mut image_idx = 0usize;
+    let mut chips = Vec::new();
+    let mut texts = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text(t) if !t.text.is_empty() => texts.push(t.text.as_str()),
+            ContentPart::Text(_) => {}
+            ContentPart::Image(_) => {
+                image_idx += 1;
+                chips.push(format!("[Image #{image_idx}]"));
+            }
+        }
+    }
+    let body = texts.join("\n");
+    if chips.is_empty() {
+        body
+    } else if body.trim().is_empty() {
+        chips.join(" ")
+    } else {
+        format!("{} {}", chips.join(" "), body.trim())
+    }
+}
+
 pub(crate) fn tool_result_to_output(result: AgentToolResult, is_error: bool) -> ToolOutput {
     ToolOutput {
         text: parts_to_text(&result.content),
@@ -114,7 +139,7 @@ pub(crate) fn restore_history(messages: Vec<AgentMessage>) -> (Vec<HistoryMessag
         match msg {
             AgentMessage::Llm(Message::User(u)) => {
                 out.push(HistoryMessage::User {
-                    text: parts_to_text(&u.content),
+                    text: user_parts_to_display(&u.content),
                     steered: false,
                 });
             }
@@ -249,7 +274,7 @@ impl KitEventTranslator {
                         }
                         out.push(TuiEvent::UserMessage {
                             id: u.id,
-                            text: parts_to_text(&u.content),
+                            text: user_parts_to_display(&u.content),
                             steered,
                         });
                     }

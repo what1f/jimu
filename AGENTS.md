@@ -48,12 +48,12 @@ Jimu 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 S
 | `jimu-codemode` | 受限 QuickJS（`rquickjs` 纯解释模式，禁 JIT 满足 iOS App Store 合规）工具编排沙盒 | 零网络、零文件系统暴露，强制内存上限与执行超时 |
 | `jimu-session` | 追加式会话树（内存 / JSONL）、分支 `fork`、具名 `<system-reminder>` 去重、保前缀压缩 | 仅依赖 `jimu-agent` |
 | `jimu-durable` | 可选单机 SQLite WAL（`IMMEDIATE` + `synchronous=FULL`）事务级 Checkpoint、租约隔离与恢复 | 仅无外部调度器的嵌入式守护进程选用 |
-| `jimu-js` | QuickJS 动态扩展运行时（注册自定义工具与回合/工具级钩子，支持热重载） | 流式高频 `delta` 事件严禁跨 JS 边界 |
+| `jimu-js` | QuickJS 动态扩展运行时（注册自定义工具、回合/工具级钩子、纯数据 `UiNode` UI Mod 协议与主题覆盖，支持热重载） | 流式高频 `delta` 事件严禁跨 JS 边界；UI Mod 协议严禁引入终端或图形依赖，无头模式零开销 |
 | `jimu-tools` | 模块化内置工具箱（`fs`、`patch`、`search`、`shell`、`monitor`、`sleep`、`web-fetch` + Schema 覆盖） | 子进程工具（`exec_command`、`write_stdin`、`monitor`）必须用 `#[cfg(not(target_os = "ios"))]` 隔离，确保全仓库可通过 `aarch64-apple-ios` 编译 |
 | `jimu-kit` | 高阶无头会话组装（可扩展 `SkillCatalog` + 回合前自动刷新与可选跨平台 `SkillWatcher`、增量 Diff、BM25 `tool_search`、MCP、后台唤醒收件箱） | 默认关 `stdio` 时零 `tokio`；`watch` feature 仅在非 Wasm / 非 iOS 平台引入 `notify` |
-| `jimu-tui` | 源自 Grok Build 原版引擎的 Inline / Fullscreen 双屏终端 UI 框架（默认零 `jimu-*` 依赖，任意 Harness 可接入；可选 `jimu` feature 原生直连 `KitSession`） | 默认不含 `jimu-*` 依赖；重型媒体能力（`clipboard-image`/`inline-image`/`mermaid`）按 feature 可选；`syntect` 走纯 Rust `default-fancy`；隔离 iOS，严禁被 `jimu-ffi` 引用，在 `apps/jimu` 中仅允许通过可选 `tui` feature 引入 |
+| `jimu-tui` | 源自 Grok Build 原版引擎的 Inline / Fullscreen 双屏终端 UI 框架（默认零 `jimu-*` 依赖，含 `[Image #N]` 图片粘贴、默认隐藏顶栏 + 底部默认状态栏、`ThemeOverrides`、`ChromeSlots` 装饰钩子；可选 `jimu` feature 原生直连 `KitSession`） | 默认不含 `jimu-*` 依赖；重型媒体能力（`clipboard-image`/`inline-image`/`mermaid`）按 feature 可选；`syntect` 走纯 Rust `default-fancy`；隔离 iOS，严禁被 `jimu-ffi` 引用，在 `apps/jimu` 中仅允许通过可选 `tui` feature 引入 |
 | `jimu-ffi` | C-ABI 桥接层（供 Swift `JimuKit` 等原生 SDK 链接） | **严禁**引入 `jimu-http` / `reqwest` / `rustls` / `jimu-tui` |
-| `apps/jimu` (`jimu`) | 统一 CLI 与宿主入口（所有模式通过共享 `host` + `mcp` + `KitSession` 装配层共用认证、`providers.json`、`settings.json` 含 `mcp_servers`、`--mcp-config`/`--mcp-server`、工具裁剪、延迟网关、Codemode、JS 扩展、Skills 与 `AGENTS.md`；默认启动可选 `tui` feature 交互界面 `jimu [PROMPT]`，同时提供 `-p` 单次非交互、`jimu rpc` / `--mode rpc` JSONL RPC、`jimu acp` ACP v1、`jimu login/logout`） | `stdout` 在 RPC/ACP 模式下仅输出协议 JSON 报文；`--no-default-features` 无头构建必须保持零 `jimu-tui` 依赖 |
+| `apps/jimu` (`jimu`) | 统一 CLI 与宿主入口（所有模式通过共享 `host` + `mcp` + `KitSession` 装配层共用认证、`providers.json`、`settings.json` 含 `mcp_servers`/`status_line`/`show_header`/`extensions`、`--mcp-config`/`--mcp-server`、工具裁剪、延迟网关、Codemode、JS 扩展自动发现、Skills 与 `AGENTS.md`；默认启动可选 `tui` feature 交互界面 `jimu [PROMPT]` 并集成外部 JSON 主题、独立 `status_line` 命令与 `UiModBridge` 异步桥接，同时提供 `-p` 单次非交互、`jimu rpc` / `--mode rpc` JSONL RPC、`jimu acp` ACP v1、`jimu login/logout`） | `stdout` 在 RPC/ACP 模式下仅输出协议 JSON 报文；`--no-default-features` 无头构建必须保持零 `jimu-tui` 依赖 |
 
 ---
 
@@ -75,7 +75,7 @@ Jimu 是面向全端嵌入（Rust / Swift / 跨进程 RPC / 未来其他语言 S
    - **OpenAI Responses / Completions**：同模型保留 `item_id` 与加密推理签名，跨模型切换时自动剥离私有签名降级为纯文本；Completions 工具结果中的图片拆为紧随的用户多模态消息块保留视觉上下文。
    - **助手正文纯净**：严禁往助手 `text` 块拼接长度截断等系统提示，截断一律通过 `StopReason::Length` 表达。
 5. **进程、安全与取消收尾**：
-   - **零孤儿进程**：所有子进程（`exec_command`、`monitor`、stdio MCP）必须独立成进程组，超时、取消或会话关闭时对整个负进程组发送 `SIGKILL` 并回收句柄。
+   - **零孤儿进程**：所有子进程（`exec_command`、`monitor`、stdio MCP、`status_line`）必须独立成进程组，超时、取消或会话关闭时对整个负进程组发送 `SIGKILL` 并回收句柄。
    - **取消收尾义务**：`abort()` 即使在事件流未被外部轮询时也必须推进底层取消收尾，清理未消费的 `steer` 队列，确保紧接着的下一轮调用绝不误报 `Busy`。
    - **网络与文件安全**：Swift `URLSession` 必须使用无痕会话（`ephemeral`、`urlCache = nil`）。`web_fetch` 逐跳检查目标，默认限制为公网访问，仅对域名解析结果放行 `198.18.0.0/15` TUN Fake-IP。ACP 的本地访问许可只覆盖同一协议、主机和端口。IPv4 和 IPv6 链路本地地址始终拦截。本地主机名的解析结果可丢弃 IPv6 链路本地地址，再用剩余地址执行审批和访问。`write`/`edit`/`apply_patch` 遇到软链接时写入真实目标文件而非破坏软链接本身。
 

@@ -17,7 +17,7 @@ pub(super) struct Transcript {
     messages: HashMap<(bool, usize), EntryId>,
     tools: HashMap<String, (EntryId, ToolBlockData)>,
     agents: HashMap<String, EntryId>,
-    pending: Option<(EntryId, String)>,
+    pending: Option<(EntryId, String, String)>,
 }
 
 impl Transcript {
@@ -76,17 +76,25 @@ impl Transcript {
     }
 
     pub fn pending_user_with_submitted(&mut self, display: String, submitted: String) {
-        let id = self.state.add_user(display);
+        let id = self.state.add_user(display.clone());
         self.state.set_pending_user_input(id, true);
-        self.pending = Some((id, submitted));
+        self.pending = Some((id, display, submitted));
     }
 
     fn user(&mut self, text: String, steered: bool) {
         if !steered
-            && self
-                .pending
-                .as_ref()
-                .is_some_and(|(_, draft)| draft == &text)
+            && self.pending.as_ref().is_some_and(|(_, display, draft)| {
+                let draft_trimmed = draft.trim();
+                let leading_stripped = super::image_paste::strip_leading_image_chips(&text);
+                draft == &text
+                    || display == &text
+                    || (!draft_trimmed.is_empty()
+                        && (leading_stripped.trim() == draft_trimmed
+                            || super::image_paste::strip_image_chips_text(&text) == draft_trimmed))
+                    || (draft_trimmed.is_empty()
+                        && leading_stripped.trim().is_empty()
+                        && display.contains("[Image #"))
+            })
         {
             self.finish_pending();
             return;
@@ -102,7 +110,7 @@ impl Transcript {
     }
 
     pub fn finish_pending(&mut self) {
-        if let Some((id, _)) = self.pending.take() {
+        if let Some((id, _, _)) = self.pending.take() {
             self.state.set_pending_user_input(id, false);
         }
     }

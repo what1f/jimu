@@ -33,6 +33,8 @@ pub struct ExecuteToolCallBlock {
     pub bash_mode: bool,
     /// Peeled display form for the header; `command` stays the full source of truth.
     pub header_display: Option<String>,
+    /// Actual tool name (e.g. `exec_command`, `write_stdin`) preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 impl ExecuteToolCallBlock {
     /// Create a new execute block. Pre-completed blocks never get timing; they show `"-"`.
@@ -46,6 +48,7 @@ impl ExecuteToolCallBlock {
             elapsed_ms: None,
             bash_mode: false,
             header_display: None,
+            tool_name: None,
         }
     }
 

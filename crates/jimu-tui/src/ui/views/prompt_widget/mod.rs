@@ -2999,14 +2999,14 @@ impl PromptWidget {
         let mut needs_sep = info.usage_warning.is_some();
         if !info.model_name.is_empty() {
             if needs_sep {
-                left_spans.push(Span::styled(" · ", sep_style));
+                left_spans.push(Span::styled("  ", sep_style));
             }
             left_spans.push(Span::styled(info.model_name, model_style));
             needs_sep = true;
         }
         for flag in info.flags {
             if needs_sep {
-                left_spans.push(Span::styled(" · ", sep_style));
+                left_spans.push(Span::styled("  ", sep_style));
             }
             needs_sep = true;
             let mut style = if let Some(color) = flag.color {

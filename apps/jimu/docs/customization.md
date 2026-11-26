@@ -95,9 +95,96 @@ jimu -p "Search docs" --mcp-server docs=https://example.com/mcp
 jimu --mcp-server fs='{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","."]}'
 ```
 
-## 5. JavaScript Extensions
+## 5. Custom Status Line & Header (`settings.json`)
 
-Load custom tools or lifecycle hooks with `--extension <path>` (file or directory, repeatable):
+Customize the TUI chrome in `~/.jimu/settings.json`:
+
+```json
+{
+  "show_header": false,
+  "status_line": {
+    "command": "~/.jimu/status-line.sh",
+    "refresh_ms": 5000,
+    "timeout_ms": 1500
+  }
+}
+```
+
+- `show_header`: Set `true` to show the built-in 1-row top header bar in fullscreen mode (default `false`).
+- `status_line`: Runs `command` via `sh -c` in the background whenever session state changes (plus optional periodic `refresh_ms`), piping a JSON snapshot to `stdin` and rendering ANSI-colored `stdout` (16-color, 256-color, TrueColor, bold/dim/italic/underline) as the bottom status bar. Exiting with empty/whitespace-only `stdout` clears the cached custom bar and falls back to the built-in status bar.
+
+### `status_line` Stdin JSON Schema
+
+```json
+{
+  "version": "0.1.0",
+  "session_id": "...",
+  "transcript_path": "/path/to/session.jsonl",
+  "model": { "id": "gpt-5.4", "display_name": "GPT-5.4" },
+  "workspace": { "current_dir": "/path/to/cwd", "project_dir": "/path/to/project" },
+  "git_branch": "main",
+  "context_window": {
+    "context_window_size": 200000,
+    "used_percentage": 12.3,
+    "current_usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0
+    }
+  },
+  "cost": { "total_cost_usd": 0.0, "total_duration_ms": 0 },
+  "effort": "high",
+  "fast_mode": false,
+  "permission_mode": "default",
+  "running": false
+}
+```
+
+Example `~/.jimu/status-line.sh` (using `jq`):
+
+```bash
+#!/usr/bin/env bash
+json=$(cat)
+model=$(jq -r '.model.display_name' <<<"$json")
+branch=$(jq -r '.git_branch' <<<"$json")
+pct=$(jq -r '.context_window.used_percentage' <<<"$json")
+printf '\033[1;36m%s\033[0m  \033[33m%s\033[0m  \033[90mctx %s%%\033[0m\n' "$model" "$branch" "$pct"
+```
+
+## 6. Custom JSON Themes (`~/.jimu/themes/*.json`)
+
+Create personal themes in `~/.jimu/themes/<name>.json` or project-specific themes in `<project>/.jimu/themes/<name>.json` (project themes override personal themes with the same name). Select them with `--theme <name>` or `/theme`:
+
+```json
+{
+  "base": "dark",
+  "colors": {
+    "bg": "#111318",
+    "bg_surface": "#1a1d24",
+    "fg": "#e6edf3",
+    "muted": "#8b949e",
+    "accent": "#58a6ff",
+    "border": "#30363d",
+    "border_focus": "#58a6ff",
+    "error": "#f85149",
+    "success": "#3fb950",
+    "warning": "#d29922"
+  }
+}
+```
+
+- `base` (optional): Any built-in theme (`dark`, `light`, `tokyonight`, `rosepine`, `oscura`, `terminal`, `auto`).
+- Color values accept `#rrggbb`, `#rgb`, `rgb(r,g,b)`, `ansi(n)`, `reset`, or standard ANSI color names.
+
+## 7. JavaScript Extensions & UI Mods
+
+Jimu automatically discovers `.js` extensions across all modes (TUI, `-p`, RPC, ACP) from:
+
+- Personal: `~/.jimu/extensions/*.js`
+- Project: `<project>/.jimu/extensions/*.js` (overrides a same-named personal extension)
+- Explicit entries in `~/.jimu/settings.json` (`"extensions": ["./my-ext.js"]`; relative paths resolve against `~/.jimu/`)
+- CLI flags: `--extension <path>` (file or directory, repeatable; relative paths resolve against the current working directory)
 
 ```bash
 jimu --extension ./extensions/my-tools.js
@@ -107,6 +194,7 @@ An extension exports a default function that receives the `jimu` API:
 
 ```javascript
 export default function (jimu) {
+  // 1. Register custom tools
   jimu.registerTool({
     name: "hello",
     description: "Return a friendly greeting",
@@ -117,22 +205,41 @@ export default function (jimu) {
       },
       required: ["name"],
     },
-    execute(args) {
+    execute(_id, args) {
       return `Hello, ${args.name}!`;
     },
   });
 
+  // 2. Intercept agent lifecycle hooks
   jimu.on("before_tool_call", (ctx) => {
-    // Inspect or block tool calls if needed
     return undefined;
+  });
+
+  // 3. Optional TUI theme overrides & declarative UI mods (ignored in headless modes)
+  jimu.ui.theme({ accent: "#7aa2f7" });
+
+  jimu.on("ui.render", (e, next) => {
+    if (e.component === "StatusLine") {
+      return jimu.ui.row({ gap: 1 }, [
+        next(e),
+        jimu.ui.text("[team]", { color: "accent_success", bold: true }),
+      ]);
+    }
+    if (e.component === "AbovePrompt" && e.props.running) {
+      return jimu.ui.text("Working...", { color: "warning", dim: true });
+    }
+    return next(e);
   });
 }
 ```
 
-Available hook events for `jimu.on(event, handler)`:
-`prepare_request`, `transform_context`, `before_tool_call`, `after_tool_call`, `finish_turn`.
+- **Agent hook events** (`jimu.on(event, handler)`): `prepare_request`, `transform_context`, `before_tool_call`, `after_tool_call`, `finish_turn`.
+- **UI Mod slots** (`jimu.on("ui.render", (e, next) => ...)`): `StatusLine`, `AbovePrompt`, `Header`, `Footer`, `UserMessage`, `ToolRow`, `Spinner`.
+  - Call `next(e)` inside `jimu.ui.box(...)` / `jimu.ui.row(...)` to wrap native rendering without losing syntax highlighting, image chips, or diffs; omit `next(e)` to replace a slot completely.
+  - Pure-data node builders: `jimu.ui.text(str, style)`, `jimu.ui.box(props, children)`, `jimu.ui.row(props, children)`, `jimu.ui.divider(style)`, `jimu.ui.native()`, `jimu.ui.theme(overrides)`, and `jimu.ui.invalidate()`.
+  - Run `/reload` in the TUI to hot-reload edited extensions, UI mods, and custom themes without restarting.
 
-## 6. Editor Integration (`jimu acp`)
+## 8. Editor Integration (`jimu acp`)
 
 Connect Jimu to any editor that supports the Agent Client Protocol (ACP)—such as **Zed**, **JetBrains IDEs**, or **Neovim**.
 
@@ -151,7 +258,7 @@ Example **Zed** (`settings.json`):
 
 MCP servers configured by your editor are attached automatically in ACP mode. You can pass any shared flags (such as `--provider`, `-m`, `--thinking`, `--tools`, or `--permission-mode`) after `acp`.
 
-## 7. Cross-Process Automation (`jimu rpc`)
+## 9. Cross-Process Automation (`jimu rpc`)
 
 For external apps or scripts that want persistent, streaming control over a session via newline-delimited JSON on stdin/stdout:
 

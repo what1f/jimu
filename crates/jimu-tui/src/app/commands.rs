@@ -155,23 +155,45 @@ impl TuiApp {
     }
 
     pub(super) fn theme_command(&mut self, name: &str) {
-        if name.is_empty() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
             let current = self.config.theme_kind;
-            let options = std::iter::once(&ThemeKind::Auto)
+            let active_custom = self.active_custom_theme.as_deref();
+            let mut options: Vec<(String, String)> = std::iter::once(&ThemeKind::Auto)
                 .chain(ThemeKind::selectable())
                 .map(|k| {
-                    let marker = if *k == current { "● " } else { "  " };
+                    let marker = if active_custom.is_none() && *k == current {
+                        "● "
+                    } else {
+                        "  "
+                    };
                     (
                         k.display_name().into(),
                         format!("{marker}{}", k.display_name()),
                     )
                 })
                 .collect();
+            for custom_name in self.config.custom_themes.keys() {
+                let marker = if active_custom == Some(custom_name.as_str()) {
+                    "● "
+                } else {
+                    "  "
+                };
+                options.push((custom_name.clone(), format!("{marker}{custom_name}")));
+            }
             self.open_picker("Color theme", PickerTarget::Theme, options);
-        } else if let Some(kind) = ThemeKind::from_name(name.trim()) {
+        } else if let Some((key, _)) = self.find_custom_theme(trimmed) {
+            self.apply_custom_theme(key.clone());
+            if let Some(cb) = &self.config.on_theme_name_change {
+                cb(&key);
+            }
+        } else if let Some(kind) = ThemeKind::from_name(trimmed) {
             self.apply_theme(kind);
             if let Some(cb) = &self.config.on_theme_change {
                 cb(kind);
+            }
+            if let Some(cb) = &self.config.on_theme_name_change {
+                cb(kind.display_name());
             }
         } else {
             self.history.notice(
@@ -251,12 +273,23 @@ impl TuiApp {
             }
             "theme" => {
                 let current = self.config.theme_kind;
+                let active_custom = self.active_custom_theme.as_deref();
                 for kind in std::iter::once(&ThemeKind::Auto).chain(ThemeKind::selectable()) {
                     let name = kind.display_name();
                     if fuzzy_subseq(name, query) {
                         out.push(CompletionItem {
                             token: name.to_owned(),
-                            description: (*kind == current).then(|| "●".to_owned()),
+                            description: (active_custom.is_none() && *kind == current)
+                                .then(|| "●".to_owned()),
+                        });
+                    }
+                }
+                for custom_name in self.config.custom_themes.keys() {
+                    if fuzzy_subseq(custom_name, query) {
+                        out.push(CompletionItem {
+                            token: custom_name.clone(),
+                            description: (active_custom == Some(custom_name.as_str()))
+                                .then(|| "●".to_owned()),
                         });
                     }
                 }
@@ -816,12 +849,9 @@ impl TuiApp {
                 if let Err(err) = c.set_thinking_level(&level).await {
                     return Outcome::Result(Err(err));
                 }
-                ctrl.push_notice(
-                    NoticeLevel::Info,
-                    format!("Model: {model}  Effort: {level}"),
-                );
+                ctrl.show_toast(format!("{model}  {level}"));
             } else {
-                ctrl.push_notice(NoticeLevel::Info, format!("Model: {model}"));
+                ctrl.show_toast(model);
             }
             Outcome::Done
         }));
@@ -839,7 +869,7 @@ impl TuiApp {
                     };
                     let res = c.set_model(&id).await;
                     if res.is_ok() {
-                        ctrl.push_notice(NoticeLevel::Info, format!("Model: {id}"));
+                        ctrl.show_toast(id);
                     }
                     Outcome::Result(res)
                 }));
@@ -852,7 +882,7 @@ impl TuiApp {
                     };
                     let res = c.set_thinking_level(&id).await;
                     if res.is_ok() {
-                        ctrl.push_notice(NoticeLevel::Info, format!("Effort: {id}"));
+                        ctrl.show_toast(format!("Effort {id}"));
                     }
                     Outcome::Result(res)
                 }));

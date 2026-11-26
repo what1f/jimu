@@ -130,6 +130,14 @@ impl HostConfig {
             extra_explicit,
         )
     }
+
+    /// Resolve the full ordered list of QuickJS extension files for a specific workspace `cwd`,
+    /// combining auto-discovered user/project extensions, `settings.json` entries (resolved
+    /// relative to `jimu_home`), and explicit CLI/caller `--extension` paths.
+    pub fn resolve_extension_paths(&self, cwd: &Path) -> Vec<PathBuf> {
+        let saved = crate::settings::UserSettings::load(&self.jimu_home);
+        discover_extension_paths(&self.jimu_home, cwd, &saved.extensions, &self.extensions)
+    }
 }
 
 /// Active-branch preferences restored from a persisted JSONL session.
@@ -733,6 +741,120 @@ pub fn validate_extension_tools(
     Ok(())
 }
 
+/// Discover QuickJS extension files across user (`~/.jimu/extensions/*.js`), project
+/// (`<cwd>/.jimu/extensions/*.js`), `settings.json` (`extensions`, resolved relative to
+/// `jimu_home`), and CLI `--extension` paths (resolved relative to the command-line cwd).
+///
+/// Auto-discovered files are sorted lexicographically by filename with project-level files
+/// overriding same-named user-level files, followed by explicit `settings_extensions` and
+/// `cli_extensions` (directories expanded to their JS entries and deduplicated by canonical path
+/// so the same extension file is never loaded twice).
+pub fn discover_extension_paths(
+    jimu_home: &Path,
+    cwd: &Path,
+    settings_extensions: &[PathBuf],
+    cli_extensions: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> =
+        std::collections::BTreeMap::new();
+
+    let user_dir = jimu_home.join("extensions");
+    let project_dir = cwd.join(".jimu").join("extensions");
+
+    let mut auto_dirs = vec![user_dir.clone()];
+    if !paths_same_dir(&user_dir, &project_dir) {
+        auto_dirs.push(project_dir);
+    }
+
+    for dir in auto_dirs {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = read_dir
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && is_js_extension_file(path))
+            .collect();
+        files.sort();
+        for path in files {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                by_name.insert(name.to_owned(), path);
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut push_unique = |path: PathBuf| {
+        let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            result.push(path);
+        }
+    };
+
+    for (_, path) in by_name {
+        push_unique(path);
+    }
+    for raw in settings_extensions {
+        let resolved = expand_user_path(raw, jimu_home);
+        push_expanded_extension_path(resolved, &mut push_unique);
+    }
+    for path in cli_extensions {
+        push_expanded_extension_path(path.clone(), &mut push_unique);
+    }
+
+    result
+}
+
+fn is_js_extension_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("mjs"))
+}
+
+fn push_expanded_extension_path(path: PathBuf, push_unique: &mut impl FnMut(PathBuf)) {
+    if path.is_dir() {
+        let Ok(read_dir) = fs::read_dir(&path) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in read_dir.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_file() && is_js_extension_file(&entry_path) {
+                files.push(entry_path);
+            } else if entry_path.is_dir() {
+                let index_js = entry_path.join("index.js");
+                let index_mjs = entry_path.join("index.mjs");
+                if index_js.is_file() {
+                    files.push(index_js);
+                } else if index_mjs.is_file() {
+                    files.push(index_mjs);
+                }
+            }
+        }
+        files.sort();
+        for file in files {
+            push_unique(file);
+        }
+    } else {
+        push_unique(path);
+    }
+}
+
+fn expand_user_path(path: &Path, base_dir: &Path) -> PathBuf {
+    if let Some(s) = path.to_str()
+        && let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    if path.is_relative() {
+        base_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Load QuickJS extensions and validate their registered tool names.
 pub fn load_js_extensions(
     paths: &[PathBuf],
@@ -774,15 +896,16 @@ pub fn attach_extensions_to_config(
 }
 
 /// Consistent deferred gateway policy shared by all modes:
-/// expose resident `tool_search` & `call_tool` whenever tools, codemode, extensions, or MCP are
-/// enabled; omit them in pure `--no-tools` chat-only runs.
+/// expose resident `tool_search` & `call_tool` whenever built-in tools, codemode, extension
+/// tools, or MCP are enabled; omit them in pure `--no-tools` chat-only runs (including runs that
+/// only load UI-only / hook-only JS extensions with zero registered tools).
 pub fn should_enable_deferred_gateway(
     selection: &ToolSelection,
     enable_codemode: bool,
-    has_extensions: bool,
+    has_extension_tools: bool,
     has_mcp: bool,
 ) -> bool {
-    !selection.is_empty() || enable_codemode || has_extensions || has_mcp
+    !selection.is_empty() || enable_codemode || has_extension_tools || has_mcp
 }
 
 /// Materialize built-in user docs (when `read` is enabled and no custom prompt was provided) and

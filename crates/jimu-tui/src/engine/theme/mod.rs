@@ -23,7 +23,93 @@ pub mod tokyonight;
 pub use color_support::quantize;
 pub use tokyonight::{Theme, pulse_brightness, wave_brightness};
 
+use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
+
+/// Declarative color overrides layered on top of a built-in base theme.
+///
+/// Colors accept `#rrggbb`, `#rgb`, `rgb(r,g,b)`, `ansi(n)` / `indexed(n)`, `reset` / `default`,
+/// and standard ANSI color names (`red`, `bright_blue`, `dark_gray`, etc.).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemeOverrides {
+    #[serde(default)]
+    pub base: Option<String>,
+    #[serde(default)]
+    pub colors: BTreeMap<String, String>,
+}
+
+/// Parse a CSS-like hex color (`#rrggbb` / `#rgb`), `rgb(r,g,b)`, `ansi(n)`, or standard ANSI name.
+pub fn parse_color(spec: &str) -> Option<Color> {
+    let raw = spec.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(hex) = raw.strip_prefix('#') {
+        if !hex.is_ascii() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return match hex.len() {
+            6 => {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                Some(Color::Rgb(r, g, b))
+            }
+            3 => {
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+                Some(Color::Rgb(r * 17, g * 17, b * 17))
+            }
+            _ => None,
+        };
+    }
+    let lower = raw.to_ascii_lowercase();
+    if let Some(inner) = lower.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+        let mut parts = inner.split(',').map(|p| p.trim().parse::<u8>().ok());
+        let r = parts.next()??;
+        let g = parts.next()??;
+        let b = parts.next()??;
+        if parts.next().is_none() {
+            return Some(Color::Rgb(r, g, b));
+        }
+        return None;
+    }
+    if let Some(inner) = lower
+        .strip_prefix("ansi(")
+        .or_else(|| lower.strip_prefix("indexed("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        return inner.trim().parse::<u8>().ok().map(Color::Indexed);
+    }
+    let normalized = lower.replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "reset" | "default" | "none" | "transparent" => Some(Color::Reset),
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" | "purple" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "gray" | "grey" => Some(Color::Gray),
+        "dark_gray" | "dark_grey" | "darkgray" | "darkgrey" | "bright_black" => {
+            Some(Color::DarkGray)
+        }
+        "light_red" | "bright_red" => Some(Color::LightRed),
+        "light_green" | "bright_green" => Some(Color::LightGreen),
+        "light_yellow" | "bright_yellow" => Some(Color::LightYellow),
+        "light_blue" | "bright_blue" => Some(Color::LightBlue),
+        "light_magenta" | "bright_magenta" | "light_purple" | "bright_purple" => {
+            Some(Color::LightMagenta)
+        }
+        "light_cyan" | "bright_cyan" => Some(Color::LightCyan),
+        "white" | "bright_white" | "light_white" => Some(Color::White),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThemeKind {
@@ -297,21 +383,23 @@ impl Theme {
             return Self::terminal_default().quantized(level);
         }
         let kind = cache::current_kind();
-        // Before polarity adaptations: contrast boost and ANSI16 overrides would paint opaque bgs over `Reset`.
-        if kind.is_terminal_native() {
-            return Self::terminal().quantized(level);
-        }
-        let base = match kind {
-            ThemeKind::Dark => Self::dark(),
-            ThemeKind::TokyoNight => Self::tokyonight(),
-            ThemeKind::Light => Self::light(),
-            ThemeKind::RosePineMoon => Self::rosepine_moon(),
-            ThemeKind::OscuraMidnight => Self::oscura_midnight(),
-            // Handled by the early return above.
-            ThemeKind::Terminal => Self::terminal(),
-            // Auto is resolved to a concrete theme before being stored; if reached, fall back to Dark
-            ThemeKind::Auto => Self::dark(),
+        let overrides = cache::current_overrides();
+        let effective_base_kind = overrides
+            .as_ref()
+            .and_then(|o| o.base.as_deref())
+            .and_then(ThemeKind::from_name)
+            .filter(|k| !k.is_auto())
+            .unwrap_or(kind);
+        let base = Self::for_kind(kind);
+        let base = if let Some(overrides) = overrides.as_ref() {
+            base.apply_overrides_raw(overrides)
+        } else {
+            base
         };
+        // Before polarity adaptations: contrast boost and ANSI16 overrides would paint opaque bgs over `Reset`.
+        if effective_base_kind.is_terminal_native() {
+            return base.quantized(level);
+        }
         // Sample polarity before quantizing
         // After quantization `bg_base` may land on a named or indexed entry whose luminance depends on the host palette
         let dark = base.is_dark();
@@ -332,6 +420,145 @@ impl Theme {
         } else {
             adapted
         }
+    }
+
+    /// Return the unquantized palette for a concrete [`ThemeKind`].
+    pub fn for_kind(kind: ThemeKind) -> Self {
+        match kind {
+            ThemeKind::Dark => Self::dark(),
+            ThemeKind::TokyoNight => Self::tokyonight(),
+            ThemeKind::Light => Self::light(),
+            ThemeKind::RosePineMoon => Self::rosepine_moon(),
+            ThemeKind::OscuraMidnight => Self::oscura_midnight(),
+            ThemeKind::Terminal => Self::terminal(),
+            ThemeKind::Auto => Self::dark(),
+        }
+    }
+
+    /// Apply [`ThemeOverrides`] on top of `self` (or `overrides.base` when specified) and quantize
+    /// to the active terminal color capability.
+    #[must_use]
+    pub fn with_overrides(&self, overrides: &ThemeOverrides) -> Self {
+        self.apply_overrides_raw(overrides)
+            .quantized(color_support::detect())
+    }
+
+    fn apply_overrides_raw(&self, overrides: &ThemeOverrides) -> Self {
+        let mut theme = match overrides.base.as_deref().and_then(ThemeKind::from_name) {
+            Some(ThemeKind::Auto) | None => *self,
+            Some(kind) => Self::for_kind(kind),
+        };
+
+        let parsed: Vec<(String, Color)> = overrides
+            .colors
+            .iter()
+            .filter_map(|(k, v)| {
+                let color = parse_color(v)?;
+                let key = k.trim().to_ascii_lowercase().replace('-', "_");
+                Some((key, color))
+            })
+            .collect();
+
+        // Pass 1: semantic group aliases so explicit field keys in pass 2 always win.
+        for (key, color) in &parsed {
+            let color = *color;
+            match key.as_str() {
+                "bg" => theme.bg_base = color,
+                "bg_surface" | "surface" => {
+                    theme.bg_light = color;
+                    theme.bg_dark = color;
+                }
+                "fg" => {
+                    theme.text_primary = color;
+                    theme.md_text = color;
+                }
+                "text_muted" | "muted" => {
+                    theme.gray = color;
+                    theme.md_muted = color;
+                }
+                "dim" => theme.gray_dim = color,
+                "accent_primary" | "accent" => {
+                    theme.accent_user = color;
+                    theme.accent_model = color;
+                    theme.prompt_border_active = color;
+                }
+                "border" => theme.prompt_border = color,
+                "border_focus" => theme.prompt_border_active = color,
+                "accent_warning" => theme.warning = color,
+                "error" => theme.accent_error = color,
+                "success" => theme.accent_success = color,
+                _ => {}
+            }
+        }
+
+        // Pass 2: exact field names.
+        for (key, color) in parsed {
+            match key.as_str() {
+                "bg_base" => theme.bg_base = color,
+                "bg_light" => theme.bg_light = color,
+                "bg_dark" => theme.bg_dark = color,
+                "bg_highlight" => theme.bg_highlight = color,
+                "bg_hover" => theme.bg_hover = color,
+                "bg_terminal" => theme.bg_terminal = color,
+                "bg_visual" => theme.bg_visual = color,
+                "accent_user" => theme.accent_user = color,
+                "accent_assistant" => theme.accent_assistant = color,
+                "accent_thinking" => theme.accent_thinking = color,
+                "accent_tool" => theme.accent_tool = color,
+                "accent_system" => theme.accent_system = color,
+                "accent_error" => theme.accent_error = color,
+                "accent_success" => theme.accent_success = color,
+                "accent_running" => theme.accent_running = color,
+                "accent_skill" => theme.accent_skill = color,
+                "accent_plan" => theme.accent_plan = color,
+                "accent_verify" => theme.accent_verify = color,
+                "accent_remember" => theme.accent_remember = color,
+                "accent_model" => theme.accent_model = color,
+                "text_primary" => {
+                    theme.text_primary = color;
+                    theme.md_text = color;
+                }
+                "text_secondary" => theme.text_secondary = color,
+                "gray_dim" => theme.gray_dim = color,
+                "gray" => theme.gray = color,
+                "gray_bright" => theme.gray_bright = color,
+                "command" => theme.command = color,
+                "path" => theme.path = color,
+                "running" => theme.running = color,
+                "warning" => theme.warning = color,
+                "fuzzy_accent" => theme.fuzzy_accent = color,
+                "selection_border" => theme.selection_border = color,
+                "hover_border" => theme.hover_border = color,
+                "prompt_border" => theme.prompt_border = color,
+                "prompt_border_active" => theme.prompt_border_active = color,
+                "scrollbar_bg" => theme.scrollbar_bg = color,
+                "scrollbar_fg" => theme.scrollbar_fg = color,
+                "diff_delete_bg" => theme.diff_delete_bg = color,
+                "diff_delete_fg" => theme.diff_delete_fg = color,
+                "diff_insert_bg" => theme.diff_insert_bg = color,
+                "diff_insert_fg" => theme.diff_insert_fg = color,
+                "diff_equal_fg" => theme.diff_equal_fg = color,
+                "diff_gutter_fg" => theme.diff_gutter_fg = color,
+                "paste_bg" => theme.paste_bg = color,
+                "paste_fg" => theme.paste_fg = color,
+                "paste_dim" => theme.paste_dim = color,
+                "md_heading_h1" => theme.md_heading_h1 = color,
+                "md_heading_h2" => theme.md_heading_h2 = color,
+                "md_heading_h3" => theme.md_heading_h3 = color,
+                "md_heading_h4" => theme.md_heading_h4 = color,
+                "md_heading_h5" => theme.md_heading_h5 = color,
+                "md_heading_h6" => theme.md_heading_h6 = color,
+                "md_code" => theme.md_code = color,
+                "md_code_bg" => theme.md_code_bg = color,
+                "md_task_checked" => theme.md_task_checked = color,
+                "md_task_unchecked" => theme.md_task_unchecked = color,
+                "md_muted" => theme.md_muted = color,
+                "md_text" => theme.md_text = color,
+                "link_fg" => theme.link_fg = color,
+                _ => {}
+            }
+        }
+        theme
     }
 
     pub fn current_kind() -> ThemeKind {

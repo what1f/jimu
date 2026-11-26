@@ -801,6 +801,8 @@ pub struct EditToolCallBlock {
     pub highlight: EditHighlightPhase,
     /// Whether this ordinary edit targets a memory v2 scope.
     pub is_memory_activity: bool,
+    /// Actual tool name (e.g. `apply_patch`, `write`, `edit`) preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 fn workflow_script_name(path: &str) -> Option<String> {
@@ -843,6 +845,7 @@ impl EditToolCallBlock {
             change_counts,
             highlight: EditHighlightPhase::HunkOnly,
             is_memory_activity: false,
+            tool_name: None,
         }
     }
 

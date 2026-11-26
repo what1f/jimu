@@ -35,6 +35,8 @@ pub struct WebSearchToolCallBlock {
     pub label: Option<String>,
     /// True for X search (backend); suppresses the content body since structured post results are not exposed to the TUI client.
     pub is_x_search: bool,
+    /// Actual tool name preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 impl WebSearchToolCallBlock {
@@ -48,6 +50,7 @@ impl WebSearchToolCallBlock {
             elapsed_ms: None,
             label: None,
             is_x_search: false,
+            tool_name: None,
         }
     }
 

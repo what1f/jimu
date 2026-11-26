@@ -465,9 +465,54 @@ impl ToolCallBlock {
         }
     }
 
+    /// Preserve the actual tool call name (e.g. `apply_patch`, `write`, `write_stdin`) for
+    /// [`crate::harness::ToolRowView`] without changing the rendered card variant.
+    pub fn set_tool_name(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if name.is_empty() {
+            return;
+        }
+        match self {
+            ToolCallBlock::Execute(b) => b.tool_name = Some(name),
+            ToolCallBlock::Read(b) => b.tool_name = Some(name),
+            ToolCallBlock::Edit(b) => b.tool_name = Some(name),
+            ToolCallBlock::ListDir(b) => b.tool_name = Some(name),
+            ToolCallBlock::Search(b) => b.tool_name = Some(name),
+            ToolCallBlock::WebFetch(b) => b.tool_name = Some(name),
+            ToolCallBlock::WebSearch(b) => b.tool_name = Some(name),
+            ToolCallBlock::IntegrationSearch(b) => b.tool_name = Some(name),
+            ToolCallBlock::UseTool(b) => {
+                if b.tool_name.is_empty() {
+                    b.tool_name = name;
+                }
+            }
+            ToolCallBlock::MemorySearch(b) => b.tool_name = Some(name),
+            ToolCallBlock::SentMessage(b) => b.tool_name = Some(name),
+            ToolCallBlock::Skill(_) | ToolCallBlock::Other(_) => {}
+        }
+    }
+
+    /// Actual tool name for this tool row (used by [`crate::harness::ToolRowView`]).
+    pub fn tool_name(&self) -> &str {
+        match self {
+            ToolCallBlock::Execute(b) => b.tool_name.as_deref().unwrap_or("exec_command"),
+            ToolCallBlock::Read(b) => b.tool_name.as_deref().unwrap_or("read"),
+            ToolCallBlock::Edit(b) => b.tool_name.as_deref().unwrap_or("edit"),
+            ToolCallBlock::ListDir(b) => b.tool_name.as_deref().unwrap_or("list_dir"),
+            ToolCallBlock::Search(b) => b.tool_name.as_deref().unwrap_or("search"),
+            ToolCallBlock::WebFetch(b) => b.tool_name.as_deref().unwrap_or("web_fetch"),
+            ToolCallBlock::WebSearch(b) => b.tool_name.as_deref().unwrap_or("web_search"),
+            ToolCallBlock::IntegrationSearch(b) => b.tool_name.as_deref().unwrap_or("tool_search"),
+            ToolCallBlock::UseTool(b) => &b.tool_name,
+            ToolCallBlock::MemorySearch(b) => b.tool_name.as_deref().unwrap_or("memory_search"),
+            ToolCallBlock::SentMessage(b) => b.tool_name.as_deref().unwrap_or("send_message"),
+            ToolCallBlock::Skill(b) | ToolCallBlock::Other(b) => &b.name,
+        }
+    }
+
     /// Create from tool name string (for parsing ACP tool calls).
     pub fn from_name(name: &str, summary: impl Into<String>) -> Self {
-        match name.to_lowercase().as_str() {
+        let mut block = match name.to_lowercase().as_str() {
             "run_terminal_command"
             | "run_terminal_cmd"
             | "exec_command"
@@ -494,7 +539,9 @@ impl ToolCallBlock {
             "use_tool" | "call_tool" => ToolCallBlock::UseTool(UseToolCallBlock::new(summary)),
             "skill" => ToolCallBlock::Skill(OtherToolCallBlock::new("Skill", summary)),
             _ => ToolCallBlock::Other(OtherToolCallBlock::new(name, summary)),
-        }
+        };
+        block.set_tool_name(name);
+        block
     }
 
     /// Full stored SOURCE text of this tool call for full-text scrollback search.

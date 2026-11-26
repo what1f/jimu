@@ -110,7 +110,7 @@ SESSION & WORKSPACE OPTIONS:
   --compact-tokens <u32>    Output reserve tokens for auto-compaction threshold
   --permission-mode <mode>  Initial permission mode: default | acceptEdits | bypassPermissions
   --system-prompt <text>    Override base system instructions
-  --theme <name>            TUI color theme: auto | dark | light | tokyonight | rosepine | oscura | terminal
+  --theme <name>            TUI color theme (built-in or custom JSON theme in ~/.jimu/themes/)
 
 GENERAL:
   -h, --help                Show this help message

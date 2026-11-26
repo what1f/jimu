@@ -18,7 +18,9 @@ pub use capabilities::{
 };
 pub use chrome::{
     AutocompleteProvider, ChromeConfig, ChromeSlots, ChromeState, CombinedAutocompleteProvider,
-    CompletionItem, SlashCommand, SlashContext, TuiController, UiText, is_valid_slash_query,
+    CompletionItem, SlashCommand, SlashContext, SurfaceDecoration, ToolRowView, TuiController,
+    UiText, is_valid_slash_query, render_default_status_line,
+    render_default_status_line_with_spinner,
 };
 pub use tools::{ToolOutput, ToolRenderer, ToolRendererRegistry, ToolView};
 

@@ -240,7 +240,8 @@ impl RpcRuntime {
         let mcp_hub = Arc::new(mcp_hub);
 
         // Load QuickJS extensions once so hooks and reload_extensions share one runtime.
-        let loaded_extensions = match load_js_extensions(&host.extensions, &HashSet::new()) {
+        let extension_paths = host.resolve_extension_paths(&session_cwd);
+        let loaded_extensions = match load_js_extensions(&extension_paths, &HashSet::new()) {
             Ok(ext) => ext,
             Err(err) => {
                 mcp_hub.shutdown().await;
@@ -1751,20 +1752,24 @@ async fn build_kit_session(
     cfg.tools
         .extend(built_tools.tools.iter().cloned().map(KitToolSpec::resident));
 
-    let has_extensions = if let Some(rt) = js_runtime {
+    let has_extension_tools = if let Some(rt) = js_runtime {
         let loaded = jimu::host::LoadedExtensions {
             runtime: Arc::clone(rt),
             tools: rt.tools(),
         };
         attach_extensions_to_config(&mut cfg, &loaded)?;
-        true
+        !loaded.tools.is_empty()
     } else {
         false
     };
 
     let has_mcp = !mcp_hub.is_empty();
-    cfg.enable_deferred_gateway =
-        should_enable_deferred_gateway(&host.tools, host.enable_codemode, has_extensions, has_mcp);
+    cfg.enable_deferred_gateway = should_enable_deferred_gateway(
+        &host.tools,
+        host.enable_codemode,
+        has_extension_tools,
+        has_mcp,
+    );
     let has_tools = !cfg.tools.is_empty() || host.enable_codemode || has_mcp;
     cfg.system_prompt = resolve_system_prompt(
         host.system_prompt.as_deref(),

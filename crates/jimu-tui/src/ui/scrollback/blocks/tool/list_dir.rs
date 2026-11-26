@@ -21,6 +21,8 @@ pub struct ListDirToolCallBlock {
     pub elapsed_ms: Option<i64>,
     /// Whether this ordinary list targets a memory v2 scope.
     pub is_memory_activity: bool,
+    /// Actual tool name preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 impl ListDirToolCallBlock {
@@ -34,6 +36,7 @@ impl ListDirToolCallBlock {
             started_at: None,
             elapsed_ms: None,
             is_memory_activity: false,
+            tool_name: None,
         }
     }
 

@@ -26,9 +26,9 @@ Jimu is a coding assistant that runs in your terminal, scripts, and code editors
 
 Read the topic you need:
 
-- **`usage.md`** — Interactive terminal guide, CLI flags, one-shot mode (`-p`), sessions (`-c` / `-r`), slash commands, keyboard shortcuts, rewind & branching, permission modes, and themes.
+- **`usage.md`** — Interactive terminal guide, CLI flags, one-shot mode (`-p`), sessions (`-c` / `-r`), pasting images (`[Image #N]`), bottom status bar, slash commands (`/reload`, `/theme`, etc.), keyboard shortcuts, rewind & branching, and permission modes.
 - **`models.md`** — Signing in (`jimu login`), environment variable API keys, built-in provider presets, thinking levels, fast mode, and global provider/model setup (`~/.jimu/providers.json`).
-- **`customization.md`** — Project instructions (`AGENTS.md`), reusable skills (`SKILL.md`), choosing which tools are enabled, JavaScript extensions (`--extension`), editor integration (`jimu acp`), and automation (`jimu rpc`).
+- **`customization.md`** — Project instructions (`AGENTS.md`), reusable skills (`SKILL.md`), choosing which tools are enabled, custom `status_line` scripts, JSON themes (`~/.jimu/themes/`), JavaScript extensions & UI mods (`~/.jimu/extensions/`), editor integration (`jimu acp`), and automation (`jimu rpc`).
 
 ## Where Jimu Stores Files
 
@@ -36,7 +36,9 @@ By default, Jimu stores user data in `~/.jimu` (override with `--jimu-home <dir>
 
 - `~/.jimu/auth.json` — Stored login credentials
 - `~/.jimu/providers.json` — Global providers and models (shared across TUI, `-p`, RPC, and ACP)
-- `~/.jimu/settings.json` — Saved default model, effort, permission mode, theme, fast mode, and global `mcp_servers`
+- `~/.jimu/settings.json` — Saved defaults (model, effort, permission mode, theme, fast mode, `show_header`, `status_line`, `extensions`, and global `mcp_servers`)
+- `~/.jimu/themes/` — Personal JSON color themes (`*.json`)
+- `~/.jimu/extensions/` — Auto-loaded personal JavaScript extensions & UI mods (`*.js`)
 - `~/.jimu/sessions/` — Unified conversation histories (shared across TUI, RPC, and ACP)
 - `~/.jimu/skills/` — Personal skills
 - `~/.jimu/AGENTS.md` — Personal instructions applied across projects

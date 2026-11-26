@@ -220,7 +220,22 @@ let chat_history = session.visible_messages();
 - `before_tool_call`：拦截敏感工具（如 `exec_command` / `write` / `apply_patch`）弹出用户确认，拒绝时设 `block: true` 返回原因，也可通过 `args_override` 改写参数。
 - `after_tool_call`：统一扫描工具输出文本，对注入过的 API Key / 凭证做打码脱敏，或将超长输出落盘截断。
 
-## 7. Rust 原生终端入口
+---
+
+## 7. QuickJS 动态扩展与纯数据 UI Mod（`jimu-js`）
+
+`jimu-js` 在纯解释模式 QuickJS VM 中加载用户扩展脚本，支持注册自定义工具、5 阶 Agent 生命周期钩子、热重载（`reload` / `reload_excluding`），以及**完全终端/平台无关的纯数据 UI Mod 协议**：
+
+- **JS 扩展 API**：
+  - `jimu.registerTool(spec)` / `jimu.on(hook, fn)`（`prepare_request`、`transform_context`、`before_tool_call`、`after_tool_call`、`finish_turn`）。
+  - `jimu.ui.theme(overrides)`：声明主题色 token 覆盖，宿主通过 `runtime.ui_theme_overrides()` 读取并注入渲染层。
+  - `jimu.on("ui.render", (e, next) => ...)`：同步洋葱链拦截器，覆盖 `UiComponent`（`StatusLine` / `AbovePrompt` / `Header` / `Footer` / `UserMessage` / `ToolRow` / `Spinner`）；返回纯数据 `UiNode`（`Native` / `Text` / `Box` / `Divider`，可通过 `jimu.ui.text/box/row/divider/native` 构造），内置深度（`MAX_UI_NODE_DEPTH`）、节点数（`MAX_UI_NODE_COUNT`）与单次渲染超时（`DEFAULT_UI_RENDER_TIMEOUT_MS`）硬上限。
+  - `jimu.ui.invalidate()`：递增无锁版本号 `runtime.ui_generation()`，通知交互宿主刷新 UI 缓存。
+- **无头零开销契约**：`jimu-js` 不依赖任何终端或 GUI 库；当无扩展注册 `ui.render`（`!runtime.has_ui_render()`）或运行在无头宿主（RPC / ACP / `-p` / 服务端）时，绝不进入 QuickJS UI 渲染分支，工具与 Agent Hook 正常运行、零额外开销。交互宿主（如 `apps/jimu` TUI）通过异步缓存任务调用 `runtime.render_ui(component, props, DEFAULT_UI_RENDER_TIMEOUT_MS)` 并在渲染热路径只做 O(1) 缓存读取。
+
+---
+
+## 8. Rust 原生终端入口
 
 将现有 `KitSession` 包装为 `JimuHarness` 交给 `TuiApp`（需启用 `jimu-tui` 的 `jimu` feature；不启用时 `jimu-tui` 零 `jimu-*` 依赖，可直接对接其他自定义 Harness）：
 

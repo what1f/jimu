@@ -80,6 +80,61 @@ fn token_styled_line(
     Line::from(spans)
 }
 
+/// Find byte ranges of `[Image #N]` placeholders inside `line_text`.
+fn find_image_chip_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let bytes = text.as_bytes();
+    let needle = b"[Image #";
+    let mut pos = 0;
+    while pos + needle.len() < bytes.len() {
+        let Some(rel) = text[pos..].find("[Image #") else {
+            break;
+        };
+        let start = pos + rel;
+        let after = start + needle.len();
+        let mut idx = after;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx > after && idx < bytes.len() && bytes[idx] == b']' {
+            ranges.push(start..idx + 1);
+            pos = idx + 1;
+        } else {
+            pos = after;
+        }
+    }
+    ranges
+}
+
+/// Apply `[Image #N]` chip styling on top of an already-styled `Line`.
+fn style_image_chips_in_line(line: Line<'static>, chip_style: Style) -> Line<'static> {
+    let mut out_spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let ranges = find_image_chip_ranges(&span.content);
+        if ranges.is_empty() {
+            out_spans.push(span);
+            continue;
+        }
+        let base_style = span.style;
+        let text = span.content.as_ref();
+        let mut pos = 0;
+        for range in ranges {
+            if range.start > pos {
+                out_spans.push(Span::styled(text[pos..range.start].to_string(), base_style));
+            }
+            out_spans.push(Span::styled(
+                text[range.start..range.end].to_string(),
+                chip_style,
+            ));
+            pos = range.end;
+        }
+        if pos < text.len() {
+            out_spans.push(Span::styled(text[pos..].to_string(), base_style));
+        }
+    }
+    Line::from(out_spans)
+}
+
 #[derive(Debug, Clone)]
 pub struct UserPromptBlock {
     pub text: String,
@@ -112,6 +167,11 @@ impl UserPromptBlock {
 
     pub fn copy_text(&self) -> String {
         self.text.clone()
+    }
+
+    /// Number of `[Image #N]` attachment chips present in this prompt's display text.
+    pub fn image_chip_count(&self) -> usize {
+        find_image_chip_ranges(&self.text).len()
     }
 
     pub fn bash(text: impl Into<String>) -> Self {
@@ -341,6 +401,14 @@ impl UserPromptBlock {
                     text_style,
                 )
             };
+            let chip_style = if terminal_native || attribute_emphasis {
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.paste_fg).bg(theme.paste_bg)
+            };
+            let content_line = style_image_chips_in_line(content_line, chip_style);
             let (wrapped, wrap_joiners) =
                 word_wrap_line_with_joiners(&content_line, RtOptions::new(base_content_width));
             let wrapped_count = wrapped.len();

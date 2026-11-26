@@ -46,14 +46,14 @@ flowchart TD
         Swift["swift/JimuKit (Swift 6 Actor SDK)"]
         FFI["jimu-ffi (C-ABI 静态库桥接，零 reqwest/rustls)"]
         TUI["jimu-tui (框架中立双屏 TUI + 可选 jimu 原生适配器)"]
-        CLI["apps/jimu (统一无头二进制 jimu · JSONL RPC · ACP v1 · one-shot)"]
+        CLI["apps/jimu (统一二进制 jimu · 可选 TUI · JSONL RPC · ACP v1 · one-shot)"]
     end
 
     subgraph Runtime["会话组装与扩展层"]
         Kit["jimu-kit (KitSession · Skills · Deferred Tools · MCP · Wakeup Inbox)"]
         Tools["jimu-tools (模块化内置工具箱 + Schema 覆盖)"]
         Durable["jimu-durable (可选单机 SQLite WAL 事务恢复引擎)"]
-        JS["jimu-js (QuickJS 动态扩展与钩子)"]
+        JS["jimu-js (QuickJS 动态扩展 · 钩子 · 纯数据 UI Mod 协议)"]
         CodeMode["jimu-codemode (QuickJS 受限工具编排沙盒)"]
         HTTP["jimu-http (reqwest + rustls + 系统根证书)"]
     end
@@ -120,3 +120,9 @@ flowchart TD
 宿主在注入系统提醒、后台事件唤醒或中途协议纠偏时，无需靠正则过滤 `<system-reminder>` 标签：
 - **底层统一标记**：`UserMessage` 原生携带 `is_meta: bool`（Swift / JSON 兼容 `isMeta`），向模型发请求时完全等同于标准 `user` 消息（不向任何上游模型 API 泄露额外字段，100% 保持缓存前缀字节一致），而对 UI 历史与实时事件天然区分用户发言与系统注入。
 - **全时机覆盖**：所有 `<system-reminder>`（`set_context` / `append_context` / `append_named_context`）、无标签隐藏块（`append_meta`）、自动压缩摘要、后台 `Monitor` 唤醒轮次、独立触发的隐藏轮次（`prompt_meta` / `submit_meta`）以及运行中隐藏插话（`steer_meta` / `follow_up_meta`，不触发面向用户的 `Steered` 气泡事件）均统一标记 `is_meta: true`，`visible_messages()` 与 ACP 历史回放自动过滤。
+
+### 3.6 纯数据 UI Mod 契约与独立 `status_line` 边界
+交互定制采用严格分层，避免把终端库拉进内核或阻塞 TUI 绘制：
+- **`jimu-js` 只产纯数据 `UiNode`**：`jimu.on("ui.render", (e, next) => ...)` 与 `jimu.ui.theme(...)` 仅处理纯 JSON 结构（`Native`/`Text`/`Box`/`Divider`），零 `ratatui`/终端依赖；无头模式（`-p`/RPC/ACP/服务端）加载同一份扩展零副作用。
+- **`apps/jimu` 宿主异步缓存桥接（`UiModBridge`）**：仅在 `#[cfg(feature = "tui")]` 下存在；仅当 `runtime.has_ui_render()` 为真时起后台任务以 Latest-Only 合并执行 `render_ui`，并把洋葱链 `UiNode` 翻译为 `ratatui` `Line` 或 `SurfaceDecoration`（保留原生高亮与 `[Image #N]` 芯片），`ChromeSlots` 渲染热路径永远 O(1) 读内存缓存。
+- **独立外部 `status_line` 命令（`StatusLineRunner`）**：归属于 `apps/jimu` 宿主配置（`settings.json`），不侵入 `jimu-tui` 或 `jimu-js`；子进程以独立进程组在后台执行（stdin 喂标准状态 JSON、stdout 完整解析 ANSI SGR、超时/退出强制 `SIGKILL` 回收整个进程组），与 `UiModBridge` 自然叠加（可被 JS `StatusLine` 拦截器包裹，两者均未配置时平滑回退 `jimu-tui` 默认底部状态栏）。

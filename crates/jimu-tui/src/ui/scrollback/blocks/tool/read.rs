@@ -59,6 +59,8 @@ pub struct ReadToolCallBlock {
     pub media_kind: Option<ReadMediaKind>,
     /// Whether this ordinary read targets a memory v2 scope.
     pub is_memory_activity: bool,
+    /// Actual tool name preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 impl ReadToolCallBlock {
@@ -76,6 +78,7 @@ impl ReadToolCallBlock {
             image_ref: None,
             media_kind: None,
             is_memory_activity: false,
+            tool_name: None,
         }
     }
 

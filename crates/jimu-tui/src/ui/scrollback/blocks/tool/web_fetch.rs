@@ -33,6 +33,8 @@ pub struct WebFetchToolCallBlock {
     pub started_at: Option<std::time::Instant>,
     /// Elapsed time in ms after completion.
     pub elapsed_ms: Option<i64>,
+    /// Actual tool name preserved for `ToolRowView`.
+    pub tool_name: Option<String>,
 }
 
 impl WebFetchToolCallBlock {
@@ -46,6 +48,7 @@ impl WebFetchToolCallBlock {
             output: None,
             started_at: None,
             elapsed_ms: None,
+            tool_name: None,
         }
     }
 

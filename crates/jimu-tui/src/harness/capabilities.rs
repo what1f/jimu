@@ -135,6 +135,10 @@ pub trait ModelPickerCap: Send + Sync {
     fn set_thinking_level(&self, _level: &str) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
+    /// Whether fast/low-latency mode is currently enabled for this model/session.
+    fn fast_mode(&self) -> bool {
+        false
+    }
 }
 
 /// Permission-mode inspection and switching capability (`/permissions`, `Shift+Tab`).

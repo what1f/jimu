@@ -55,6 +55,18 @@ jimu -p -c "Now write a commit message for those changes"
 | `Alt+T` | Cycle thinking / effort level |
 | `Ctrl+O` | Expand or collapse all tool and thinking cards |
 | `Ctrl+R` | Search previous prompt history |
+| `Ctrl+V` / `Alt+V` | Paste an image from the clipboard (inserted as an `[Image #N]` chip) |
+
+## Pasting Images
+
+- Press `Ctrl+V` (or `Alt+V` if your terminal intercepts `Ctrl+V`) to attach a screenshot or copied image directly from your clipboard.
+- You can also paste or drop a local image file path into the prompt editor—Jimu automatically turns it into a numbered `[Image #N]` chip and keeps the `[Image #N]` placeholder in your conversation transcript so you can refer to it across turns.
+
+## Layout & Bottom Status Bar
+
+- By default, Jimu hides the top header bar to keep the transcript uncluttered and renders a compact single-line status bar at the bottom (model, effort, fast mode, directory & Git branch, context usage, permission mode, and active spinner).
+- To re-enable the 1-row top header bar, set `"show_header": true` in `~/.jimu/settings.json`.
+- To replace the bottom status bar with your own shell script or JS UI mod, see `customization.md`.
 
 ## Slash Commands
 
@@ -78,8 +90,9 @@ Type `/` in the prompt editor to open the command menu:
 ### Extensions & Interface
 - `/skills` — View discovered skills
 - `/mcp` — View connected MCP servers and tools
+- `/reload` — Hot-reload JS extensions, UI mods, and custom themes
 - `/copy` — Copy the last assistant response to the clipboard
-- `/theme` — Switch color theme
+- `/theme` — Switch color theme (built-in or custom themes)
 - `/help` (alias `/hotkeys`) — Show keyboard shortcuts
 
 ## Rewind and Conversation Branching
@@ -107,8 +120,9 @@ When a shell command or monitor continues running in the background, a compact i
 
 ## Themes
 
-Choose a theme at startup with `--theme <name>` or switch live with `/theme`:
+Choose a built-in or custom theme at startup with `--theme <name>` or switch live with `/theme` (your selection is saved to `~/.jimu/settings.json`):
 
-`auto` (follows your terminal light/dark appearance), `dark`, `light`, `tokyonight`, `rosepine`, `oscura`, `terminal`.
+- **Built-in themes**: `auto` (follows your terminal light/dark appearance), `dark`, `light`, `tokyonight`, `rosepine`, `oscura`, `terminal`.
+- **Custom themes**: Place `<name>.json` files in `~/.jimu/themes/` (personal) or `.jimu/themes/` (project, overrides personal). See `customization.md` for the JSON format.
 
 You can also set a default theme via the `TUI_THEME` environment variable.

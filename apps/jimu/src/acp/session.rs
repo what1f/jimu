@@ -939,11 +939,12 @@ impl Session {
             .iter()
             .map(|spec| spec.tool.definition().name)
             .collect();
-        let has_extensions = if let Some(loaded) =
-            load_js_extensions(&cfg.extensions, &existing_names).map_err(|err| failed(&err))?
+        let extension_paths = host_cfg.resolve_extension_paths(&meta.cwd);
+        let has_extension_tools = if let Some(loaded) =
+            load_js_extensions(&extension_paths, &existing_names).map_err(|err| failed(&err))?
         {
             attach_extensions_to_config(&mut opts, &loaded).map_err(|err| failed(&err))?;
-            true
+            !loaded.tools.is_empty()
         } else {
             false
         };
@@ -951,7 +952,7 @@ impl Session {
         opts.enable_deferred_gateway = should_enable_deferred_gateway(
             &cfg.tools,
             cfg.enable_codemode,
-            has_extensions,
+            has_extension_tools,
             has_mcp,
         );
         let has_tools = !opts.tools.is_empty() || cfg.enable_codemode || has_mcp;
