@@ -1,7 +1,7 @@
 use crate::deferred::DeferredToolRegistry;
 use futures_util::future::{Either, select};
 use jimu_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
-use jimu_ai::{BoxFuture, CancelToken, ContentPart, ImageContent, TextContent, ToolDefinition};
+use jimu_ai::{BoxFuture, CancelToken, ContentPart, TextContent, ToolDefinition};
 use jimu_codemode::{
     CodemodeExecuteOptions, CodemodeOutputItem, CodemodeSandbox, CodemodeSandboxOptions,
     CodemodeTool, CodemodeToolContext,
@@ -351,10 +351,7 @@ impl AgentTool for CodemodeExecTool {
                         content.push(ContentPart::Text(TextContent::plain(text.clone())));
                     }
                     CodemodeOutputItem::Image { data, mime_type } => {
-                        content.push(ContentPart::Image(ImageContent {
-                            data: data.clone(),
-                            mime_type: mime_type.clone(),
-                        }));
+                        content.push(crate::mcp::checked_image(data, mime_type));
                     }
                 }
             }

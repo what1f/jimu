@@ -745,7 +745,7 @@ impl AgentTool for IdeTool {
         Box::pin(async move {
             let name = self.definition().name;
             match name.as_str() {
-                "read" => {
+                "read" if self.bridge.capabilities.fs.read_text_file => {
                     let path = self.bridge.path(edits::string_arg(&args, "path")?);
                     let is_image =
                         path.extension()
@@ -755,7 +755,8 @@ impl AgentTool for IdeTool {
                                     ext.to_ascii_lowercase().as_str(),
                                     "png" | "jpg" | "jpeg" | "gif" | "webp"
                                 )
-                            });
+                            })
+                            || jimu_tools::ReadTool::is_image_file(&path);
                     let number = |field: &str| {
                         args[field]
                             .as_u64()

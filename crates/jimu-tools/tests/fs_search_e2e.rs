@@ -130,7 +130,7 @@ async fn edit_fuzzes_whole_lines_and_rejects_ambiguous_batches() {
 async fn path_and_content_search_respect_filters_modes_limits_and_cancellation() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    for name in [".git", "a", "target", "custom"] {
+    for name in [".git", ".agents", "a", "target", "custom"] {
         fs::create_dir(root.join(name)).unwrap();
     }
     for name in [
@@ -153,6 +153,8 @@ async fn path_and_content_search_respect_filters_modes_limits_and_cancellation()
         format!("Need.le {}\n", "中文".repeat(500)),
     )
     .unwrap();
+    let emoji = "😀".repeat(400);
+    fs::write(root.join(".agents/note"), format!("{emoji}🌲\n")).unwrap();
     let config = Arc::new(WorkspaceToolsConfig::new(root).with_ignore_dirs(["target", "custom"]));
     let find = FindTool::new(config.clone());
     let grep = GrepTool::new(config);
@@ -164,7 +166,21 @@ async fn path_and_content_search_respect_filters_modes_limits_and_cancellation()
     .await
     .unwrap();
     assert_eq!(text(&result), ".hidden.rs\nz.rs");
-    let result = run(&find, json!({"pattern": "hit"})).await.unwrap();
+    let limited = run(&find, json!({"pattern": "*.rs", "limit": 1}))
+        .await
+        .unwrap();
+    assert!(text(&limited).contains("Limit reached"));
+    assert_eq!(limited.details["matches"], 1);
+    let tiny = FindTool::new(Arc::new(
+        WorkspaceToolsConfig::new(root).with_max_output_bytes(16),
+    ));
+    let result = run(&tiny, json!({"pattern": "*.rs", "limit": 1}))
+        .await
+        .unwrap();
+    assert_eq!(text(&result), "[Limit reached.]");
+    let result = run(&find, json!({"pattern": "hit", "limit": 1}))
+        .await
+        .unwrap();
     assert_eq!(text(&result), "a/hit.rs");
     let result = run(&find, json!({"pattern": "a"})).await.unwrap();
     assert!(text(&result).lines().any(|line| line == "a"));
@@ -172,7 +188,7 @@ async fn path_and_content_search_respect_filters_modes_limits_and_cancellation()
     let result = run(&grep, json!({"pattern": "need.le", "fixed_strings": true, "case_insensitive": true, "path": "a", "glob": "*.rs", "context_lines": 1, "limit": 1})).await.unwrap();
     assert_eq!(
         text(&result),
-        "a/hit.rs-1-before\na/hit.rs:2:Need.le\na/hit.rs-3-after"
+        "a/hit.rs-1-before\na/hit.rs:2:Need.le\na/hit.rs-3-after\n[Limit reached.]"
     );
     assert_eq!(result.details["hit_limit"], true);
     let result = run(
@@ -197,6 +213,19 @@ async fn path_and_content_search_respect_filters_modes_limits_and_cancellation()
         .unwrap();
     assert!(text(&result).ends_with('…'));
     assert!(!text(&result).contains('\u{FFFD}'));
+
+    let hidden = run(&grep, json!({"pattern": "😀"})).await.unwrap();
+    assert_eq!(text(&hidden), "No matches found.");
+    for args in [
+        json!({"hidden": true}),
+        json!({"path": ".agents"}),
+        json!({"path": ".agents/note"}),
+    ] {
+        let mut args = args;
+        args["pattern"] = json!("😀");
+        let result = run(&grep, args).await.unwrap();
+        assert_eq!(text(&result), format!(".agents/note:1:{emoji}…"));
+    }
 
     let capped = GrepTool::new(Arc::new(
         WorkspaceToolsConfig::new(root).with_max_output_bytes(120),

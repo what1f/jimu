@@ -16,6 +16,8 @@ mod exec_session;
 mod find;
 #[cfg(feature = "search")]
 mod grep;
+#[cfg(any(feature = "fs", feature = "web-fetch"))]
+mod image_util;
 #[cfg(all(feature = "monitor", not(target_os = "ios")))]
 mod monitor;
 mod override_spec;
@@ -49,6 +51,8 @@ pub use exec_session::{
 pub use find::FindTool;
 #[cfg(feature = "search")]
 pub use grep::GrepTool;
+#[cfg(any(feature = "fs", feature = "web-fetch"))]
+pub use image_util::ImageProcessConfig;
 #[cfg(all(feature = "monitor", not(target_os = "ios")))]
 pub use monitor::{MonitorConfig, MonitorManager, MonitorTool, RunningMonitorInfo};
 pub use override_spec::{
@@ -246,6 +250,9 @@ impl FromIterator<BuiltinToolKind> for BuiltinToolSet {
 /// Host controls for [`WorkspaceTools`].
 #[derive(Clone)]
 pub struct WorkspaceToolsConfig {
+    /// Image validation and resizing options for the read tool.
+    #[cfg(feature = "fs")]
+    pub image: ImageProcessConfig,
     /// Base workspace directory; relative paths in tool calls resolve against `cwd`.
     pub cwd: PathBuf,
     /// Enabled subset of built-in tools.
@@ -284,6 +291,8 @@ impl std::fmt::Debug for WorkspaceToolsConfig {
 impl WorkspaceToolsConfig {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
+            #[cfg(feature = "fs")]
+            image: ImageProcessConfig::default(),
             cwd: cwd.into(),
             enabled_tools: BuiltinToolSet::default(),
             tool_overrides: HashMap::new(),
@@ -297,6 +306,12 @@ impl WorkspaceToolsConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
         }
+    }
+
+    #[cfg(feature = "fs")]
+    pub fn with_image(mut self, image: ImageProcessConfig) -> Self {
+        self.image = image;
+        self
     }
 
     pub fn with_enabled_tools(mut self, enabled_tools: impl Into<BuiltinToolSet>) -> Self {

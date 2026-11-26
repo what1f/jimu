@@ -1,9 +1,9 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use crate::image_util::{ImageProcessConfig, process_image_bytes};
 use jimu_agent::{AgentTool, AgentToolResult, ToolProgressCallback};
-use jimu_ai::{BoxFuture, CancelToken, ContentPart, HttpTransport, ImageContent, ToolDefinition};
+use jimu_ai::{BoxFuture, CancelToken, ContentPart, HttpTransport, TextContent, ToolDefinition};
 use jimu_schema::{bool_schema, int_schema, obj_schema, str_schema, with_bounds, with_description};
 use serde_json::{Value, json};
 use url::Origin;
@@ -123,7 +123,9 @@ impl AgentTool for WebFetchTool {
             .map_err(|error| error.to_string())?;
 
             match routed {
-                Routed::Other(download) => response(download, max),
+                Routed::Other(download) => {
+                    response(download, max, &self.web2md.fetcher.config.image)
+                }
                 Routed::Document(document, head) => {
                     let mut text = String::new();
                     if !document.title.is_empty() {
@@ -169,14 +171,21 @@ fn response_details(head: &ResponseHead) -> Value {
     })
 }
 
-fn response(download: Download, max: usize) -> Result<AgentToolResult, String> {
+fn response(
+    download: Download,
+    max: usize,
+    config: &ImageProcessConfig,
+) -> Result<AgentToolResult, String> {
     let details = response_details(&download.head());
     if download.is_image() {
+        let image = process_image_bytes(&download.bytes, config)?;
+        let mut content = Vec::new();
+        if image.size != image.original {
+            content.push(ContentPart::Text(TextContent::plain(image.note())));
+        }
+        content.push(ContentPart::Image(image.content));
         return Ok(AgentToolResult {
-            content: vec![ContentPart::Image(ImageContent {
-                data: STANDARD.encode(download.bytes),
-                mime_type: download.mime,
-            })],
+            content,
             details,
             structured_content: None,
             is_error: false,

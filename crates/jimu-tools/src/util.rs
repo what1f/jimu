@@ -216,13 +216,10 @@ pub(crate) fn uses_crlf(text: &str) -> bool {
 }
 
 #[cfg(feature = "fs")]
-pub(crate) fn read_regular_file(
+pub(crate) fn open_regular_file(
     path: &Path,
     shown: &str,
-) -> Result<(Vec<u8>, fs::Metadata), String> {
-    use std::io::Read as _;
-
-    const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+) -> Result<(fs::File, fs::Metadata), String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -239,18 +236,54 @@ pub(crate) fn read_regular_file(
     if !meta.is_file() {
         return Err(format!("Cannot read '{shown}': expected a regular file"));
     }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: file owns the open descriptor throughout both calls.
+        unsafe {
+            let fd = file.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+                return Err(format!(
+                    "Could not open '{shown}': {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    Ok((file, meta))
+}
+
+#[cfg(feature = "fs")]
+pub(crate) fn read_bounded_bytes(
+    reader: impl std::io::Read,
+    size: u64,
+    shown: &str,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
     let size_error = || format!("Cannot read '{shown}': file exceeds 16 MiB");
-    if meta.len() > MAX_FILE_BYTES {
+    if size > MAX_FILE_BYTES {
         return Err(size_error());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1)
+    reader
+        .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|err| format!("Could not read '{shown}': {err}"))?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(size_error());
     }
-    Ok((bytes, meta))
+    Ok(bytes)
+}
+
+#[cfg(feature = "patch")]
+pub(crate) fn read_regular_file(
+    path: &Path,
+    shown: &str,
+) -> Result<(Vec<u8>, fs::Metadata), String> {
+    let (file, meta) = open_regular_file(path, shown)?;
+    Ok((read_bounded_bytes(file, meta.len(), shown)?, meta))
 }
 
 #[cfg(feature = "patch")]

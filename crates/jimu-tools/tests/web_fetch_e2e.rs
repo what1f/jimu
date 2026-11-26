@@ -24,6 +24,7 @@ enum Reply {
     Body(&'static str, String),
     Redirect(u16, &'static str),
     Oversize,
+    Bytes(&'static str, Vec<u8>, usize),
 }
 
 impl Replay {
@@ -70,6 +71,14 @@ impl HttpTransport for Replay {
                     status: 200,
                     headers: vec![("Content-Type".into(), (*mime).into())],
                     body: Box::pin(stream::iter([Ok(body.clone().into())])),
+                },
+                Some(Reply::Bytes(mime, bytes, length)) => HttpStreamResponse {
+                    status: 200,
+                    headers: vec![
+                        ("Content-Type".into(), (*mime).into()),
+                        ("Content-Length".into(), length.to_string()),
+                    ],
+                    body: Box::pin(stream::iter([Ok(bytes.clone().into())])),
                 },
                 Some(Reply::Redirect(status, location)) => {
                     return Err(TransportError::HttpStatus {
@@ -364,15 +373,11 @@ async fn returns_text_and_images_with_limits_and_blocks_private_redirects() {
         .unwrap();
     assert_eq!(text(&result), "😄");
     assert_eq!(result.details["truncated"], true);
-    let result = fetch(&tool, json!({"url":image,"max_bytes":0}))
-        .await
-        .unwrap();
-    let jimu_ai::ContentPart::Image(image) = &result.content[0] else {
-        panic!("expected image")
-    };
-    assert_eq!(
-        (image.mime_type.as_str(), image.data.as_str()),
-        ("image/png", "YWJj")
+    assert!(
+        fetch(&tool, json!({"url":image,"max_bytes":0}))
+            .await
+            .unwrap_err()
+            .contains("Unsupported image")
     );
     assert_eq!(
         fetch(&tool, json!({"url":large})).await.unwrap_err(),
@@ -793,5 +798,45 @@ async fn ssrf_pinning_header_and_web2md_edge_cases_work() {
         doc.markdown.contains("![Logo](https://x.com/img/logo.png)"),
         "sorted attrs must keep rewritten src: {}",
         doc.markdown
+    );
+}
+
+#[tokio::test]
+async fn fetch_checks_image_bytes_and_response_length() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use image::{DynamicImage, ImageFormat};
+    let good = "https://public.example/photo";
+    let damaged = "https://public.example/damaged";
+    let partial = "https://public.example/partial";
+    let mut out = std::io::Cursor::new(Vec::new());
+    DynamicImage::new_rgb8(2, 1)
+        .write_to(&mut out, ImageFormat::WebP)
+        .unwrap();
+    let mut bytes = out.into_inner();
+    let encoded = STANDARD.encode(&bytes);
+    let len = bytes.len();
+    let good_reply = Reply::Bytes("text/html", bytes.clone(), len);
+    bytes.pop();
+    let replay = Replay::new([
+        (good, good_reply),
+        (damaged, Reply::Bytes("image/webp", bytes, len - 1)),
+        (partial, Reply::Bytes("text/plain", b"partial".to_vec(), 20)),
+    ]);
+    let tool = WebFetchTool::new(Arc::new(replay), config());
+    let result = fetch(&tool, json!({"url":good})).await.unwrap();
+    let [jimu_ai::ContentPart::Image(image)] = result.content.as_slice() else {
+        panic!("expected WebP")
+    };
+    assert_eq!(image.mime_type, "image/webp");
+    assert_eq!(image.data, encoded);
+    assert!(
+        fetch(&tool, json!({"url":damaged}))
+            .await
+            .unwrap_err()
+            .contains("incomplete")
+    );
+    assert_eq!(
+        fetch(&tool, json!({"url":partial})).await.unwrap_err(),
+        Web2MdError::Network.to_string()
     );
 }

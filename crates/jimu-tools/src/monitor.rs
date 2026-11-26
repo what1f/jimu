@@ -663,9 +663,6 @@ impl MonitorOutput {
     }
 
     fn push(&mut self, stream: OutputStream, chunk: &[u8], interrupt: &CancelToken) {
-        if self.line_events && stream == OutputStream::Stderr {
-            return;
-        }
         for part in chunk.split_inclusive(|&byte| byte == b'\n') {
             let current = match stream {
                 OutputStream::Stdout => &mut self.stdout,
@@ -679,25 +676,25 @@ impl MonitorOutput {
             current.bytes.extend_from_slice(&body[..take]);
             if body.len() != part.len() {
                 let line = current.finish().unwrap();
-                self.line(line, interrupt);
+                self.line(stream, line, interrupt);
             }
         }
     }
 
     fn finish(&mut self, interrupt: &CancelToken) {
-        for line in [self.stdout.finish(), self.stderr.finish()]
-            .into_iter()
-            .flatten()
-        {
-            self.line(line, interrupt);
+        if let Some(line) = self.stdout.finish() {
+            self.line(OutputStream::Stdout, line, interrupt);
+        }
+        if let Some(line) = self.stderr.finish() {
+            self.line(OutputStream::Stderr, line, interrupt);
         }
     }
 
-    fn line(&mut self, line: String, interrupt: &CancelToken) {
+    fn line(&mut self, stream: OutputStream, line: String, interrupt: &CancelToken) {
         if self.tail.len() == TAIL_LINES {
             self.tail.pop_front();
         }
-        if self.line_events && !self.flooded {
+        if self.line_events && stream == OutputStream::Stdout && !self.flooded {
             let now = Instant::now();
             while self
                 .recent

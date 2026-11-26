@@ -10,7 +10,7 @@ test = false
 
 [features]
 default = ["fs", "patch", "search", "shell", "monitor", "sleep", "web-fetch"]
-fs = ["dep:tempfile", "dep:base64", "dep:libc"]
+fs = ["dep:image", "dep:tempfile", "dep:base64", "dep:libc"]
 patch = ["fs"]
 search = ["dep:ignore", "dep:grep-searcher", "dep:grep-regex", "dep:grep-matcher", "dep:globset", "dep:libc"]
 sleep = ["dep:tokio"]
@@ -23,6 +23,7 @@ web-fetch = [
     "dep:futures-util",
     "dep:thiserror",
     "dep:base64",
+    "dep:image",
     "dep:chrono",
     "dep:ego-tree",
     "dep:scraper",
@@ -45,6 +46,7 @@ tokio = { version = "1.54", features = ["rt", "macros", "sync", "time"], optiona
 futures-core = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+image = { workspace = true, optional = true, features = ["png", "jpeg", "gif", "webp"] }
 base64 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 ego-tree = { workspace = true, optional = true }

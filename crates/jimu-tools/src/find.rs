@@ -119,9 +119,12 @@ impl AgentTool for FindTool {
                     Some(glob) => glob.is_match(relative) || glob.is_match(&shown),
                     None => shown.contains(pattern) || relative.to_string_lossy().contains(pattern),
                 };
-                if is_match && paths.insert(shown) && paths.len() > limit {
-                    paths.pop_last();
-                    hit_limit = true;
+                if is_match {
+                    if paths.len() == limit && !paths.contains(&shown) {
+                        hit_limit = true;
+                        break;
+                    }
+                    paths.insert(shown);
                 }
             }
             check_cancelled(&cancel)?;
@@ -225,7 +228,21 @@ pub(crate) fn search_result(
     } else {
         rows.join("\n")
     };
-    let trunc = truncate_head(&text, config.max_output_bytes, config.max_output_lines);
+    let mut trunc = truncate_head(&text, config.max_output_bytes, config.max_output_lines);
+    // A byte/line omission marker already tells the model the results are incomplete.
+    let has_marker = trunc.text.len() > text.len() - trunc.omitted_bytes;
+    if hit_limit && !has_marker && config.max_output_lines > 0 {
+        let notice = "[Limit reached.]";
+        let budget = config.max_output_bytes;
+        let end = text.floor_char_boundary(budget.saturating_sub(notice.len() + 1));
+        trunc.omitted_bytes = text.len() - end;
+        trunc.truncated = end < text.len();
+        trunc.text.truncate(end);
+        if end > 0 {
+            trunc.text.push('\n');
+        }
+        trunc.text.push_str(&notice[..notice.len().min(budget)]);
+    }
     let mut result = AgentToolResult::text(trunc.text);
     result.details = json!({
         "path": display_path(&config.cwd, root),

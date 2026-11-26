@@ -706,3 +706,127 @@ async fn symlink_edit_and_write_preserve_symlink_and_tiny_bash_budget_keeps_head
     assert!(utf8_text.len() <= 16);
     assert!(!utf8_text.contains('\u{FFFD}'));
 }
+
+#[cfg(feature = "fs")]
+#[tokio::test]
+async fn read_validates_images_and_reports_the_displayed_dimensions() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use image::{DynamicImage, GenericImageView, ImageFormat};
+    use jimu_agent::AgentTool;
+    use jimu_tools::ReadTool;
+    use std::io::Cursor;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("picture");
+    let tool = ReadTool::new(Arc::new(WorkspaceToolsConfig::new(dir.path())));
+    let read = || {
+        tool.execute(
+            "r".into(),
+            json!({"path":"picture"}),
+            Default::default(),
+            Arc::new(|_| {}),
+        )
+    };
+    let source = DynamicImage::new_rgb8(2400, 120);
+    for format in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::WebP] {
+        let mut bytes = Cursor::new(Vec::new());
+        source.write_to(&mut bytes, format).unwrap();
+        let mut bytes = bytes.into_inner();
+        fs::write(&path, &bytes).unwrap();
+        assert!(ReadTool::is_image_file(&path));
+        let result = read().await.unwrap();
+        let [ContentPart::Text(note), ContentPart::Image(img)] = result.content.as_slice() else {
+            panic!("expected an image with dimensions")
+        };
+        assert!(note.text.contains("coordinates"));
+        let output = STANDARD.decode(&img.data).unwrap();
+        assert_eq!(
+            image::load_from_memory(&output).unwrap().dimensions(),
+            (2000, 100)
+        );
+        assert_eq!(
+            result.details,
+            json!({"path":"picture", "mime_type":img.mime_type,
+            "original_width":2400,"original_height":120,"width":2000,"height":100,"resized":true})
+        );
+
+        if format == ImageFormat::Png {
+            // The byte limit alone can trigger a resize.
+            let cfg = jimu_tools::ImageProcessConfig {
+                max_dimension: 3000,
+                max_encoded_bytes: 160,
+                ..Default::default()
+            };
+            let capped = ReadTool::new(Arc::new(
+                WorkspaceToolsConfig::new(dir.path()).with_image(cfg),
+            ));
+            let result = capped
+                .execute(
+                    "r".into(),
+                    json!({"path":"picture"}),
+                    Default::default(),
+                    Arc::new(|_| {}),
+                )
+                .await
+                .unwrap();
+            let ContentPart::Image(img) = &result.content[1] else {
+                panic!("expected image")
+            };
+            let output = STANDARD.decode(&img.data).unwrap();
+            assert!(output.len() <= 160 && image::load_from_memory(&output).is_ok());
+        }
+
+        bytes.truncate(bytes.len() - 2);
+        if format == ImageFormat::Jpeg {
+            // A thumbnail EOI inside a comment cannot complete the outer image.
+            bytes.splice(2..2, [0xff, 0xfe, 0, 4, 0xff, 0xd9]);
+        }
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            read().await.unwrap_err().contains("incomplete"),
+            "{format:?}"
+        );
+    }
+}
+
+#[cfg(feature = "fs")]
+#[tokio::test]
+async fn read_pages_a_large_log_and_clips_the_first_line_at_a_utf8_boundary() {
+    use jimu_agent::AgentTool;
+    use jimu_tools::ReadTool;
+    use std::io::Write;
+
+    let dir = TempDir::new().unwrap();
+    let mut file = fs::File::create(dir.path().join("log")).unwrap();
+    file.write_all(b"first\r\n").unwrap();
+    let block = "界".repeat(4096);
+    for _ in 0..1500 {
+        file.write_all(block.as_bytes()).unwrap();
+    }
+    file.write_all(b"\r\nlast\n").unwrap();
+    let tool = ReadTool::new(Arc::new(
+        WorkspaceToolsConfig::new(dir.path()).with_max_output_bytes(120),
+    ));
+    let read = |offset| {
+        tool.execute(
+            "r".into(),
+            json!({"path":"log", "offset":offset, "limit":1}),
+            Default::default(),
+            Arc::new(|_| {}),
+        )
+    };
+    for (offset, start) in [(1, "1: first"), (2, "2: 界"), (3, "3: last")] {
+        let result = read(offset).await.unwrap();
+        let ContentPart::Text(part) = &result.content[0] else {
+            panic!()
+        };
+        assert!(
+            part.text.starts_with(start) && part.text.len() <= 120 && !part.text.contains('\r')
+        );
+        assert_eq!(result.details["total_lines"], 3);
+        assert_eq!(result.details["returned_lines"], 1);
+        if offset == 2 {
+            assert!(part.text.contains("120-byte limit") && part.text.contains("offset=3"));
+        }
+    }
+}

@@ -60,6 +60,11 @@ impl AgentTool for GrepTool {
                     false,
                 ),
                 (
+                    "hidden",
+                    with_description(bool_schema(), "Include hidden paths."),
+                    false,
+                ),
+                (
                     "case_insensitive",
                     with_description(bool_schema(), "Ignore letter case."),
                     false,
@@ -120,6 +125,7 @@ impl GrepTool {
         check_cancelled(cancel)?;
         let root = search_root(&self.config, args)?;
         let mut walk = search_walk(&self.config, &root, cancel);
+        walk.hidden(!args["hidden"].as_bool().unwrap_or(false));
         let overrides = args
             .get("glob")
             .map(|glob| {
@@ -327,7 +333,17 @@ struct FileMatches<'a> {
 impl FileMatches<'_> {
     fn push(&mut self, line_number: Option<u64>, bytes: &[u8], separator: char) {
         let line_number = line_number.expect("line numbers are enabled");
-        let snippet = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_SNIPPET_CHARS * 4 + 1)]);
+        let cap = MAX_SNIPPET_CHARS * 4 + 4;
+        let window = if bytes.len() > cap {
+            let mut end = cap;
+            while end > cap.saturating_sub(4) && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+                end -= 1;
+            }
+            &bytes[..end]
+        } else {
+            bytes
+        };
+        let snippet = String::from_utf8_lossy(window);
         let snippet = snippet.trim_end_matches(['\r', '\n']);
         let mut row = format!("{}{separator}{line_number}{separator}", self.shown);
         if let Some((end, _)) = snippet.char_indices().nth(MAX_SNIPPET_CHARS) {

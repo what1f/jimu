@@ -2200,6 +2200,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "image",
  "jimu-agent",
  "jimu-ai",
  "jimu-schema",

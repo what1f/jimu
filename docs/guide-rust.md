@@ -92,6 +92,8 @@ pub async fn run_example(workspace: &std::path::Path, api_key: String) -> Result
 
 `WebFetchTool` 默认限制为公网访问。符合公网域名规则的名称可解析到 `198.18.0.0/15` TUN Fake-IP，直接输入该网段的地址仍会被拦截。宿主可用 `private_origin` 判断目标是否需要审批，获批后用 `with_private_origin` 为指定来源开放本地访问。所有请求都拦截 IPv4 和 IPv6 链路本地地址。本地主机名解析到 IPv6 链路本地地址时会剔除这些地址。至少要有一个可用地址，才能继续访问。
 
+`read` 与 `web_fetch` 返回图片前均会做完整解码与结构校验（拒绝截断或损坏的 PNG/JPEG/GIF/WebP 毒化会话历史），并按 `ImageProcessConfig`（默认最大边 `2000px`、编码前体积上限 `3.5 MB`，支持通过 `WorkspaceToolsConfig::with_image` / `WebFetchConfig::with_image` 覆盖或关闭自动缩放）自动缩放；`read` 对超大文本文件采用流式按行读取（不受 16 MiB 整文件上限限制），`grep` 支持可选 `hidden` 参数。
+
 自定义 `HttpTransport` 要消费 `x-no-redirect` 和 `x-resolve-addrs` 控制头，原样返回重定向响应，并确保连接遵守已校验的地址策略。这两个控制头只在工具与传输层之间传递。
 
 ### 3.1 覆盖内置工具的描述或隐藏参数

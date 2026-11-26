@@ -2,7 +2,7 @@ use crate::WorkspaceToolsConfig;
 use crate::events::{
     BackgroundEventCallback, BackgroundEvents, BackgroundToolEvent, ShellStopReason, WakeGate,
 };
-use crate::util::{TailSpilloverBuffer, display_path, resolve_path};
+use crate::util::{TailSpilloverBuffer, TruncatedOutput, display_path, resolve_path};
 use jimu_agent::{AgentTool, AgentToolResult, ToolExecutionMode, ToolProgressCallback};
 use jimu_ai::{BoxFuture, CancelToken, ToolDefinition};
 use jimu_schema::{bool_schema, int_schema, obj_schema, str_schema, with_bounds, with_description};
@@ -256,7 +256,7 @@ impl ProcessSessionManager {
         cwd: PathBuf,
         process: Command,
         args: &ExecArgs,
-        progress: mpsc::Sender<Vec<u8>>,
+        progress: mpsc::Sender<String>,
     ) -> Result<Arc<Session>, String> {
         let mut sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.closed {
@@ -271,7 +271,12 @@ impl ProcessSessionManager {
             .ok_or("No command session IDs are available.")?;
         let (child, input, output) = spawn_process(process, true, args.tty)
             .map_err(|err| format!("Could not start command: {err}"))?;
-        let deadline = args.timeout_ms.and_then(deadline_after_ms);
+        let timeout_ms = if args.background {
+            args.timeout_ms
+        } else {
+            args.timeout_ms.or(self.0.workspace.default_exec_timeout_ms)
+        };
+        let deadline = timeout_ms.and_then(deadline_after_ms);
         let max_bytes = self.0.workspace.max_output_bytes;
         let max_lines = self.0.workspace.max_output_lines;
         let session = Arc::new(Session {
@@ -418,6 +423,29 @@ impl Session {
         }
     }
 
+    async fn wait_for_output(&self, after_write: bool) {
+        self.wait_until(|state| state.has_output || state.exit.is_some())
+            .await;
+        if !after_write {
+            return;
+        }
+        loop {
+            let changed = self.changed.notified();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .exit
+                .is_some()
+                || tokio::time::timeout(Duration::from_millis(80), changed)
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+    }
+
     fn take_output(&self, state: &mut SessionState) -> TailSpilloverBuffer {
         state.has_output = false;
         std::mem::replace(
@@ -429,7 +457,20 @@ impl Session {
     fn render(&self, unread: TailSpilloverBuffer, exit: Option<ProcessExit>) -> AgentToolResult {
         let (structured_out, structured_trunc) = unread.structured_prefix();
         let structured_out = structured_out.into_owned();
-        let output = unread.render(self.max_output_bytes);
+        let notice = match exit {
+            Some(exit) if exit.reason == ProcessEnd::Timeout => Some("Command timed out.".into()),
+            Some(exit)
+                if exit.reason == ProcessEnd::Exited
+                    && !exit.status.is_some_and(|s| s.success()) =>
+            {
+                Some(failure_notice(exit.status))
+            }
+            _ => None,
+        };
+        let output = match &notice {
+            Some(notice) => render_with_notice(&unread, self.max_output_bytes, notice),
+            None => unread.render(self.max_output_bytes),
+        };
         let text = if exit.is_none() {
             let status_line = format!("[session_id: {}, status: running]", self.id);
             if output.text.is_empty() {
@@ -458,9 +499,7 @@ impl Session {
             if timed_out {
                 details["timed_out"] = json!(true);
             }
-            result.is_error = timed_out
-                || (exit.reason == ProcessEnd::Exited
-                    && !exit.status.is_some_and(|status| status.success()));
+            result.is_error = notice.is_some();
             let mut structured = json!({
                 "exit_code": shell_exit_code(exit.status, timed_out),
                 "output": structured_out,
@@ -483,21 +522,28 @@ async fn run_shell(
     mut child: ProcessChild,
     mut output: ProcessOutput,
     deadline: Option<Instant>,
-    progress: mpsc::Sender<Vec<u8>>,
+    progress: mpsc::Sender<String>,
 ) {
     let read = async {
         let mut buffers = [[0; OUTPUT_CHUNK_BYTES]; 2];
-        while let Some((_, chunk)) = output.next(&mut buffers).await {
+        let mut decoder = ProgressDecoder::default();
+        while let Some((stream, chunk)) = output.next(&mut buffers).await {
             {
                 let mut state = session.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.unread.push(chunk);
                 state.has_output = true;
             }
             session.changed.notify_waiters();
-            if let Ok(permit) = progress.try_reserve() {
-                permit.send(chunk.to_vec());
+            if !progress.is_closed() {
+                let text = decoder.push(stream, chunk);
+                if !text.is_empty() {
+                    let _ = progress.try_send(text);
+                }
             }
         }
+        decoder.finish(|text| {
+            let _ = progress.try_send(text);
+        });
     };
     let (exit, ()) = tokio::join!(child.wait(deadline, None), read);
     let backgrounded = if let Some(manager) = manager.upgrade() {
@@ -553,6 +599,8 @@ pub struct ExecCommandTool {
 }
 
 impl ExecCommandTool {
+    /// Foreground commands use the workspace timeout by default, including after they yield.
+    /// Explicit background commands run until completion unless given a timeout.
     pub fn new(manager: ProcessSessionManager) -> Self {
         Self {
             backend: ExecBackend::Interactive(manager),
@@ -731,7 +779,7 @@ async fn execute_interactive(
                 }
                 _ = wait_deadline(deadline) => break,
                 Some(chunk) = progress.recv() => {
-                    on_update(AgentToolResult::text(String::from_utf8_lossy(&chunk)));
+                    on_update(AgentToolResult::text(chunk));
                 }
                 _ = session.control.wait_done() => break,
             }
@@ -789,6 +837,7 @@ async fn execute_one_shot(
     let mut aborted = false;
     let mut timed_out = false;
 
+    let mut decoder = ProgressDecoder::default();
     let mut chunks = [[0u8; OUTPUT_CHUNK_BYTES]; 2];
     loop {
         tokio::select! {
@@ -805,15 +854,19 @@ async fn execute_one_shot(
             }
             next = output.next(&mut chunks) => {
                 match next {
-                    Some((_, slice)) => {
+                    Some((stream, slice)) => {
                         buffer.push(slice);
-                        on_update(AgentToolResult::text(String::from_utf8_lossy(slice)));
+                        let text = decoder.push(stream, slice);
+                        if !text.is_empty() {
+                            on_update(AgentToolResult::text(text));
+                        }
                     }
                     None => break,
                 }
             }
         }
     }
+    decoder.finish(|text| on_update(AgentToolResult::text(text)));
     drop(output);
 
     let exit = if aborted {
@@ -840,16 +893,15 @@ async fn execute_one_shot(
 
     if aborted {
         let notice = "Command aborted.";
-        let (text, truncated, omitted_bytes, full_path) =
-            render_with_notice(&buffer, workspace.max_output_bytes, notice);
-        let mut res = AgentToolResult::error(text);
+        let rendered = render_with_notice(&buffer, workspace.max_output_bytes, notice);
+        let mut res = AgentToolResult::error(rendered.text);
         let mut details = json!({
             "cwd": shown_cwd,
             "aborted": true,
-            "truncated": truncated,
-            "omitted_bytes": omitted_bytes,
+            "truncated": rendered.truncated,
+            "omitted_bytes": rendered.omitted_bytes,
         });
-        if let Some(p) = full_path {
+        if let Some(p) = rendered.full_output_path {
             details["full_output_path"] = json!(p);
         }
         res.details = details;
@@ -862,22 +914,21 @@ async fn execute_one_shot(
     if timed_out {
         let ms = timeout_ms.unwrap_or(0);
         let notice = format!("Command timed out after {ms}ms.");
-        let (text, truncated, omitted_bytes, full_path) =
-            render_with_notice(&buffer, workspace.max_output_bytes, &notice);
-        let mut res = AgentToolResult::error(text);
+        let rendered = render_with_notice(&buffer, workspace.max_output_bytes, &notice);
+        let mut res = AgentToolResult::error(rendered.text);
         let mut details = json!({
             "cwd": shown_cwd,
             "timed_out": true,
             "timeout_ms": ms,
-            "truncated": truncated,
-            "omitted_bytes": omitted_bytes,
+            "truncated": rendered.truncated,
+            "omitted_bytes": rendered.omitted_bytes,
         });
         let mut structured = json!({
             "exit_code": 124,
             "output": structured_out,
             "output_truncated": structured_trunc,
         });
-        if let Some(p) = full_path {
+        if let Some(p) = rendered.full_output_path {
             details["full_output_path"] = json!(p);
             structured["full_output_path"] = json!(p);
         }
@@ -910,25 +961,21 @@ async fn execute_one_shot(
         res.structured_content = Some(structured);
         Ok(res)
     } else {
-        let notice = match code {
-            Some(c) => format!("Command exited with code {c}."),
-            None => format_signal_notice(status),
-        };
-        let (text, truncated, omitted_bytes, full_path) =
-            render_with_notice(&buffer, workspace.max_output_bytes, &notice);
-        let mut res = AgentToolResult::error(text);
+        let notice = failure_notice(status);
+        let rendered = render_with_notice(&buffer, workspace.max_output_bytes, &notice);
+        let mut res = AgentToolResult::error(rendered.text);
         let mut details = json!({
             "cwd": shown_cwd,
             "exit_code": code,
-            "truncated": truncated,
-            "omitted_bytes": omitted_bytes,
+            "truncated": rendered.truncated,
+            "omitted_bytes": rendered.omitted_bytes,
         });
         let mut structured = json!({
             "exit_code": shell_exit_code(status, false),
             "output": structured_out,
             "output_truncated": structured_trunc,
         });
-        if let Some(p) = full_path {
+        if let Some(p) = rendered.full_output_path {
             details["full_output_path"] = json!(p);
             structured["full_output_path"] = json!(p);
         }
@@ -938,27 +985,32 @@ async fn execute_one_shot(
     }
 }
 
+fn failure_notice(status: Option<ExitStatus>) -> String {
+    match status.and_then(|s| s.code()) {
+        Some(code) => format!("Command exited with code {code}."),
+        None => format_signal_notice(status),
+    }
+}
+
 fn render_with_notice(
     buffer: &TailSpilloverBuffer,
     max_bytes: usize,
     notice: &str,
-) -> (String, bool, usize, Option<PathBuf>) {
-    let sep_and_notice_len = notice.len() + 1;
-    let body_budget = max_bytes.saturating_sub(sep_and_notice_len);
-    let rendered = buffer.render(body_budget);
-    let text = if rendered.text.is_empty() {
-        notice.to_string()
-    } else if rendered.text.ends_with('\n') {
-        format!("{}{notice}", rendered.text)
-    } else {
-        format!("{}\n{notice}", rendered.text)
-    };
-    (
-        text,
-        rendered.truncated,
-        rendered.omitted_bytes,
-        rendered.full_output_path,
-    )
+) -> TruncatedOutput {
+    let body_budget = max_bytes.saturating_sub(notice.len() + 1);
+    let mut rendered = buffer.render(body_budget);
+    // Invalid UTF-8 can expand an otherwise untruncated body. In that case
+    // use the buffer's bounded tail rendering and preserve its spill metadata.
+    if rendered.text.len() > body_budget {
+        rendered = buffer.render(body_budget.min(rendered.original_bytes.saturating_sub(1)));
+    }
+    if !rendered.text.is_empty() && !rendered.text.ends_with('\n') {
+        rendered.text.push('\n');
+    }
+    rendered
+        .text
+        .push_str(&notice[..notice.floor_char_boundary(max_bytes)]);
+    rendered
 }
 
 #[derive(Clone)]
@@ -1054,7 +1106,7 @@ impl AgentTool for WriteStdinTool {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err("Operation aborted".into()),
-                    _ = session.wait_until(|state| state.has_output || state.exit.is_some()) => {},
+                    _ = session.wait_for_output(!args.chars.is_empty()) => {},
                     _ = wait_deadline(deadline) => {},
                 }
             }
@@ -1299,6 +1351,50 @@ impl ProcessInput {
 pub(crate) enum OutputStream {
     Stdout,
     Stderr,
+}
+
+// Each pipe can split a different UTF-8 character at the end of a read.
+#[derive(Default)]
+struct ProgressDecoder {
+    pending: [Vec<u8>; 2],
+}
+
+impl ProgressDecoder {
+    fn push(&mut self, stream: OutputStream, bytes: &[u8]) -> String {
+        let pending = &mut self.pending[stream as usize];
+        let joined;
+        let bytes = if pending.is_empty() {
+            bytes
+        } else {
+            joined = [pending.as_slice(), bytes].concat();
+            pending.clear();
+            &joined
+        };
+        let mut text = String::with_capacity(bytes.len());
+        let mut chunks = bytes.utf8_chunks().peekable();
+        while let Some(chunk) = chunks.next() {
+            text.push_str(chunk.valid());
+            let invalid = chunk.invalid();
+            if !invalid.is_empty() {
+                if chunks.peek().is_none()
+                    && std::str::from_utf8(invalid).is_err_and(|err| err.error_len().is_none())
+                {
+                    pending.extend_from_slice(invalid);
+                    break;
+                }
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+        text
+    }
+
+    fn finish(self, mut emit: impl FnMut(String)) {
+        for pending in self.pending {
+            if !pending.is_empty() {
+                emit(char::REPLACEMENT_CHARACTER.to_string());
+            }
+        }
+    }
 }
 
 pub(crate) enum ProcessOutput {

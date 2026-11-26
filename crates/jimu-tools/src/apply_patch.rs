@@ -1,5 +1,5 @@
 use crate::WorkspaceToolsConfig;
-use crate::seek_sequence::seek_sequence;
+use crate::seek_sequence::{Search, seek_sequence, split_bom};
 use crate::util::{
     check_cancelled, display_path, path_lock, read_editable_text, resolve_path,
     resolve_write_target, stage_write, truncate_output,
@@ -125,7 +125,7 @@ fn parse(patch: &str) -> Result<Vec<FilePatch<'_>>, String> {
         .peekable();
     let mut files = Vec::new();
     while let Some((i, header)) = lines.next() {
-        let body = std::iter::from_fn(|| lines.next_if(|(_, line)| !file_header(line)));
+        let mut body = std::iter::from_fn(|| lines.next_if(|(_, line)| !file_header(line)));
         let (path, action) = if let Some(path) = header.strip_prefix(ADD) {
             let mut text = String::new();
             for (i, line) in body {
@@ -136,6 +136,12 @@ fn parse(patch: &str) -> Result<Vec<FilePatch<'_>>, String> {
             }
             (path, Action::Add(text))
         } else if let Some(path) = header.strip_prefix(DELETE) {
+            if let Some((line, _)) = body.find(|(_, text)| !text.is_empty()) {
+                return Err(format!(
+                    "Unexpected content after Delete File at patch line {}",
+                    line + 2
+                ));
+            }
             (path, Action::Delete)
         } else if let Some(path) = header.strip_prefix(UPDATE) {
             let mut body = body.peekable();
@@ -207,6 +213,7 @@ fn update_text(source: &str, chunks: &[Chunk<'_>], shown: &str) -> Result<String
     if chunks.is_empty() {
         return Ok(source.to_owned());
     }
+    let (bom, source) = split_bom(source);
     let raw: Vec<_> = source.split_inclusive('\n').collect();
     let lines: Vec<_> = raw
         .iter()
@@ -218,22 +225,13 @@ fn update_text(source: &str, chunks: &[Chunk<'_>], shown: &str) -> Result<String
             }
         })
         .collect();
-    let ending = if raw
-        .iter()
-        .find(|line| line.ends_with('\n'))
-        .is_some_and(|line| line.ends_with("\r\n"))
-    {
-        "\r\n"
-    } else {
-        "\n"
-    };
-
-    let mut output = String::with_capacity(source.len());
+    let mut output = String::with_capacity(source.len() + bom.len());
+    output.push_str(bom);
     let mut cursor = 0;
     for chunk in chunks {
         let mut start = cursor;
         if let Some(anchor) = chunk.anchor {
-            let offset = seek_sequence(&lines[start..], &[anchor], false)
+            let offset = seek_sequence(&lines[start..], &[anchor], Search::First)
                 .ok()
                 .flatten()
                 .ok_or_else(|| format!("Could not find context in '{shown}': {anchor}"))?;
@@ -241,33 +239,53 @@ fn update_text(source: &str, chunks: &[Chunk<'_>], shown: &str) -> Result<String
         }
         let expected: Vec<_> = chunk.lines.iter().filter_map(Change::old_text).collect();
         let index = if expected.is_empty() {
-            lines.len()
-        } else {
-            if chunk.eof {
-                start = lines.len().saturating_sub(expected.len()).max(start);
+            if chunk.anchor.is_some() {
+                start
+            } else {
+                lines.len()
             }
-            let offset = seek_sequence(&lines[start..], &expected, false)
+        } else {
+            let search = if chunk.eof {
+                Search::EndOfFile
+            } else {
+                Search::First
+            };
+            let offset = seek_sequence(&lines[start..], &expected, search)
                 .ok()
                 .flatten()
                 .ok_or_else(|| format!("Could not find the expected lines in '{shown}'"))?;
             start + offset
         };
 
+        // Insertions follow the anchor's ending; replacements follow the matched line.
+        let local = if expected.is_empty() {
+            index.saturating_sub(1)
+        } else {
+            index
+        };
+        let ending = raw
+            .get(local)
+            .filter(|line| line.ends_with('\n'))
+            .or_else(|| raw[..local].last())
+            .map_or(
+                "\n",
+                |line| if line.ends_with("\r\n") { "\r\n" } else { "\n" },
+            );
         for line in &raw[cursor..index] {
-            ensure_line_break(&mut output, ending);
             output.push_str(line);
         }
         cursor = index;
         for change in &chunk.lines {
             match change {
                 Change::Keep(_) => {
-                    ensure_line_break(&mut output, ending);
                     output.push_str(raw[cursor]);
                     cursor += 1;
                 }
                 Change::Remove(_) => cursor += 1,
                 Change::Insert(line) => {
-                    ensure_line_break(&mut output, ending);
+                    if output.len() > bom.len() && !output.ends_with('\n') {
+                        output.push_str(ending);
+                    }
                     output.push_str(line);
                     output.push_str(ending);
                 }
@@ -275,16 +293,9 @@ fn update_text(source: &str, chunks: &[Chunk<'_>], shown: &str) -> Result<String
         }
     }
     for line in &raw[cursor..] {
-        ensure_line_break(&mut output, ending);
         output.push_str(line);
     }
     Ok(output)
-}
-
-fn ensure_line_break(output: &mut String, ending: &str) {
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push_str(ending);
-    }
 }
 
 #[derive(PartialEq, Eq)]

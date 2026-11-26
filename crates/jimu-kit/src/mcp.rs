@@ -1234,15 +1234,12 @@ impl McpClient {
                         }
                     }
                     "image" => {
-                        if let (Some(data), Some(mime)) = (
-                            item.get("data").and_then(Value::as_str),
-                            item.get("mimeType").and_then(Value::as_str),
-                        ) {
-                            content.push(ContentPart::Image(ImageContent {
-                                data: data.to_string(),
-                                mime_type: mime.to_string(),
-                            }));
-                        }
+                        content.push(checked_image(
+                            item.get("data").and_then(Value::as_str).unwrap_or_default(),
+                            item.get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ));
                     }
                     "resource" => {
                         if let Some(text) = item
@@ -1339,4 +1336,121 @@ impl AgentTool for McpAgentTool {
             })
         })
     }
+}
+
+/// MCP and codemode supply already-encoded images. Check the envelope before adding it to history.
+pub(crate) fn checked_image(data: &str, mime: &str) -> ContentPart {
+    let omitted =
+        |reason| ContentPart::Text(TextContent::plain(format!("[Image omitted: {reason}]")));
+    if data.len() > 5 * 1024 * 1024 {
+        return omitted("larger than 5 MiB");
+    }
+    let Some(bytes) = decode_image_base64(data) else {
+        return omitted("invalid base64");
+    };
+    let complete = match mime {
+        "image/png" => complete_png(&bytes),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]) && jpeg_has_eoi(&bytes),
+        "image/webp" => {
+            bytes.starts_with(b"RIFF")
+                && bytes.get(8..12) == Some(b"WEBP")
+                && matches!(bytes.get(12..16), Some(b"VP8 " | b"VP8L" | b"VP8X"))
+                && (12..=bytes.len() as u64 - 8).contains(&u64::from(u32::from_le_bytes(
+                    bytes[4..8].try_into().unwrap(),
+                )))
+        }
+        "image/gif" => {
+            bytes.len() >= 14
+                && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+                && bytes.last() == Some(&0x3b)
+        }
+        _ => return omitted("unsupported image type"),
+    };
+    if !complete {
+        return omitted("incomplete image or incorrect image type");
+    }
+    ContentPart::Image(ImageContent {
+        data: data.to_owned(),
+        mime_type: mime.to_owned(),
+    })
+}
+
+// Standard RFC 4648 alphabet and canonical padding. No codecs are needed in the kit.
+fn decode_image_base64(data: &str) -> Option<Vec<u8>> {
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
+    let text = data.trim_end_matches('=');
+    let padding = data.len() - text.len();
+    if padding > 2 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(data.len() / 4 * 3);
+    let mut bits = 0;
+    let mut acc = 0u16;
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u16::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+        }
+    }
+    (acc & ((1 << bits) - 1) == 0).then_some(bytes)
+}
+
+fn complete_png(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR") {
+        return false;
+    }
+    let mut chunks = &bytes[8..];
+    let mut has_data = false;
+    while let [a, b, c, d, kind @ ..] = chunks {
+        let size = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
+        if kind.starts_with(b"IEND") {
+            return has_data && size == 0 && kind.starts_with(b"IEND\xaeB\x60\x82");
+        }
+        has_data |= kind.starts_with(b"IDAT");
+        let Some(rest) = size.checked_add(12).and_then(|end| chunks.get(end..)) else {
+            break;
+        };
+        chunks = rest;
+    }
+    false
+}
+
+// Skip length-prefixed segments so EOI inside an embedded preview cannot end the main image.
+fn jpeg_has_eoi(mut bytes: &[u8]) -> bool {
+    let mut saw_scan = false;
+    bytes = &bytes[2..];
+    while let Some(marker) = bytes.iter().position(|&b| b == 0xff) {
+        bytes = &bytes[marker..];
+        let Some(code) = bytes.iter().position(|&b| b != 0xff) else {
+            break;
+        };
+        let marker = bytes[code];
+        bytes = &bytes[code + 1..];
+        match marker {
+            0xd9 => return saw_scan,
+            0 | 1 | 0xd0..=0xd7 => continue, // stuffed byte, TEM, or restart
+            _ => {
+                let [hi, lo, ..] = *bytes else { break };
+                let len = u16::from_be_bytes([hi, lo]) as usize;
+                let Some(rest) = bytes.get(len..).filter(|_| len >= 2) else {
+                    break;
+                };
+                saw_scan |= marker == 0xda;
+                bytes = rest;
+            }
+        }
+    }
+    false
 }

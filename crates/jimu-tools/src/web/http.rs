@@ -52,6 +52,9 @@ impl Download {
     }
 
     pub fn is_html(&self) -> bool {
+        if self.is_image() {
+            return false;
+        }
         matches!(self.mime.as_str(), "text/html" | "application/xhtml+xml")
             || (self.mime.is_empty()
                 && self.text().is_ok_and(|text| {
@@ -67,7 +70,7 @@ impl Download {
     }
 
     pub fn is_image(&self) -> bool {
-        is_image(&self.mime)
+        is_raster_image_mime(&self.mime) || crate::image_util::image_format(&self.bytes).is_some()
     }
 }
 
@@ -158,15 +161,17 @@ impl Fetcher {
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
-            let limit = if is_image(&mime) {
+            let limit = if is_raster_image_mime(&mime) {
                 self.config.max_download_bytes.min(MAX_IMAGE_BYTES)
             } else {
                 self.config.max_download_bytes
             };
-            if header(headers, "content-length")
-                .and_then(|length| length.parse::<u64>().ok())
-                .is_some_and(|length| length > limit as u64)
-            {
+            let content_encoded = header(headers, "content-encoding")
+                .map(str::trim)
+                .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"));
+            let content_length = header(headers, "content-length")
+                .and_then(|length| length.trim().parse::<u64>().ok());
+            if !content_encoded && content_length.is_some_and(|length| length > limit as u64) {
                 return Err(Web2MdError::TooLarge);
             }
 
@@ -183,12 +188,20 @@ impl Fetcher {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            return Ok(Download {
+            if !content_encoded && content_length.is_some_and(|length| length != bytes.len() as u64)
+            {
+                return Err(Web2MdError::Network);
+            }
+            let download = Download {
                 url,
                 status,
                 mime,
                 bytes,
-            });
+            };
+            if download.bytes.len() > MAX_IMAGE_BYTES && download.is_image() {
+                return Err(Web2MdError::TooLarge);
+            }
+            return Ok(download);
         }
         Err(Web2MdError::TooManyRedirects)
     }
@@ -201,9 +214,9 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn is_image(mime: &str) -> bool {
+fn is_raster_image_mime(mime: &str) -> bool {
     matches!(
         mime,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
     )
 }

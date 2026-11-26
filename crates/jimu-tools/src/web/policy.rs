@@ -11,6 +11,8 @@ pub type HostResolver = Arc<dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send 
 /// Limits and network policy shared by the tool and the extraction engine.
 #[derive(Clone)]
 pub struct WebFetchConfig {
+    /// Image validation and resizing options for downloaded images.
+    pub image: crate::ImageProcessConfig,
     pub max_output_bytes: usize,
     pub max_download_bytes: usize,
     /// Permit local destinations. IPv4 and IPv6 link-local addresses are always blocked.
@@ -21,11 +23,19 @@ pub struct WebFetchConfig {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
+            image: Default::default(),
             max_output_bytes: crate::DEFAULT_MAX_OUTPUT_BYTES,
             max_download_bytes: 10 * 1024 * 1024,
             allow_private_hosts: false,
             host_resolver: None,
         }
+    }
+}
+
+impl WebFetchConfig {
+    pub fn with_image(mut self, image: crate::ImageProcessConfig) -> Self {
+        self.image = image;
+        self
     }
 }
 

@@ -1,14 +1,31 @@
 // Matching order follows OpenAI Codex's Apache-2.0 apply-patch/seek_sequence.rs.
 
+pub(crate) enum Search {
+    First,
+    Unique,
+    EndOfFile,
+}
+
+pub(crate) fn split_bom(text: &str) -> (&str, &str) {
+    match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    }
+}
+
 /// Match at the strongest applicable level. For unique searches, report a tie at that level.
 pub(crate) fn seek_sequence(
     lines: &[&str],
     pattern: &[&str],
-    unique: bool,
+    search: Search,
 ) -> Result<Option<usize>, ()> {
     if pattern.is_empty() {
         return Ok(Some(0));
     }
+    let start = match search {
+        Search::EndOfFile => lines.len().saturating_sub(pattern.len()),
+        _ => 0,
+    };
     let comparators: [fn(&str, &str) -> bool; 4] = [
         |a, b| a == b,
         |a, b| a.trim_end() == b.trim_end(),
@@ -21,7 +38,7 @@ pub(crate) fn seek_sequence(
         },
     ];
     for equal in comparators {
-        let mut matches = lines
+        let mut matches = lines[start..]
             .windows(pattern.len())
             .enumerate()
             .filter_map(|(i, window)| {
@@ -29,10 +46,10 @@ pub(crate) fn seek_sequence(
                     .iter()
                     .zip(pattern)
                     .all(|(a, b)| equal(a, b))
-                    .then_some(i)
+                    .then_some(start + i)
             });
         if let Some(first) = matches.next() {
-            return if unique && matches.next().is_some() {
+            return if matches!(search, Search::Unique) && matches.next().is_some() {
                 Err(())
             } else {
                 Ok(Some(first))

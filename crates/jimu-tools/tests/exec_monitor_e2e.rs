@@ -100,9 +100,13 @@ mod subprocesses {
     async fn foreground_and_naturally_completed_background_commands_return_output() {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
-        let workspace = Arc::new(WorkspaceToolsConfig::new(dir.path()).with_env_provider(
-            Arc::new(|| Box::pin(async { vec![("JIMU_TEST_VAR".into(), "provided".into())] })),
-        ));
+        let workspace = Arc::new(
+            WorkspaceToolsConfig::new(dir.path())
+                .with_default_exec_timeout_ms(Some(0))
+                .with_env_provider(Arc::new(|| {
+                    Box::pin(async { vec![("JIMU_TEST_VAR".into(), "provided".into())] })
+                })),
+        );
         let (callback, mut events) = events();
         let manager = ProcessSessionManager::new(workspace, WakeGate::new(), Some(callback));
         let exec = ExecCommandTool::new(manager.clone());
@@ -113,7 +117,7 @@ mod subprocesses {
                 "foreground".into(),
                 json!({
                     "command": "printf '%s|%s' \"${AI_AGENT:-unset}\" \"$JIMU_TEST_VAR\"; exit 7",
-                    "cwd": "sub",
+                    "cwd": "sub", "timeout_ms": 10_000,
                 }),
                 CancelToken::new(),
                 Arc::new(move |chunk| progress.send(chunk).unwrap()),
@@ -123,9 +127,16 @@ mod subprocesses {
         assert_eq!(result.details["status"], "exited");
         assert_eq!(result.details["exit_code"], 7);
         assert_eq!(result.details["cwd"], json!(dir.path().join("sub")));
-        assert_eq!(text(&result), "unset|provided");
+        assert_eq!(text(&result), "unset|provided\nCommand exited with code 7.");
+        assert!(result.is_error);
         assert_eq!(text(&chunks.recv().await.unwrap()), "unset|provided");
         assert!(events.try_recv().is_err());
+
+        let timeout = call(&exec, json!({"command": "read -r line"}))
+            .await
+            .unwrap();
+        assert!(timeout.is_error);
+        assert_eq!(text(&timeout), "Command timed out.");
 
         let result = call(&exec, json!({"command": "printf done", "background": true}))
             .await
@@ -159,6 +170,37 @@ mod subprocesses {
     }
 
     #[tokio::test]
+    async fn progress_decodes_split_utf8_on_each_pipe() {
+        let dir = TempDir::new().unwrap();
+        let gate = dir.path().join("gate");
+        fifo(&gate);
+        let workspace = Arc::new(WorkspaceToolsConfig::new(dir.path()));
+        let manager = ProcessSessionManager::new(workspace.clone(), WakeGate::new(), None);
+        for exec in [
+            ExecCommandTool::new(manager),
+            ExecCommandTool::one_shot(workspace),
+        ] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let gate = gate.clone();
+            let result = exec.execute("split".into(), json!({"command":
+                r"printf 'start\360'; read -r x <gate; printf 'middle' >&2; read -r x <gate; printf '\237\230\200\342'"
+            }), CancelToken::new(), Arc::new(move |part| {
+                let text = text(&part);
+                if text.contains("start") || text.contains("middle") {
+                    fs::write(&gate, b"\n").unwrap();
+                }
+                tx.send(text.to_owned()).unwrap();
+            })).await.unwrap();
+            assert!(!result.is_error);
+            let mut output = String::new();
+            while let Some(part) = rx.recv().await {
+                output.push_str(&part);
+            }
+            assert_eq!(output, "startmiddle😀�");
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_yields_accepts_input_and_kills() {
         let dir = TempDir::new().unwrap();
         let (callback, mut events) = events();
@@ -172,7 +214,7 @@ mod subprocesses {
         let stdin = WriteStdinTool::new(manager.clone());
 
         let start = call(&exec, json!({
-            "command": "test -t 0 && test -t 1 && test -t 2 || exit 8; stty -echo; printf 'prompt\\n'; read -r line; printf 'got:%s\\n' \"$line\"; read -r line",
+            "command": "test -t 0 && test -t 1 && test -t 2 || exit 8; stty echo; printf 'prompt\\n'; read -r line; printf 'got:%s\\n' \"$line\"; read -r line",
             "tty": true,
             "yield_time_ms": 0,
         })).await.unwrap();
@@ -191,7 +233,7 @@ mod subprocesses {
         let reply = call(&stdin, json!({"session_id": id, "chars": "hello\n"}))
             .await
             .unwrap();
-        await_output(&stdin, id, text(&reply).into(), "got:hello").await;
+        assert!(text(&reply).contains("got:hello"), "{}", text(&reply));
         let stop = call(&stdin, json!({"session_id": id, "kill": true}))
             .await
             .unwrap();
@@ -335,6 +377,17 @@ mod subprocesses {
         );
         assert!(log_path.starts_with(dir.path().join("logs")));
         assert!(fs::read_to_string(log_path).unwrap().contains("hidden"));
+        call(
+            &start,
+            json!({"name": "error", "command": "printf 'first\\nlast' >&2; exit 7"}),
+        )
+        .await
+        .unwrap();
+        let Some(BackgroundToolEvent::MonitorExited { tail_lines, .. }) = events.recv().await
+        else {
+            panic!("expected monitor exit");
+        };
+        assert_eq!(tail_lines, "first\nlast");
         manager.shutdown().await;
     }
 
