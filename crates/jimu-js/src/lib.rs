@@ -11,11 +11,17 @@
 
 mod prelude;
 mod types;
+mod ui;
 mod worker;
 
 pub use types::{
     DEFAULT_MAX_STACK_SIZE_BYTES, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_TIMEOUT_MS, ExtensionSource,
     HookKind, JsExtensionConfig, JsExtensionError,
+};
+pub use ui::{
+    DEFAULT_UI_RENDER_TIMEOUT_MS, MAX_UI_BOX_GAP, MAX_UI_BOX_PADDING, MAX_UI_DIVIDER_CH_LEN,
+    MAX_UI_NODE_COUNT, MAX_UI_NODE_DEPTH, MAX_UI_TEXT_LEN, MAX_UI_TOKEN_LEN, UiBorder, UiComponent,
+    UiDirection, UiNode, UiTextStyle, validate_ui_node,
 };
 
 use futures_channel::oneshot;
@@ -26,13 +32,15 @@ use jimu_agent::{
 };
 use jimu_ai::{BoxFuture, CancelToken, ToolDefinition};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use types::{
     JsAfterToolCallPayload, JsBeforeToolCallPayload, JsFinishTurnPayload, JsPrepareRequestSnapshot,
     RegistrySnapshot, parse_after_tool_call_result, parse_before_tool_call_result,
     parse_finish_turn_result, parse_request_override, parse_tool_execute_result, resolve_sources,
 };
+use ui::parse_and_validate_ui_node;
 use worker::{VmLimits, WorkerCmd, WorkerHandle};
 
 const MAX_RECORDED_ERRORS: usize = 64;
@@ -42,8 +50,11 @@ struct RuntimeInner {
     worker: WorkerHandle,
     registry: RwLock<RegistrySnapshot>,
     hook_mask: AtomicU8,
+    has_ui_render: AtomicBool,
+    ui_generation: Arc<AtomicU64>,
     errors: Mutex<Vec<JsExtensionError>>,
     js_hook_invocations: AtomicU64,
+    ui_render_invocations: AtomicU64,
 }
 
 impl RuntimeInner {
@@ -138,16 +149,21 @@ impl JsExtensionRuntime {
             max_stack_size_bytes: config.max_stack_size_bytes,
             timeout_ms: config.timeout_ms,
         };
-        let (worker, snapshot) = WorkerHandle::spawn(limits, sources)?;
+        let ui_generation = Arc::new(AtomicU64::new(1));
+        let (worker, snapshot) = WorkerHandle::spawn(limits, sources, Arc::clone(&ui_generation))?;
         let hook_mask = AtomicU8::new(snapshot.hook_mask);
+        let has_ui_render = AtomicBool::new(snapshot.has_ui_render);
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 config,
                 worker,
                 registry: RwLock::new(snapshot),
                 hook_mask,
+                has_ui_render,
+                ui_generation,
                 errors: Mutex::new(Vec::new()),
                 js_hook_invocations: AtomicU64::new(0),
+                ui_render_invocations: AtomicU64::new(0),
             }),
         })
     }
@@ -185,6 +201,8 @@ impl JsExtensionRuntime {
         })??;
 
         let new_mask = new_snapshot.hook_mask;
+        let new_has_ui = new_snapshot.has_ui_render;
+        let mut published = false;
         {
             let mut reg = self
                 .inner
@@ -194,7 +212,14 @@ impl JsExtensionRuntime {
             if new_snapshot.generation >= reg.generation {
                 *reg = new_snapshot;
                 self.inner.hook_mask.store(new_mask, Ordering::Release);
+                self.inner
+                    .has_ui_render
+                    .store(new_has_ui, Ordering::Release);
+                published = true;
             }
+        }
+        if published {
+            self.inner.ui_generation.fetch_add(1, Ordering::Release);
         }
         Ok(())
     }
@@ -235,6 +260,84 @@ impl JsExtensionRuntime {
     /// Check whether at least one JS listener is registered for the given control-plane hook.
     pub fn has_hook(&self, hook: HookKind) -> bool {
         self.inner.has_hook(hook)
+    }
+
+    /// Check whether at least one JS extension registered a `ui.render` interceptor.
+    pub fn has_ui_render(&self) -> bool {
+        self.inner.has_ui_render.load(Ordering::Acquire)
+    }
+
+    /// Return merged UI theme token overrides registered via `jimu.ui.theme(...)`.
+    pub fn ui_theme_overrides(&self) -> BTreeMap<String, String> {
+        self.inner
+            .registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ui_theme_overrides
+            .clone()
+    }
+
+    /// Lock-free monotonic UI revision counter incremented on `jimu.ui.invalidate()` and reload.
+    pub fn ui_generation(&self) -> u64 {
+        self.inner.ui_generation.load(Ordering::Acquire)
+    }
+
+    /// Total number of `ui.render` calls dispatched to the QuickJS worker thread.
+    pub fn ui_render_invocations(&self) -> u64 {
+        self.inner.ui_render_invocations.load(Ordering::Relaxed)
+    }
+
+    /// Invoke the synchronous `ui.render` onion chain for a [`UiComponent`] slot.
+    ///
+    /// - Zero-overhead fast path: when `!self.has_ui_render()`, returns `Ok(UiNode::Native)`
+    ///   immediately without touching the QuickJS worker thread.
+    /// - `timeout_ms`: per-render timeout in milliseconds (pass `0` to fall back to the VM default
+    ///   timeout; interactive hosts typically pass [`DEFAULT_UI_RENDER_TIMEOUT_MS`]).
+    /// - Returned nodes are validated against [`validate_ui_node`] hard limits before returning.
+    pub async fn render_ui(
+        &self,
+        component: UiComponent,
+        props: Value,
+        timeout_ms: u64,
+    ) -> Result<UiNode, JsExtensionError> {
+        if !self.has_ui_render() {
+            return Ok(UiNode::Native);
+        }
+        let props_json = serde_json::to_string(&props)
+            .map_err(|err| JsExtensionError::Serialization(err.to_string()))?;
+        self.inner
+            .ui_render_invocations
+            .fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .worker
+            .tx
+            .send(WorkerCmd::RenderUi {
+                component,
+                props_json,
+                timeout_ms,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                JsExtensionError::RuntimeUnavailable("QuickJS worker channel closed".to_string())
+            })?;
+        let raw_json = match reply_rx.await {
+            Ok(Ok(json)) => json,
+            Ok(Err(err)) => {
+                self.inner.record_error(err.clone());
+                return Err(err);
+            }
+            Err(_) => {
+                let err = JsExtensionError::RuntimeUnavailable(
+                    "QuickJS worker dropped UI render reply".to_string(),
+                );
+                self.inner.record_error(err.clone());
+                return Err(err);
+            }
+        };
+        parse_and_validate_ui_node(&raw_json).inspect_err(|err| {
+            self.inner.record_error(err.clone());
+        })
     }
 
     /// Names/paths of the currently loaded extension sources.

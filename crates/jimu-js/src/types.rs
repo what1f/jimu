@@ -12,6 +12,7 @@ use jimu_ai::{
 use jimu_schema::{CompiledSchema, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -174,6 +175,9 @@ pub enum JsExtensionError {
     #[error("invalid tool registration '{name}': {reason}")]
     InvalidTool { name: String, reason: String },
 
+    #[error("invalid UI node: {0}")]
+    InvalidUiNode(String),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -283,12 +287,14 @@ pub(crate) struct RegisteredToolMeta {
     pub execution_mode: ToolExecutionMode,
 }
 
-/// Snapshot of registered tools, hooks, and loaded extension names for the active VM.
+/// Snapshot of registered tools, hooks, UI registrations, and loaded extension names for the active VM.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RegistrySnapshot {
     pub generation: u64,
     pub tools: Vec<RegisteredToolMeta>,
     pub hook_mask: u8,
+    pub has_ui_render: bool,
+    pub ui_theme_overrides: BTreeMap<String, String>,
     pub loaded_extensions: Vec<String>,
 }
 
@@ -299,6 +305,10 @@ struct RawInspectPayload {
     tools: Vec<RawToolMeta>,
     #[serde(default)]
     hooks: Vec<String>,
+    #[serde(default)]
+    has_ui_render: bool,
+    #[serde(default)]
+    ui_theme_overrides: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +377,8 @@ pub(crate) fn parse_registry_snapshot(
         generation: 0,
         tools,
         hook_mask,
+        has_ui_render: raw.has_ui_render,
+        ui_theme_overrides: raw.ui_theme_overrides,
         loaded_extensions,
     })
 }

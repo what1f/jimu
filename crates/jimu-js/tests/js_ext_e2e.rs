@@ -4,7 +4,10 @@ use jimu_ai::{
     ApiKind, AssistantBlock, AssistantMessage, AssistantMessageEvent, ContentPart, Message, Model,
     ModelCost, StopReason, TextContent, ThinkingLevel, ToolCall, ToolDefinition, Usage,
 };
-use jimu_js::{HookKind, JsExtensionConfig, JsExtensionError, JsExtensionRuntime};
+use jimu_js::{
+    DEFAULT_UI_RENDER_TIMEOUT_MS, HookKind, JsExtensionConfig, JsExtensionError,
+    JsExtensionRuntime, UiBorder, UiComponent, UiDirection, UiNode, UiTextStyle,
+};
 use jimu_schema::{obj_schema, str_schema};
 use jimu_testkit::FauxProvider;
 use serde_json::{Map, Value, json};
@@ -690,4 +693,438 @@ export default function (jimu) {{
         active_ver == "v2",
         "published hook_mask must match active VM version"
     );
+}
+
+#[test]
+fn js_ui_mod_onion_chain_theme_and_invalidate_e2e() {
+    let dir = tempdir().expect("create tempdir");
+    let ext_a_path = dir.path().join("01-ext-a.js");
+    let ext_b_path = dir.path().join("02-ext-b.js");
+
+    fs::write(
+        &ext_a_path,
+        r##"
+export default function (jimu) {
+  let badge = "idle";
+  jimu.ui.theme({ accent: "#00ff88", border: "#333333" });
+
+  jimu.registerTool({
+    name: "set_badge",
+    description: "Update status badge and invalidate UI",
+    parameters: {
+      type: "object",
+      properties: { label: { type: "string" } },
+      required: ["label"],
+    },
+    execute(_id, params) {
+      badge = params.label;
+      jimu.ui.invalidate();
+      return badge;
+    },
+  });
+
+  jimu.on("ui.render", (e, next) => {
+    if (e.component === "StatusLine") {
+      const inner = next({ ...e, props: { ...e.props, tag: "from-A" } });
+      return jimu.ui.row(
+        { gap: 1 },
+        [jimu.ui.text(badge, { color: "accent", bold: true }), inner]
+      );
+    }
+    if (e.component === "Footer") {
+      return "custom-footer";
+    }
+    if (e.component === "Header") {
+      return undefined;
+    }
+    return next(e);
+  });
+}
+"##,
+    )
+    .expect("write ext-a");
+
+    fs::write(
+        &ext_b_path,
+        r##"
+export default function (jimu) {
+  jimu.ui.theme({ accent: "#ff5500", bg: "#111111" });
+
+  jimu.on("ui.render", (e, next) => {
+    if (e.component === "StatusLine") {
+      return jimu.ui.box(
+        { border: "left", borderColor: "accent", paddingLeft: 1 },
+        [next(e), jimu.ui.text(e.props.tag || "missing", { dim: true })]
+      );
+    }
+    if (e.component === "AbovePrompt") {
+      return jimu.ui.divider({ ch: "─", color: "dim" });
+    }
+    return next(e);
+  });
+}
+"##,
+    )
+    .expect("write ext-b");
+
+    let runtime = JsExtensionRuntime::new(
+        JsExtensionConfig::new()
+            .with_file(&ext_a_path)
+            .with_file(&ext_b_path),
+    )
+    .expect("load UI mod extensions");
+
+    assert!(runtime.has_ui_render());
+    for hook in [
+        HookKind::PrepareRequest,
+        HookKind::TransformContext,
+        HookKind::BeforeToolCall,
+        HookKind::AfterToolCall,
+        HookKind::FinishTurn,
+    ] {
+        assert!(
+            !runtime.has_hook(hook),
+            "ui.render must not set Agent HookKind {hook:?}"
+        );
+    }
+
+    let theme = runtime.ui_theme_overrides();
+    assert_eq!(theme.get("accent").map(String::as_str), Some("#ff5500"));
+    assert_eq!(theme.get("border").map(String::as_str), Some("#333333"));
+    assert_eq!(theme.get("bg").map(String::as_str), Some("#111111"));
+
+    let gen0 = runtime.ui_generation();
+
+    let status_node = block_on(runtime.render_ui(
+        UiComponent::StatusLine,
+        json!({ "model": "claude" }),
+        DEFAULT_UI_RENDER_TIMEOUT_MS,
+    ))
+    .expect("render StatusLine");
+    assert_eq!(
+        status_node,
+        UiNode::Box {
+            direction: UiDirection::Row,
+            gap: 1,
+            border: UiBorder::None,
+            border_color: None,
+            bg: None,
+            padding_left: 0,
+            padding_right: 0,
+            children: vec![
+                UiNode::Text {
+                    text: "idle".into(),
+                    style: UiTextStyle {
+                        color: Some("accent".into()),
+                        bold: Some(true),
+                        ..Default::default()
+                    },
+                },
+                UiNode::Box {
+                    direction: UiDirection::Column,
+                    gap: 0,
+                    border: UiBorder::Left,
+                    border_color: Some("accent".into()),
+                    bg: None,
+                    padding_left: 1,
+                    padding_right: 0,
+                    children: vec![
+                        UiNode::Native,
+                        UiNode::Text {
+                            text: "from-A".into(),
+                            style: UiTextStyle {
+                                dim: Some(true),
+                                ..Default::default()
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+    );
+
+    let footer_node =
+        block_on(runtime.render_ui(UiComponent::Footer, json!({}), DEFAULT_UI_RENDER_TIMEOUT_MS))
+            .expect("render Footer");
+    assert_eq!(
+        footer_node,
+        UiNode::Text {
+            text: "custom-footer".into(),
+            style: UiTextStyle::default(),
+        }
+    );
+
+    let header_node =
+        block_on(runtime.render_ui(UiComponent::Header, json!({}), DEFAULT_UI_RENDER_TIMEOUT_MS))
+            .expect("render Header");
+    assert_eq!(header_node, UiNode::Native);
+
+    let divider_node = block_on(runtime.render_ui(
+        UiComponent::AbovePrompt,
+        json!({}),
+        DEFAULT_UI_RENDER_TIMEOUT_MS,
+    ))
+    .expect("render AbovePrompt");
+    assert_eq!(
+        divider_node,
+        UiNode::Divider {
+            ch: Some("─".into()),
+            color: Some("dim".into()),
+        }
+    );
+
+    // Calling JS tool invokes `jimu.ui.invalidate()`, bumping ui_generation lock-free.
+    let tool = runtime.tools().into_iter().next().expect("set_badge tool");
+    block_on(tool.execute(
+        "tc_badge".into(),
+        json!({ "label": "busy" }),
+        jimu_ai::CancelToken::new(),
+        Arc::new(|_| {}),
+    ))
+    .expect("set_badge executes");
+    let gen1 = runtime.ui_generation();
+    assert!(gen1 > gen0, "jimu.ui.invalidate() must bump ui_generation");
+
+    let updated = block_on(runtime.render_ui(
+        UiComponent::StatusLine,
+        json!({}),
+        DEFAULT_UI_RENDER_TIMEOUT_MS,
+    ))
+    .expect("render updated StatusLine");
+    match updated {
+        UiNode::Box { children, .. } => match &children[0] {
+            UiNode::Text { text, .. } => assert_eq!(text, "busy"),
+            other => panic!("expected Text node, got {other:?}"),
+        },
+        other => panic!("expected Box node, got {other:?}"),
+    }
+
+    // Reload updates theme overrides and bumps ui_generation.
+    fs::write(
+        &ext_b_path,
+        r##"
+export default function (jimu) {
+  jimu.ui.theme({ accent: "#2299ff" });
+  jimu.on("ui.render", (e, next) => next(e));
+}
+"##,
+    )
+    .expect("rewrite ext-b");
+    runtime.reload().expect("reload succeeds");
+    assert!(
+        runtime.ui_generation() > gen1,
+        "reload must bump ui_generation"
+    );
+    let reloaded_theme = runtime.ui_theme_overrides();
+    assert_eq!(
+        reloaded_theme.get("accent").map(String::as_str),
+        Some("#2299ff")
+    );
+    assert!(!reloaded_theme.contains_key("bg"));
+}
+
+#[test]
+fn js_ui_mod_rejects_async_and_oversized_trees_and_recovers_e2e() {
+    // Non-string theme value rejected at load time.
+    let bad_theme = JsExtensionRuntime::new(
+        JsExtensionConfig::new().with_inline("bad-theme.js", r#"jimu.ui.theme({ accent: 123 });"#),
+    );
+    assert!(bad_theme.is_err());
+
+    let ext = r#"
+export default function (jimu) {
+  jimu.on("ui.render", (e, next) => {
+    if (e.component === "StatusLine") {
+      return Promise.resolve(jimu.ui.text("async-nope"));
+    }
+    if (e.component === "Header") {
+      let node = jimu.ui.text("deep");
+      for (let i = 0; i < 18; i++) {
+        node = jimu.ui.box([node]);
+      }
+      return node;
+    }
+    if (e.component === "Footer") {
+      const children = [];
+      for (let i = 0; i < 260; i++) {
+        children.push(jimu.ui.text("n"));
+      }
+      return jimu.ui.box(children);
+    }
+    if (e.component === "Spinner") {
+      while (true) {}
+    }
+    if (e.component === "ToolRow") {
+      return jimu.ui.text("recovered", { italic: true });
+    }
+    return next(e);
+  });
+}
+"#;
+
+    let runtime = JsExtensionRuntime::new(JsExtensionConfig::new().with_inline("guards.js", ext))
+        .expect("load guard extension");
+
+    let async_err = block_on(runtime.render_ui(UiComponent::StatusLine, json!({}), 40))
+        .expect_err("async ui.render must be rejected");
+    assert!(
+        matches!(async_err, JsExtensionError::Script(ref m) if m.contains("synchronous")),
+        "expected synchronous Script error, got {async_err:?}"
+    );
+
+    let depth_err = block_on(runtime.render_ui(UiComponent::Header, json!({}), 40))
+        .expect_err("deep tree must fail validation");
+    assert!(
+        matches!(depth_err, JsExtensionError::InvalidUiNode(ref m) if m.contains("depth")),
+        "expected depth InvalidUiNode error, got {depth_err:?}"
+    );
+
+    let count_err = block_on(runtime.render_ui(UiComponent::Footer, json!({}), 40))
+        .expect_err("too many nodes must fail validation");
+    assert!(
+        matches!(count_err, JsExtensionError::InvalidUiNode(ref m) if m.contains("node count")),
+        "expected node count InvalidUiNode error, got {count_err:?}"
+    );
+
+    let timeout_err = block_on(runtime.render_ui(UiComponent::Spinner, json!({}), 40))
+        .expect_err("infinite loop must time out");
+    assert!(
+        matches!(timeout_err, JsExtensionError::Timeout { timeout_ms: 40 }),
+        "expected Timeout(40), got {timeout_err:?}"
+    );
+
+    // VM recovers cleanly after script/validation/timeout errors.
+    let recovered = block_on(runtime.render_ui(UiComponent::ToolRow, json!({}), 40))
+        .expect("VM must recover after errors");
+    assert_eq!(
+        recovered,
+        UiNode::Text {
+            text: "recovered".into(),
+            style: UiTextStyle {
+                italic: Some(true),
+                ..Default::default()
+            },
+        }
+    );
+
+    // Box spacing/padding bounds prevent excessive host expansion while allowing max boundary values.
+    let valid_box = UiNode::Box {
+        direction: jimu_js::UiDirection::Column,
+        gap: jimu_js::MAX_UI_BOX_GAP,
+        border: jimu_js::UiBorder::None,
+        border_color: None,
+        bg: None,
+        padding_left: jimu_js::MAX_UI_BOX_PADDING,
+        padding_right: jimu_js::MAX_UI_BOX_PADDING,
+        children: vec![UiNode::Native],
+    };
+    jimu_js::validate_ui_node(&valid_box).expect("boundary gap/padding must validate");
+
+    let oversized_gap = UiNode::Box {
+        direction: jimu_js::UiDirection::Column,
+        gap: jimu_js::MAX_UI_BOX_GAP + 1,
+        border: jimu_js::UiBorder::None,
+        border_color: None,
+        bg: None,
+        padding_left: 0,
+        padding_right: 0,
+        children: vec![UiNode::Native],
+    };
+    assert!(jimu_js::validate_ui_node(&oversized_gap).is_err());
+
+    let oversized_pad_left = UiNode::Box {
+        direction: jimu_js::UiDirection::Row,
+        gap: 0,
+        border: jimu_js::UiBorder::None,
+        border_color: None,
+        bg: None,
+        padding_left: jimu_js::MAX_UI_BOX_PADDING + 1,
+        padding_right: 0,
+        children: vec![UiNode::Native],
+    };
+    assert!(jimu_js::validate_ui_node(&oversized_pad_left).is_err());
+
+    let oversized_pad_right = UiNode::Box {
+        direction: jimu_js::UiDirection::Row,
+        gap: 0,
+        border: jimu_js::UiBorder::None,
+        border_color: None,
+        bg: None,
+        padding_left: 0,
+        padding_right: jimu_js::MAX_UI_BOX_PADDING + 1,
+        children: vec![UiNode::Native],
+    };
+    assert!(jimu_js::validate_ui_node(&oversized_pad_right).is_err());
+}
+
+#[test]
+fn js_ui_mod_zero_worker_fast_path_and_headless_compat_e2e() {
+    // 1. Extension without `ui.render`: render_ui must short-circuit with zero worker dispatch.
+    let plain_ext = r#"
+export default function (jimu) {
+  jimu.registerTool({
+    name: "ping",
+    description: "ping",
+    parameters: { type: "object", properties: {} },
+    execute() { return "pong"; },
+  });
+}
+"#;
+    let plain_rt =
+        JsExtensionRuntime::new(JsExtensionConfig::new().with_inline("plain.js", plain_ext))
+            .expect("load plain extension");
+    assert!(!plain_rt.has_ui_render());
+    assert!(plain_rt.ui_theme_overrides().is_empty());
+
+    for comp in [
+        UiComponent::StatusLine,
+        UiComponent::AbovePrompt,
+        UiComponent::Header,
+        UiComponent::ToolRow,
+    ] {
+        let node = block_on(plain_rt.render_ui(comp, json!({}), 1)).expect("fast path Native");
+        assert_eq!(node, UiNode::Native);
+    }
+    assert_eq!(
+        plain_rt.ui_render_invocations(),
+        0,
+        "render_ui without listeners must never dispatch to worker"
+    );
+
+    // 2. Headless host loading an extension that contains UI Mod registrations works seamlessly.
+    let mixed_ext = r##"
+export default function (jimu) {
+  jimu.ui.theme({ accent: "#00aaff" });
+  jimu.on("ui.render", (e, next) => jimu.ui.row([jimu.ui.text("mod"), next(e)]));
+  jimu.registerTool({
+    name: "headless_echo",
+    description: "echo",
+    parameters: {
+      type: "object",
+      properties: { msg: { type: "string" } },
+      required: ["msg"],
+    },
+    execute(_id, args) { return `echo:${args.msg}`; },
+  });
+}
+"##;
+    let headless_rt =
+        JsExtensionRuntime::new(JsExtensionConfig::new().with_inline("mixed.js", mixed_ext))
+            .expect("headless host loads UI-mod extension cleanly");
+    let tool = headless_rt
+        .tools()
+        .into_iter()
+        .next()
+        .expect("headless_echo");
+    let out = block_on(tool.execute(
+        "tc_hl".into(),
+        json!({ "msg": "ok" }),
+        jimu_ai::CancelToken::new(),
+        Arc::new(|_| {}),
+    ))
+    .expect("tool executes normally in headless host");
+    match &out.content[0] {
+        ContentPart::Text(t) => assert_eq!(t.text, "echo:ok"),
+        other => panic!("expected text, got {other:?}"),
+    }
 }

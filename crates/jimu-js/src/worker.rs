@@ -4,6 +4,7 @@ use crate::prelude::PRELUDE_SOURCE;
 use crate::types::{
     HookKind, JsExtensionError, RegistrySnapshot, ResolvedSource, parse_registry_snapshot,
 };
+use crate::ui::UiComponent;
 use futures_channel::oneshot;
 use jimu_ai::CancelToken;
 use rquickjs::context::EvalOptions;
@@ -16,6 +17,7 @@ use rquickjs::{
 };
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -52,6 +54,12 @@ pub(crate) enum WorkerCmd {
         cancel: CancelToken,
         reply: oneshot::Sender<Result<Option<String>, JsExtensionError>>,
     },
+    RenderUi {
+        component: UiComponent,
+        props_json: String,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<String, JsExtensionError>>,
+    },
     Shutdown,
 }
 
@@ -64,6 +72,7 @@ impl WorkerHandle {
     pub(crate) fn spawn(
         limits: VmLimits,
         initial_sources: Vec<ResolvedSource>,
+        ui_generation: Arc<AtomicU64>,
     ) -> Result<(Self, RegistrySnapshot), JsExtensionError> {
         let (tx, rx) = mpsc::channel::<WorkerCmd>();
         let (init_tx, init_rx) = mpsc::channel::<Result<RegistrySnapshot, JsExtensionError>>();
@@ -72,7 +81,7 @@ impl WorkerHandle {
             .name("jimu-js-vm".to_string())
             .stack_size(WORKER_THREAD_STACK_BYTES)
             .spawn(move || {
-                run_worker_loop(limits, initial_sources, init_tx, rx);
+                run_worker_loop(limits, initial_sources, ui_generation, init_tx, rx);
             })
             .map_err(|err| {
                 JsExtensionError::RuntimeUnavailable(format!(
@@ -231,6 +240,7 @@ impl VmInstance {
     fn build(
         limits: &VmLimits,
         sources: &[ResolvedSource],
+        ui_generation: Arc<AtomicU64>,
     ) -> Result<(Self, RegistrySnapshot), JsExtensionError> {
         let runtime = Runtime::new().map_err(|err| {
             JsExtensionError::RuntimeUnavailable(format!("failed to create QuickJS runtime: {err}"))
@@ -261,8 +271,13 @@ impl VmInstance {
                 let init_fn: Function<'_> = ctx
                     .eval_with_options(PRELUDE_SOURCE, opts)
                     .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
+                let ui_gen_cb = Arc::clone(&ui_generation);
+                let on_invalidate = Function::new(ctx.clone(), move || {
+                    ui_gen_cb.fetch_add(1, Ordering::Release);
+                })
+                .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
                 let obj: Object<'_> = init_fn
-                    .call(())
+                    .call((on_invalidate,))
                     .map_err(|err| classify_js_error(&ctx, err, &interrupt))?;
                 Ok(Persistent::save(&ctx, obj))
             },
@@ -605,6 +620,53 @@ impl VmInstance {
         }
         res
     }
+
+    fn render_ui(
+        &self,
+        component: UiComponent,
+        props_json: &str,
+        timeout_ms: u64,
+    ) -> Result<String, JsExtensionError> {
+        let effective_timeout_ms = if timeout_ms == 0 {
+            self.timeout_ms
+        } else {
+            timeout_ms
+        };
+        self.interrupt.arm(effective_timeout_ms, None);
+        let _guard = InterruptGuard(&self.interrupt);
+
+        let res = self
+            .context
+            .with(|ctx| -> Result<String, JsExtensionError> {
+                let rt_obj = self
+                    .runtime_obj
+                    .clone()
+                    .restore(&ctx)
+                    .map_err(|err| JsExtensionError::Script(err.to_string()))?;
+                let func: Function<'_> = rt_obj
+                    .get("invokeUiRender")
+                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                let ret: Value<'_> = func
+                    .call((component.as_str(), props_json))
+                    .map_err(|err| classify_js_error(&ctx, err, &self.interrupt))?;
+                if ret.clone().into_promise().is_some() {
+                    return Err(JsExtensionError::Script(
+                        "ui.render handler must be synchronous and cannot return a Promise"
+                            .to_string(),
+                    ));
+                }
+                extract_opt_string(&ctx, ret, &self.interrupt)?.ok_or_else(|| {
+                    JsExtensionError::InvalidUiNode(
+                        "ui.render returned empty payload unexpectedly".to_string(),
+                    )
+                })
+            });
+
+        if res.is_err() {
+            self.recover_after_error();
+        }
+        res
+    }
 }
 
 enum CallOutcome {
@@ -773,21 +835,23 @@ fn classify_caught_value(
 fn run_worker_loop(
     limits: VmLimits,
     initial_sources: Vec<ResolvedSource>,
+    ui_generation: Arc<AtomicU64>,
     init_tx: mpsc::Sender<Result<RegistrySnapshot, JsExtensionError>>,
     rx: mpsc::Receiver<WorkerCmd>,
 ) {
     let mut generation: u64 = 1;
-    let mut active_vm = match VmInstance::build(&limits, &initial_sources) {
-        Ok((vm, mut snapshot)) => {
-            snapshot.generation = generation;
-            let _ = init_tx.send(Ok(snapshot));
-            vm
-        }
-        Err(err) => {
-            let _ = init_tx.send(Err(err));
-            return;
-        }
-    };
+    let mut active_vm =
+        match VmInstance::build(&limits, &initial_sources, Arc::clone(&ui_generation)) {
+            Ok((vm, mut snapshot)) => {
+                snapshot.generation = generation;
+                let _ = init_tx.send(Ok(snapshot));
+                vm
+            }
+            Err(err) => {
+                let _ = init_tx.send(Err(err));
+                return;
+            }
+        };
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -798,7 +862,7 @@ fn run_worker_loop(
             } => {
                 // Build and validate the new VM completely BEFORE dropping the active VM so failed
                 // reloads leave the previous active VM, tools, and hooks completely intact.
-                match VmInstance::build(&limits, &sources) {
+                match VmInstance::build(&limits, &sources, Arc::clone(&ui_generation)) {
                     Ok((new_vm, mut snapshot)) => {
                         let mut seen = forbidden_tool_names;
                         let conflict = snapshot
@@ -841,6 +905,15 @@ fn run_worker_loop(
                 reply,
             } => {
                 let res = active_vm.invoke_hook(hook, &payload_json, cancel);
+                let _ = reply.send(res);
+            }
+            WorkerCmd::RenderUi {
+                component,
+                props_json,
+                timeout_ms,
+                reply,
+            } => {
+                let res = active_vm.render_ui(component, &props_json, timeout_ms);
                 let _ = reply.send(res);
             }
             WorkerCmd::Shutdown => break,
