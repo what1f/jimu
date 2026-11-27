@@ -49,8 +49,11 @@ pub(crate) fn ancestor_chain_root_to_leaf(
 
 pub(crate) fn discovery_home(override_path: Option<&Path>) -> Option<PathBuf> {
     override_path.map(canonical_or_self).or_else(|| {
-        ["HOME", "USERPROFILE"]
-            .into_iter()
+        #[cfg(windows)]
+        let vars = ["USERPROFILE", "HOME"];
+        #[cfg(not(windows))]
+        let vars = ["HOME", "USERPROFILE"];
+        vars.into_iter()
             .filter_map(std::env::var_os)
             .find(|home| !home.is_empty())
             .map(|home| canonical_or_self(Path::new(&home)))

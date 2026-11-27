@@ -49,7 +49,25 @@ fn kill_process_group(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn kill_process_group(pid: u32) {
+    use std::os::windows::process::CommandExt as _;
+    if pid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process_group(_pid: u32) {}
 
 pub(crate) struct ProcessGroupGuard {
@@ -76,20 +94,53 @@ impl Drop for ProcessGroupGuard {
 
 pub(crate) fn build_shell_command(shell: Option<&str>, command: &str) -> Command {
     #[cfg(unix)]
-    {
+    let mut cmd = {
         let bin = shell.unwrap_or("/bin/sh");
         let mut cmd = Command::new(bin);
         cmd.arg("-c").arg(command);
         cmd
-    }
+    };
 
-    #[cfg(not(unix))]
-    {
+    #[cfg(windows)]
+    let mut cmd = {
+        let bin = shell.unwrap_or("cmd");
+        let mut cmd = Command::new(bin);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let name = std::path::Path::new(bin)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(bin)
+            .to_ascii_lowercase();
+        match name.as_str() {
+            "cmd" | "cmd.exe" => {
+                // `/D` disables AutoRun registry commands and `/S` strips only the
+                // outer quotes around `command`, preserving inner quotes verbatim.
+                cmd.raw_arg("/D /S /C").raw_arg(format!("\"{command}\""));
+            }
+            "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => {
+                cmd.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+            }
+            "sh" | "sh.exe" | "bash" | "bash.exe" | "zsh" | "zsh.exe" => {
+                cmd.arg("-c").arg(command);
+            }
+            _ => {
+                cmd.arg("/C").arg(command);
+            }
+        }
+        cmd
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let mut cmd = {
         let bin = shell.unwrap_or("cmd");
         let mut cmd = Command::new(bin);
         cmd.arg("/C").arg(command);
         cmd
-    }
+    };
+
+    // OSC 7577 security: never leak the host terminal's program-resume token to agent-run tools.
+    cmd.env_remove("OSC7577_TOKEN");
+    cmd
 }
 
 fn shell_exit_code(status: Option<ExitStatus>, timed_out: bool) -> i32 {
@@ -652,6 +703,7 @@ impl AgentTool for ExecCommandTool {
     fn definition(&self) -> ToolDefinition {
         match &self.backend {
             ExecBackend::Interactive(_) => {
+                #[cfg_attr(not(unix), allow(unused_mut))]
                 let mut fields = vec![
                     (
                         "command",
@@ -1313,7 +1365,10 @@ pub(crate) enum ProcessInput {
 }
 
 impl ProcessInput {
-    async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
+    async fn write_all(
+        &mut self,
+        #[cfg_attr(not(unix), allow(unused_mut))] mut data: &[u8],
+    ) -> io::Result<()> {
         match self {
             Self::Pipe(pipe) => pipe.write_all(data).await,
             #[cfg(unix)]

@@ -598,7 +598,25 @@ mod stdio {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    #[cfg(windows)]
+    fn kill_process_group(pid: u32) {
+        use std::os::windows::process::CommandExt as _;
+        if pid == 0 {
+            return;
+        }
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn kill_process_group(_pid: u32) {}
 
     struct PendingState {
@@ -789,7 +807,8 @@ mod stdio {
             })?;
 
             let mut cmd = Command::new(&config.command);
-            cmd.args(&config.args)
+            cmd.env_remove("OSC7577_TOKEN")
+                .args(&config.args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -802,6 +821,8 @@ mod stdio {
             }
             #[cfg(unix)]
             cmd.process_group(0);
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
 
             let mut child = cmd.spawn().map_err(|err| {
                 McpError::Protocol(format!(

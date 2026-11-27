@@ -150,14 +150,27 @@ fn sync_watches(
     }
 }
 
+fn is_symlink_or_junction(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        let ft = meta.file_type();
+        ft.is_symlink() || ft.is_symlink_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
 fn collect_watch_dirs(config: &SkillDiscoveryConfig) -> HashSet<PathBuf> {
     let mut dirs = HashSet::new();
     let mut ancestry = HashSet::new();
     for root in config.roots() {
         if root.is_dir() {
-            // If the root itself is a symlink, also watch its parent so retargeting or removing
-            // the symlink emits an event.
-            if fs::symlink_metadata(&root).is_ok_and(|meta| meta.file_type().is_symlink())
+            // If the root itself is a symlink (or Windows NTFS junction), also watch its parent
+            // so retargeting or removing the link emits an event.
+            if fs::symlink_metadata(&root).is_ok_and(|meta| is_symlink_or_junction(&meta))
                 && let Some(parent) = root.parent()
                 && let Ok(canonical_parent) = fs::canonicalize(parent)
             {

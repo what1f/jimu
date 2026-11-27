@@ -40,6 +40,25 @@ pub(crate) fn resolve_path(base_cwd: &Path, raw: &str) -> Result<PathBuf, String
     }
 }
 
+#[cfg(all(
+    windows,
+    any(
+        feature = "fs",
+        feature = "search",
+        all(feature = "shell", not(target_os = "ios"))
+    )
+))]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(any(
     feature = "fs",
     feature = "search",
@@ -47,8 +66,35 @@ pub(crate) fn resolve_path(base_cwd: &Path, raw: &str) -> Result<PathBuf, String
 ))]
 /// Format a path relative to `base_cwd` when possible, using forward slashes.
 pub(crate) fn display_path(base_cwd: &Path, path: &Path) -> String {
-    let shown = path.strip_prefix(base_cwd).unwrap_or(path);
-    shown.to_string_lossy().replace('\\', "/")
+    #[cfg(windows)]
+    {
+        if let Ok(rel) = path.strip_prefix(base_cwd) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+        let clean_base = strip_verbatim_prefix(base_cwd);
+        let clean_path = strip_verbatim_prefix(path);
+        let shown = clean_path.strip_prefix(&clean_base).unwrap_or(&clean_path);
+        shown.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        let shown = path.strip_prefix(base_cwd).unwrap_or(path);
+        shown.to_string_lossy().replace('\\', "/")
+    }
+}
+
+#[cfg(feature = "fs")]
+fn is_symlink_or_junction(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        let ft = meta.file_type();
+        ft.is_symlink() || ft.is_symlink_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 #[cfg(feature = "fs")]
@@ -83,7 +129,7 @@ fn normalize_nonexistent_path(path: &Path) -> PathBuf {
 /// the symlink intact.
 pub(crate) fn resolve_write_target(target: &Path) -> Result<PathBuf, String> {
     match fs::symlink_metadata(target) {
-        Ok(meta) if meta.file_type().is_symlink() => match fs::canonicalize(target) {
+        Ok(meta) if is_symlink_or_junction(&meta) => match fs::canonicalize(target) {
             Ok(real) => Ok(real),
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 // Dangling symlink: walk symlink hops so `write` creates the linked target
@@ -91,7 +137,7 @@ pub(crate) fn resolve_write_target(target: &Path) -> Result<PathBuf, String> {
                 let mut cur = target.to_path_buf();
                 for _ in 0..MAX_SYMLINK_HOPS {
                     match fs::symlink_metadata(&cur) {
-                        Ok(m) if m.file_type().is_symlink() => {
+                        Ok(m) if is_symlink_or_junction(&m) => {
                             let link = fs::read_link(&cur).map_err(|e| {
                                 format!("failed to read symlink '{}': {e}", cur.display())
                             })?;
