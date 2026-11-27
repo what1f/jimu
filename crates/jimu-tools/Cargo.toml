@@ -24,7 +24,6 @@ web-fetch = [
     "dep:thiserror",
     "dep:base64",
     "dep:image",
-    "dep:chrono",
     "dep:ego-tree",
     "dep:scraper",
     "dep:url",
@@ -48,7 +47,6 @@ futures-util = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 image = { workspace = true, optional = true, features = ["png", "jpeg", "gif", "webp"] }
 base64 = { workspace = true, optional = true }
-chrono = { workspace = true, optional = true }
 ego-tree = { workspace = true, optional = true }
 scraper = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

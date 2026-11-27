@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use chrono::{DateTime, SecondsFormat};
 use jimu_ai::BoxFuture;
 use serde_json::Value;
 use url::Url;
@@ -348,18 +347,174 @@ fn route_segment(prefix: &str, value: &str) -> Option<String> {
 
 fn date(status: &Value) -> String {
     if let Some(timestamp) = status["created_timestamp"].as_i64()
-        && let Some(date) = DateTime::from_timestamp(timestamp, 0)
+        && let Some(formatted) = format_unix_seconds_utc(timestamp)
     {
-        return date.to_rfc3339_opts(SecondsFormat::Secs, true);
+        return formatted;
     }
     let raw = string(&status["created_at"]);
-    DateTime::parse_from_str(raw, "%a %b %d %H:%M:%S %z %Y")
-        .map(|date| date.to_utc().to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_else(|_| iso_date(raw))
+    parse_twitter_date(raw)
+        .or_else(|| parse_rfc3339_utc(raw))
+        .unwrap_or_else(|| raw.to_owned())
 }
 
 fn iso_date(raw: &str) -> String {
-    DateTime::parse_from_rfc3339(raw)
-        .map(|date| date.to_utc().to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_else(|_| raw.to_owned())
+    parse_rfc3339_utc(raw).unwrap_or_else(|| raw.to_owned())
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let m = u64::from(month);
+    let d = u64::from(day);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe as i64 - 719_468)
+}
+
+fn format_unix_seconds_utc(secs: i64) -> Option<String> {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days.checked_add(719_468)?;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+    Some(format!(
+        "{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+}
+
+fn parse_hms(raw: &str) -> Option<(i64, i64, i64)> {
+    let mut parts = raw.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let s: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some()
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&m)
+        || !(0..=59).contains(&s)
+    {
+        return None;
+    }
+    Some((h, m, s))
+}
+
+fn parse_twitter_date(raw: &str) -> Option<String> {
+    // Example: "Wed Oct 10 20:19:24 +0000 2018"
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let month = match parts[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = parts[2].parse().ok()?;
+    let (h, m, s) = parse_hms(parts[3])?;
+    let tz = parts[4];
+    if tz.len() != 5 {
+        return None;
+    }
+    let sign: i64 = match &tz[0..1] {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let tz_h: i64 = tz[1..3].parse().ok()?;
+    let tz_m: i64 = tz[3..5].parse().ok()?;
+    if tz_h > 23 || tz_m > 59 {
+        return None;
+    }
+    let year: i64 = parts[5].parse().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    let offset = sign * (tz_h * 3_600 + tz_m * 60);
+    let secs = days.checked_mul(86_400)? + h * 3_600 + m * 60 + s - offset;
+    format_unix_seconds_utc(secs)
+}
+
+fn parse_rfc3339_utc(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if !matches!(bytes[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let year: i64 = raw.get(0..4)?.parse().ok()?;
+    let month: u32 = raw.get(5..7)?.parse().ok()?;
+    let day: u32 = raw.get(8..10)?.parse().ok()?;
+    let (h, m, s) = parse_hms(raw.get(11..19)?)?;
+    let mut rest = raw.get(19..)?;
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let frac_len = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if frac_len == 0 {
+            return None;
+        }
+        rest = &after_dot[frac_len..];
+    }
+    let offset = if matches!(rest, "Z" | "z") {
+        0
+    } else if rest.len() == 6 && rest.as_bytes()[3] == b':' {
+        let sign: i64 = match &rest[0..1] {
+            "+" => 1,
+            "-" => -1,
+            _ => return None,
+        };
+        let tz_h: i64 = rest[1..3].parse().ok()?;
+        let tz_m: i64 = rest[4..6].parse().ok()?;
+        if tz_h > 23 || tz_m > 59 {
+            return None;
+        }
+        sign * (tz_h * 3_600 + tz_m * 60)
+    } else {
+        return None;
+    };
+    let days = days_from_civil(year, month, day)?;
+    let secs = days.checked_mul(86_400)? + h * 3_600 + m * 60 + s - offset;
+    format_unix_seconds_utc(secs)
 }
